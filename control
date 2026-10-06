@@ -1,0 +1,11 @@
+Package: com.example.myhook
+Name: MyHook
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: iOS Hook with Full Protections
+Maintainer: YourName
+Author: YourName
+Section: Tweaks
+Depends: mobilesubstrate, firmware (>= 14.0)
+Homepage: https://github.com/yourname/myhook
+Icon: file:///Library/PreferenceBundles/MyHook.bundle/icon.png
