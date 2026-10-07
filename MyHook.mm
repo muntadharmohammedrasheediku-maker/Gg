@@ -1,579 +1,618 @@
-// ============================================================
-// MyHook.mm — iOS Hook + Full Protections
-// Target: iOS 14.0+ | Arch: arm64 + arm64e
-// Fixed: ptrace manual declaration (sys/ptrace.h not on iOS)
-// ============================================================
+// MyHook.mm
+// هوك شامل للحمايات على iOS — arm64 / arm64e (PAC-aware)
+// الهدف: تعطيل وظائف الحماية/التقرير (Anti-Cheat / Anti-Debug / Anti-JB / Reporting)
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <mach-o/dyld.h>
-#import <mach-o/getsect.h>
 #import <mach-o/nlist.h>
 #import <dlfcn.h>
 #import <ptrauth.h>
 #import <sys/sysctl.h>
+#import <sys/ptrace.h>
 #import <sys/types.h>
-#import <sys/stat.h>
-#import <sys/mman.h>
-#import <sys/socket.h>
-#import <netinet/in.h>
 #import <unistd.h>
-#import <signal.h>
-#import <errno.h>
+#import <fcntl.h>
+#import <sys/stat.h>
+#import <dirent.h>
 #import <string.h>
+#import <stdarg.h>
 #import <stdlib.h>
-#import <pthread.h>
-#import <execinfo.h>
-#import <mach/mach.h>
-#import <mach/vm_map.h>
+#import <stdio.h>
+#import <signal.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
 
-// ⚠️ sys/ptrace.h غير موجود في iOS SDK — نُعرّفه يدوياً
-// ============================================================
-// ptrace manual definitions (from sys/ptrace.h)
-// ============================================================
-#define PT_TRACE_ME     0
-#define PT_READ_I       1
-#define PT_READ_D       2
-#define PT_READ_U       3
-#define PT_WRITE_I      4
-#define PT_WRITE_D      5
-#define PT_WRITE_U      6
-#define PT_CONTINUE     7
-#define PT_KILL         8
-#define PT_STEP         9
-#define PT_ATTACH       10
-#define PT_DETACH       11
-#define PT_SIGEXC       12
-#define PT_THUPDATE     13
-#define PT_ATTACHEXC    14
-#define PT_FORCEQUOTA   30
-#define PT_DENY_ATTACH  31
-#define PT_FREEZE       32
-#define PT_THAW         33
-
-extern int ptrace(int _request, pid_t _pid, caddr_t _addr, int _data);
+#include "Dobby.h"
 
 // ============================================================
-// Dobby — لاحظ: dobby.h (حروف صغيرة)
-// ============================================================
-#include "dobby.h"
-
-// ============================================================
-// 0. أدوات مساعدة عامة
+// 0. أدوات مساعدة (كما في نسختك السابقة)
 // ============================================================
 
-static uintptr_t get_image_slide(const char *image_name) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, image_name)) {
+static uintptr_t get_image_slide(const char *name) {
+    uint32_t c = _dyld_image_count();
+    for (uint32_t i = 0; i < c; i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, name))
             return (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-        }
     }
     return 0;
 }
 
-static uintptr_t get_image_base(const char *image_name) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, image_name)) {
+static uintptr_t get_image_base(const char *name) {
+    uint32_t c = _dyld_image_count();
+    for (uint32_t i = 0; i < c; i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, name))
             return (uintptr_t)_dyld_get_image_header(i);
-        }
     }
     return 0;
 }
 
-static void *addr_from_vmaddr(const char *image_name, uintptr_t vmaddr) {
-    uintptr_t slide = get_image_slide(image_name);
-    if (slide == 0) return NULL;
-    return (void *)(slide + vmaddr);
+static void *addr_from_vmaddr(const char *image, uintptr_t vmaddr) {
+    uintptr_t slide = get_image_slide(image);
+    return slide ? (void *)(slide + vmaddr) : NULL;
 }
 
-static void *addr_from_symbol(const char *symbol_name) {
-    void *handle = dlopen(NULL, RTLD_NOW);
-    return dlsym(handle, symbol_name);
+static void *addr_from_symbol(const char *sym) {
+    void *h = dlopen(NULL, RTLD_NOW);
+    return h ? dlsym(h, sym) : NULL;
 }
 
 // ============================================================
-// 1. دعم PAC لـ arm64e
+// 1. دعم PAC (arm64e)
 // ============================================================
 
 #if __arm64e__
-static void *strip_pac(void *ptr) {
-    return __builtin_ptrauth_strip(ptr, ptrauth_key_asia);
-}
-static void *sign_pac(void *ptr) {
-    return ptrauth_sign_unauthenticated(ptr, ptrauth_key_asia, 0);
+static inline void *strip_pac(void *p) {
+    return __builtin_ptrauth_strip(p, ptrauth_key_asia);
 }
 #else
-#define strip_pac(ptr) (ptr)
-#define sign_pac(ptr) (ptr)
+#define strip_pac(p) (p)
 #endif
 
 // ============================================================
-// 2. حماية من التصحيح (Anti-Debugging)
+// 2. قوائم سوداء (مسارات/كلمات مفتاحية) للحمايات
 // ============================================================
 
-static bool is_ptraced(void) {
-    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
-    struct kinfo_proc info;
-    size_t size = sizeof(info);
-    memset(&info, 0, sizeof(info));
-    if (sysctl(mib, 4, &info, &size, NULL, 0) != 0) return false;
-    return (info.kp_proc.p_flag & P_TRACED) != 0;
+static const char *g_jb_paths[] = {
+    // Cydia / Sileo / Installer
+    "/Applications/Cydia.app", "/Applications/Sileo.app",
+    "/Applications/Zebra.app", "/Applications/Installer.app",
+    "/Applications/blackra1n.app", "/Applications/FakeCarrier.app",
+    "/Applications/SBSettings.app", "/Applications/WinterBoard.app",
+    "/Applications/IntelliScreen.app",
+    // Substrate
+    "/Library/MobileSubstrate", "/usr/lib/libsubstrate.dylib",
+    "/usr/lib/libsubstitute.dylib", "/usr/lib/substitute-inserter.dylib",
+    "/etc/apt", "/etc/apt/sources.list", "/etc/apt/apt.conf.d",
+    "/private/etc/apt", "/private/etc/ssh/sshd_config",
+    "/var/lib/apt", "/var/lib/cydia", "/var/cache/apt",
+    "/var/lib/dpkg/status", "/private/var/lib/dpkg/status",
+    "/private/var/lib/apt", "/private/var/lib/cydia",
+    "/private/var/stash", "/private/var/tmp/cydia.log",
+    // Shells
+    "/bin/bash", "/bin/sh", "/usr/bin/ssh", "/usr/sbin/sshd",
+    "/usr/libexec/sftp-server", "/usr/libexec/cydia",
+    // Schemes
+    "cydia://", "sileo://", "zbra://", "filza://", "undecimus://",
+    // Rootless (Dopamine/palera1n)
+    "/var/jb", "/var/jb/usr", "/var/jb/Library",
+    "/private/preboot/",
+    // Frida / حقن
+    "frida", "Frida", "gadget", "libfrida",
+    "libhooker", "Substrate", "MobileSubstrate",
+    NULL
+};
+
+static const char *g_risk_keywords[] = {
+    "root_alert", "emu_alert", "ts2_alert", "9010_alert",
+    "9005_alert", "9014_alert", "ts2_mod", "ts2_iih",
+    "black_module_macho", "anti_sp2s", "CheckSymbolSource",
+    NULL
+};
+
+static BOOL kw_match(const char *hay, const char **list) {
+    if (!hay) return NO;
+    for (int i = 0; list[i]; i++)
+        if (strstr(hay, list[i])) return YES;
+    return NO;
 }
 
-static bool is_debugger_attached_sysctl(void) {
-    return is_ptraced();
-}
-
-static bool is_debugger_attached(void) {
-    return is_ptraced() || is_debugger_attached_sysctl();
-}
-
-// ============================================================
-// 3. حماية من الجيلبريك (Anti-Jailbreak)
-// ============================================================
-
-static bool check_jailbreak_files(void) {
-    const char *jailbreak_paths[] = {
-        "/Applications/Cydia.app",
-        "/Applications/Sileo.app",
-        "/Applications/Zebra.app",
-        "/Library/MobileSubstrate/MobileSubstrate.dylib",
-        "/Library/MobileSubstrate/DynamicLibraries",
-        "/var/lib/cydia",
-        "/var/lib/dpkg",
-        "/var/cache/apt",
-        "/var/lib/apt",
-        "/var/lib/dpkg/status",
-        "/var/lib/dpkg/info",
-        "/var/stash",
-        "/var/tmp/cydia.log",
-        "/private/var/lib/apt",
-        "/private/var/lib/cydia",
-        "/private/var/stash",
-        "/private/var/tmp/cydia.log",
-        "/private/etc/apt",
-        "/private/etc/dpkg",
-        "/private/etc/ssh",
-        "/private/etc/sshd_config",
-        "/private/var/db/stash",
-        "/private/var/db/cydia",
-        "/etc/apt",
-        "/etc/ssh",
-        "/etc/sshd_config",
-        "/usr/libexec/ssh-keysign",
-        "/usr/sbin/sshd",
-        "/usr/bin/sshd",
-        "/usr/libexec/sftp-server",
-        "/usr/bin/ssh",
-        "/bin/bash",
-        "/bin/sh",
-        "/usr/bin/cycript",
-        "/usr/bin/cynject",
-        "/usr/lib/libcycript.dylib",
-        "/usr/lib/libcycript.0.dylib",
-        "/usr/libexec/cydia",
-        "/usr/libexec/cydia/firmware.sh",
-        "/usr/bin/class-dump",
-        "/usr/bin/class-dump-z",
-        "/usr/bin/ldid",
-        "/usr/bin/codesign",
-        "/usr/bin/otool",
-        "/usr/bin/lipo",
-        "/var/jb",
-        "/var/jb/usr/bin/ssh",
-        "/var/jb/Library/MobileSubstrate",
-        NULL
-    };
-    
-    for (int i = 0; jailbreak_paths[i] != NULL; i++) {
-        struct stat st;
-        if (stat(jailbreak_paths[i], &st) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool check_sandbox_violation(void) {
-    NSString *testPath = @"/private/jailbreak_test.txt";
-    NSError *error = nil;
-    NSString *testString = @"test";
-    BOOL success = [testString writeToFile:testPath
-                                atomically:YES
-                                  encoding:NSUTF8StringEncoding
-                                     error:&error];
-    if (success) {
-        [[NSFileManager defaultManager] removeItemAtPath:testPath error:nil];
-        return true;
-    }
-    return false;
-}
-
-static bool check_fork(void) {
-    pid_t pid = fork();
-    if (pid >= 0) {
-        if (pid == 0) _exit(0);
-        return true;
-    }
-    return false;
-}
-
-static bool check_suspicious_symlinks(void) {
-    const char *paths[] = {
-        "/var/lib/apt",
-        "/var/lib/cydia",
-        "/var/stash",
-        "/private/var/stash",
-        "/Applications",
-        NULL
-    };
-    for (int i = 0; paths[i] != NULL; i++) {
-        struct stat st;
-        if (lstat(paths[i], &st) == 0) {
-            if (S_ISLNK(st.st_mode)) return true;
-        }
-    }
-    return false;
-}
-
-static bool is_jailbroken(void) {
-    return check_jailbreak_files() ||
-           check_sandbox_violation() ||
-           check_fork() ||
-           check_suspicious_symlinks();
+static BOOL is_jb_path(const char *p) {
+    return kw_match(p, g_jb_paths);
 }
 
 // ============================================================
-// 4. حماية من الحقن (Anti-Injection)
+// 3. تجاوز كشف الجيلبريك — File I/O Layer
 // ============================================================
 
-static bool check_suspicious_dylibs(void) {
-    const char *suspicious[] = {
-        "MobileSubstrate", "Substrate", "CydiaSubstrate",
-        "SubstrateLoader", "SubstrateInjection", "TweakInject",
-        "libsubstrate", "libhooker", "FridaGadget", "frida",
-        "frida-agent", "frida-gadget", "cynject", "cycript",
-        "libcycript", "SSLKillSwitch", "sslkillswitch",
-        "Flex", "flexloader", "Anywhere", "Cephei",
-        "RocketBootstrap", "PreferenceLoader", "PreferenceBundles",
-        "AppList", "libcolorpicker", "libstatusbar",
-        "libpackageinfo", "APTTimeOut", "NoCrash", "SafeMode",
-        "Dobby", "dobby", "libdobby",
-        "libfrida", "libfrida-gadget", "gadget", "libgadget",
-        "substitute", "libsubstitute", "libellekit", "ellekit",
-        "libSandy", "Sandy", "libKernBypass", "KernBypass",
-        "libChoicy", "Choicy", "libHideJB", "HideJB",
-        "libShadow", "Shadow", "libA-Bypass", "A-Bypass",
-        "libBypass", "Bypass", "libFlyJB", "FlyJB",
-        "libLiberty", "Liberty", "libLibertyLite", "LibertyLite",
-        "libHestia", "Hestia", "libKernbypass", "Kernbypass",
-        NULL
-    };
-    
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-        for (int j = 0; suspicious[j] != NULL; j++) {
-            if (strcasestr(name, suspicious[j]) != NULL) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
+static int (*orig_open)(const char *, int, ...);
+static int (*orig_openat)(int, const char *, int, ...);
+static int (*orig_access)(const char *, int);
+static int (*orig_stat)(const char *, struct stat *);
+static int (*orig_lstat)(const char *, struct stat *);
+static int (*orig_fstatat)(int, const char *, struct stat *, int);
+static FILE *(*orig_fopen)(const char *, const char *);
+static DIR *(*orig_opendir)(const char *);
+static int (*orig_connect)(int, const struct sockaddr *, socklen_t);
 
-static bool check_frida_ports(void) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-    
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(27042);
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 100000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    
-    int result = connect(sock, (struct sockaddr *)&addr, sizeof(addr));
-    close(sock);
-    return (result == 0);
+static int hook_open(const char *p, int f, ...) {
+    if (is_jb_path(p)) { errno = ENOENT; return -1; }
+    va_list ap; va_start(ap, f);
+    mode_t m = va_arg(ap, mode_t); va_end(ap);
+    return orig_open(p, f, m);
 }
-
-static bool is_injected(void) {
-    return check_suspicious_dylibs() || check_frida_ports();
+static int hook_openat(int fd, const char *p, int f, ...) {
+    if (is_jb_path(p)) { errno = ENOENT; return -1; }
+    va_list ap; va_start(ap, f);
+    mode_t m = va_arg(ap, mode_t); va_end(ap);
+    return orig_openat(fd, p, f, m);
+}
+static int hook_access(const char *p, int m) {
+    if (is_jb_path(p)) { errno = ENOENT; return -1; }
+    return orig_access(p, m);
+}
+static int hook_stat(const char *p, struct stat *s) {
+    if (is_jb_path(p)) { errno = ENOENT; return -1; }
+    return orig_stat(p, s);
+}
+static int hook_lstat(const char *p, struct stat *s) {
+    if (is_jb_path(p)) { errno = ENOENT; return -1; }
+    return orig_lstat(p, s);
+}
+static int hook_fstatat(int fd, const char *p, struct stat *s, int f) {
+    if (is_jb_path(p)) { errno = ENOENT; return -1; }
+    return orig_fstatat(fd, p, s, f);
+}
+static FILE *hook_fopen(const char *p, const char *m) {
+    if (is_jb_path(p)) { errno = ENOENT; return NULL; }
+    return orig_fopen(p, m);
+}
+static DIR *hook_opendir(const char *p) {
+    if (is_jb_path(p)) { errno = ENOENT; return NULL; }
+    return orig_opendir(p);
 }
 
 // ============================================================
-// 5. حماية من التلاعب بالكود (Anti-Tamper)
+// 4. تجاوز كشف المُحقّق (Debugger / ptrace / sysctl)
 // ============================================================
 
-static bool check_text_integrity(void) {
-    const struct mach_header_64 *header =
-        (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!header) return false;
-    if (header->magic != MH_MAGIC_64) return false;
-    if (header->cputype != CPU_TYPE_ARM64) return false;
-    if (header->filetype != MH_EXECUTE) return false;
-    return false; // طبيعي
-}
-
-static bool check_text_writable(void) {
-    const struct mach_header_64 *header =
-        (const struct mach_header_64 *)_dyld_get_image_header(0);
-    if (!header) return false;
-    
-    vm_address_t addr = (vm_address_t)header;
-    vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object_name;
-    
-    kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size,
-                                    VM_REGION_BASIC_INFO_64,
-                                    (vm_region_info_t)&info,
-                                    &info_count, &object_name);
-    if (kr == KERN_SUCCESS) {
-        if (info.protection & VM_PROT_WRITE) return true;
-    }
-    return false;
-}
-
-static bool is_tampered(void) {
-    return check_text_writable();
-}
-
-// ============================================================
-// 6. حماية من الهوك (Anti-Hook)
-// ============================================================
-
-static bool is_function_hooked(void *func_addr) {
-    if (!func_addr) return false;
-    uint32_t *code = (uint32_t *)func_addr;
-    uint32_t first = code[0];
-    
-    if ((first & 0xFC000000) == 0x14000000) return true;
-    
-    if ((first & 0x9F000000) == 0x90000000) {
-        uint32_t second = code[1];
-        if ((second & 0xFF800000) == 0x91000000) {
-            uint32_t third = code[2];
-            if ((third & 0xFFFFFC1F) == 0xD61F0000) return true;
-        }
-    }
-    
-    if ((first & 0xFF000000) == 0x58000000) {
-        uint32_t second = code[1];
-        if ((second & 0xFFFFFC1F) == 0xD61F0000) return true;
-    }
-    
-    return false;
-}
-
-static bool check_critical_functions_hooked(void) {
-    const char *critical_funcs[] = {
-        "open", "close", "read", "write", "ptrace",
-        "sysctl", "fork", "dlopen", "dlsym",
-        "malloc", "free", "objc_msgSend",
-        "method_exchangeImplementations",
-        "method_setImplementation",
-        NULL
-    };
-    for (int i = 0; critical_funcs[i] != NULL; i++) {
-        void *addr = dlsym(RTLD_DEFAULT, critical_funcs[i]);
-        if (addr && is_function_hooked(addr)) return true;
-    }
-    return false;
-}
-
-static bool check_got_plt(void) {
-    void *open_addr = dlsym(RTLD_DEFAULT, "open");
-    if (open_addr) {
-        Dl_info info;
-        if (dladdr(open_addr, &info) && info.dli_fname) {
-            if (strstr(info.dli_fname, "libsystem") == NULL &&
-                strstr(info.dli_fname, "libdyld") == NULL) {
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static bool is_hooked(void) {
-    return check_critical_functions_hooked() || check_got_plt();
-}
-
-// ============================================================
-// 7. حماية من الهندسة العكسية
-// ============================================================
-
-static bool is_simulator(void) {
-    #if TARGET_OS_SIMULATOR
-    return true;
-    #else
-    return false;
-    #endif
-}
-
-static bool is_virtual_environment(void) {
-    if (getenv("SIMULATOR_DEVICE_NAME")) return true;
-    if (getenv("SIMULATOR_ROOT")) return true;
-    return false;
-}
-
-// ============================================================
-// 8. حماية من الاعتراض (Anti-Interposition)
-// ============================================================
-
-static bool check_suspicious_env(void) {
-    const char *envs[] = {
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-        "DYLD_FRAMEWORK_PATH",
-        "DYLD_FALLBACK_LIBRARY_PATH",
-        "FRIDA_SERVER", "FRIDA_AGENT", "FRIDA_GADGET",
-        "CYCRIPT", "CYCRIPT_PORT",
-        NULL
-    };
-    for (int i = 0; envs[i] != NULL; i++) {
-        if (getenv(envs[i]) != NULL) return true;
-    }
-    return false;
-}
-
-static bool is_interposed(void) {
-    return check_suspicious_env();
-}
-
-// ============================================================
-// 9. الاستجابة الأمنية
-// ============================================================
-
-static void protective_response(const char *reason) {
-    NSLog(@"[PROTECT] Security violation: %s", reason);
-    
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIAlertController *alert = [UIAlertController
-            alertControllerWithTitle:@"Security Warning"
-            message:@"A security violation has been detected. The application will now close."
-            preferredStyle:UIAlertControllerStyleAlert];
-        
-        UIAlertAction *ok = [UIAlertAction
-            actionWithTitle:@"OK"
-            style:UIAlertActionStyleDefault
-            handler:^(UIAlertAction *action) { exit(0); }];
-        [alert addAction:ok];
-        
-        UIWindow *window = [[UIApplication sharedApplication] keyWindow];
-        if (!window) {
-            NSArray *windows = [[UIApplication sharedApplication] windows];
-            if (windows.count > 0) window = windows[0];
-        }
-        if (window && window.rootViewController) {
-            [window.rootViewController presentViewController:alert
-                                                    animated:YES
-                                                  completion:nil];
-        }
-    });
-    
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ exit(0); });
-}
-
-// ============================================================
-// 10. الفحص الشامل
-// ============================================================
-
-static void master_security_check(void) {
-    if (is_debugger_attached()) { protective_response("Debugger detected"); return; }
-    if (is_jailbroken())        { protective_response("Jailbreak detected"); return; }
-    if (is_injected())          { protective_response("Injection detected"); return; }
-    if (is_tampered())          { protective_response("Tampering detected"); return; }
-    if (is_hooked())            { protective_response("Hooking detected"); return; }
-    if (is_interposed())        { protective_response("Interposition detected"); return; }
-    if (is_simulator() || is_virtual_environment()) {
-        protective_response("Virtual environment detected");
-        return;
-    }
-    NSLog(@"[PROTECT] All security checks passed");
-}
-
-// ============================================================
-// 11. المراقبة المستمرة
-// ============================================================
-
-static void *monitor_thread(void *arg) {
-    while (1) {
-        sleep(2);
-        if (is_debugger_attached()) { protective_response("Debugger (monitor)"); break; }
-        if (is_injected())          { protective_response("Injection (monitor)"); break; }
-        if (is_hooked())            { protective_response("Hooking (monitor)"); break; }
-        if (check_suspicious_env()) { protective_response("DYLD (monitor)"); break; }
-    }
-    return NULL;
-}
-
-static void start_monitoring(void) {
-    pthread_t thread;
-    pthread_create(&thread, NULL, monitor_thread, NULL);
-    pthread_detach(thread);
-}
-
-// ============================================================
-// 12. هوك ptrace للحماية
-// ============================================================
-
+static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
+static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
 static int (*orig_ptrace)(int, pid_t, caddr_t, int);
 
-static int hooked_ptrace(int request, pid_t pid, caddr_t addr, int data) {
-    if (request == PT_DENY_ATTACH) return 0;
-    if (request == PT_ATTACH || request == PT_ATTACHEXC ||
-        request == PT_CONTINUE || request == PT_STEP ||
-        request == PT_READ_D || request == PT_WRITE_D) {
-        NSLog(@"[PROTECT] ptrace(%d) blocked", request);
-        return -1;
+// قائمة عداد لتفادي كشف "debugger=0/1"
+static int hook_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp,
+                       void *newp, size_t newlen) {
+    // CTL_KERN=1, KERN_PROC=14, KERN_PROC_PID=1  → بنية kinfo_proc
+    if (name && namelen >= 4 &&
+        name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
+        int r = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+        if (r == 0 && oldp && oldlenp && *oldlenp >= sizeof(struct kinfo_proc)) {
+            struct kinfo_proc *kp = (struct kinfo_proc *)oldp;
+            kp->kp_proc.p_flag &= ~P_TRACED;   // إزالة علم التتبع
+            kp->kp_proc.p_flag |=  P_LP64;     // إضافة علم سليم
+            kp->kp_proc.p_oppid = 0;
+        }
+        return r;
     }
-    if (orig_ptrace) {
-        return orig_ptrace(request, pid, addr, data);
+    // KERN_PROCARGS2 (التحقق من متغيرات البيئة)
+    if (name && namelen >= 3 && name[0] == CTL_KERN && name[1] == KERN_PROCARGS2) {
+        if (oldp && oldlenp) memset(oldp, 0, *oldlenp);
+        return 0;
     }
+    return orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
+}
+
+static int hook_sysctlbyname(const char *n, void *o, size_t *ol, void *ni, size_t nl) {
+    if (!n) return orig_sysctlbyname(n, o, ol, ni, nl);
+    // كشف الأدوات المعروفة
+    if (strcmp(n, "kern.proc.pid") == 0 || strcmp(n, "kern.procargs2") == 0) {
+        if (o && ol) memset(o, 0, *ol);
+        return 0;
+    }
+    // تعطيل تقارير الأخطاء المخصصة
+    if (strstr(n, "hw.optional.arm")) {
+        // لا نغيّر; لكن نمنع الإبلاغ عن قيم مريبة
+    }
+    return orig_sysctlbyname(n, o, ol, ni, nl);
+}
+
+static int hook_ptrace(int req, pid_t pid, caddr_t addr, int data) {
+    // PT_DENY_ATTACH=31 → نمنع تفعيله (يرجع نجاح بدون تنفيذ)
+    if (req == PT_DENY_ATTACH) return 0;
+    // نسمح بالاستدعاءات العادية
+    return orig_ptrace(req, pid, addr, data);
+}
+
+// ============================================================
+// 5. تجاوز كشف الحقن (dlopen / dyld / Frida)
+// ============================================================
+
+static void *(*orig_dlopen)(const char *, int);
+static void *(*orig_dlsym)(void *, const char *);
+static uint32_t (*orig_dyld_image_count)(void);
+static const char *(*orig_dyld_get_image_name)(uint32_t);
+
+// قائمة مكتبات نودّ إخفاءها
+static const char *g_hidden_images[] = {
+    "frida", "Frida", "gadget", "Substrate", "substitute",
+    "libhooker", "MyHook", "Dobby", "ElleKit", "TweakInject",
+    NULL
+};
+
+static void *hook_dlopen(const char *p, int f) {
+    if (kw_match(p, g_hidden_images)) {
+        NSLog(@"[HOOK] dlopen blocked: %s", p ? p : "(null)");
+        return NULL;
+    }
+    return orig_dlopen(p, f);
+}
+static void *hook_dlsym(void *h, const char *s) {
+    if (kw_match(s, g_hidden_images)) return NULL;
+    return orig_dlsym(h, s);
+}
+static uint32_t hook_dyld_image_count(void) {
+    return orig_dyld_image_count();
+}
+static const char *hook_dyld_get_image_name(uint32_t idx) {
+    const char *n = orig_dyld_get_image_name(idx);
+    if (kw_match(n, g_hidden_images)) return "/usr/lib/libSystem.B.dylib";
+    return n;
+}
+
+// ============================================================
+// 6. تعطيل Anti-Cheat SDK (AnoSDK / ACE)
+// ============================================================
+//   نُبطّل كل الدوال المُصدَّرة من إطار anogs.framework بحيث تُرجع قيمًا
+//   آمنة دون أداء أي وظيفة فعلية (لا إرسال تقارير، لا تحقق سلامة).
+
+#define STUB_VOID(name)  static void  (*orig_##name)(); \
+                         static void   hook_##name()  { NSLog(@"[ACE] %s() → neutralized", #name); }
+
+// دوال يرجع نوعها void/ptr/int — نعرّفها بحسب نوع الإرجاع المتوقع
+
+// --- الإصدار العام ---
+static int  (*orig_AnoSDKInit)(void *);
+static int   hook_AnoSDKInit(void *cfg) {
+    NSLog(@"[ACE] AnoSDKInit() blocked");
+    return 0; // نجاح وهمي
+}
+
+static int  (*orig_AnoSDKIoctl)(int, void *, int);
+static int   hook_AnoSDKIoctl(int cmd, void *p, int n) {
+    NSLog(@"[ACE] AnoSDKIoctl(%d) blocked", cmd);
+    return 0;
+}
+
+static int  (*orig_AnoSDKIoctlOld)(int, void *, int);
+static int   hook_AnoSDKIoctlOld(int cmd, void *p, int n) { return 0; }
+
+static int  (*orig_AnoSDKGetReportData)(void *, int);
+static int   hook_AnoSDKGetReportData(void *p, int n) { return 0; }
+
+static int  (*orig_AnoSDKGetReportData2)(void *, int, void *);
+static int   hook_AnoSDKGetReportData2(void *p, int n, void *o) { return 0; }
+
+static int  (*orig_AnoSDKDelReportData)(void *);
+static int   hook_AnoSDKDelReportData(void *p) { return 0; }
+
+static int  (*orig_AnoSDKSetUserInfo)(void *);
+static int   hook_AnoSDKSetUserInfo(void *u) { return 0; }
+
+static void (*orig_AnoSDKOnPause)(void);
+static void  hook_AnoSDKOnPause(void) {}
+static void (*orig_AnoSDKOnResume)(void);
+static void  hook_AnoSDKOnResume(void) {}
+
+static int  (*orig_AnoSDKOnRecvData)(void *, int);
+static int   hook_AnoSDKOnRecvData(void *p, int n) { return 0; }
+
+static int  (*orig_AnoSDKOnRecvSignature)(void *, int);
+static int   hook_AnoSDKOnRecvSignature(void *p, int n) { return 0; }
+
+// --- CheckSymbolSource: فحص مصدر الرموز (يكشف hooks) ---
+static int  (*orig_CheckSymbolSource)(void *);
+static int   hook_CheckSymbolSource(void *p) {
+    NSLog(@"[ACE] CheckSymbolSource() → clean");
+    return 0; // 0 = لا شيء مريب
+}
+
+// ============================================================
+// 7. تعطيل تقرير الأعطال (UQM / CrashSight / QAPM)
+// ============================================================
+
+// UQM::UQMCrash - كلها C++ mangled (كما ظهرت في imports.txt)
+// نستخدم hook على الرموز المُصدَّرة مباشرة
+
+typedef struct {
+    const char *sym;
+    void       *replacement;
+    void      **original;
+} sym_hook_t;
+
+// === بدائل فارغة ===
+static void noop_void(void) {}
+static int  noop_int(void) { return 0; }
+static void *noop_ptr(void) { return NULL; }
+
+// UQM
+static void hook_UQM_SetUserValue(void *, void *, void *) {}
+static void hook_UQM_SetCrashObserver(void *) {}
+static int  hook_UQM_ReportException(void) { return 0; }
+static void hook_UQM_SetCrashLogObserver(void *) {}
+static void hook_UQM_ConfigTimeout(int) {}
+static int  hook_UQM_Init(void *, bool, bool, void *) { return 0; }
+static void hook_UQM_LogInfo(int, void *, void *) {}
+static void hook_UQM_SetAppId(void *) {}
+static void hook_UQM_SetUserId(void *) {}
+
+// CrashSight
+static int  hook_CS_ReportStuck(void) { return 0; }
+static void hook_CS_TestOomCrash(void) {}
+static void hook_CS_ReportLogInfo(const char *, const char *) {}
+static int  hook_CS_GetCrashThreadId(void) { return 0; }
+static bool hook_CS_IsLastSessionCrash(void) { return false; }
+static void hook_CS_SetUploadThreadNum(int) {}
+static void hook_CS_ConfigCrashReporter(int) {}
+static int  hook_CS_ReportExceptionJson(void) { return 0; }
+static void hook_CS_SetCatchMultiSignal(bool) {}
+static int  hook_CS_GetLastSessionUserId(void *, int) { return 0; }
+
+// QAPM
+static void hook_QAPM_Report(void) {}
+static void hook_QAPM_SenceCustomPref(void) {}
+static void hook_QAPM_SenceEI(void) {}
+static void hook_QAPM_SencePI(void) {}
+
+// TDM
+static const char *hook_TdmEventNameEi(void) { return NULL; }
+static const char *hook_TdmEventNamePi(void) { return NULL; }
+
+// ============================================================
+// 8. تعطيل قنوات الإبلاغ النصية (Alert / Report)
+// ============================================================
+// نصوص مثل: "9010_alert:%s", "9005.hi2", "root_alert:%s"
+// نرصدها في NSLog / printf / fprintf / asl_log
+
+static void (*orig_NSLog)(NSString *, ...);
+static int  (*orig_printf)(const char *, ...);
+static int  (*orig_fprintf)(FILE *, const char *, ...);
+static int  (*orig_asl_log)(void *, int, int, const char *);
+
+static BOOL msg_is_risk(const char *m) {
+    return kw_match(m, g_risk_keywords);
+}
+
+static void hook_NSLog(NSString *fmt, ...) {
+    if (fmt) {
+        const char *s = [fmt UTF8String];
+        if (msg_is_risk(s)) return;
+    }
+    va_list ap; va_start(ap, fmt);
+    NSLogv(fmt, ap);
+    va_end(ap);
+}
+static int hook_printf(const char *fmt, ...) {
+    if (msg_is_risk(fmt)) return 0;
+    va_list ap; va_start(ap, fmt);
+    int r = vprintf(fmt, ap); va_end(ap);
+    return r;
+}
+static int hook_fprintf(FILE *f, const char *fmt, ...) {
+    if (msg_is_risk(fmt)) return 0;
+    va_list ap; va_start(ap, fmt);
+    int r = vfprintf(f, fmt, ap); va_end(ap);
+    return r;
+}
+
+// ============================================================
+// 9. تعطيل كشف تسجيل الشاشة (Screen Capture)
+// ============================================================
+
+static BOOL (*orig_isCaptured)(id, SEL);
+static BOOL hook_isCaptured(id self, SEL _cmd) {
+    NSLog(@"[HOOK] UIScreen.isCaptured → NO");
+    return NO;
+}
+
+// ============================================================
+// 10. تعطيل كشف المُحاكي (Emulator)
+// ============================================================
+//    سلسلة "emu_alert" تُطلق عندما يكتشف البرنامج بيئة محاكي
+//    عبر sysctlbyname("hw.machine") و "sysctl -n kern.hv_vmm_present"
+
+static int hook_sysctlbyname_emu(const char *n, void *o, size_t *ol, void *ni, size_t nl) {
+    if (n && strcmp(n, "kern.hv_vmm_present") == 0) {
+        int zero = 0;
+        if (o && ol && *ol >= sizeof(int)) {
+            memcpy(o, &zero, sizeof(int));
+            *ol = sizeof(int);
+        }
+        return 0;
+    }
+    return orig_sysctlbyname(n, o, ol, ni, nl);
+}
+
+// ============================================================
+// 11. تعطيل فحص السلامة (Integrity / CRC / tcj_encrypt)
+// ============================================================
+//    الدوال الداخلية غير مُصدَّرة. الحل: تعطيل نقطة الدخول
+//    من خلال استبدال دالة __TEXT::__text إن عُرفت عناوينها.
+//    في هذا القالب نضع مكاناً جاهزاً لتعطيل دوال مخصصة.
+
+static int (*orig_tcj_encrypt)(void *, void *, size_t);
+static int hook_tcj_encrypt(void *in, void *out, size_t n) {
+    // تمرير بدون تشفير — يُبطل فحص CRC المرتبط
+    if (in && out && n) memcpy(out, in, n);
+    return 0;
+}
+
+static int (*orig_HBCheck)(void *);
+static int hook_HBCheck(void *p) {
+    NSLog(@"[HOOK] HBCheck() → OK");
+    return 0;
+}
+
+// فحص الوحدات المشبوهة (black_module_macho)
+static int (*orig_check_black_module)(const char *, void *, void *, void *);
+static int hook_check_black_module(const char *path, void *a, void *b, void *c) {
+    NSLog(@"[HOOK] check_black_module(%s) → clean", path ? path : "?");
     return 0;
 }
 
 // ============================================================
-// 13. نقطة الدخول
+// 12. تعطيل كشف Flex / التعديلات (Substrate-based tweaks)
+// ============================================================
+//    نصوص: "SetKV|", "IsEnabled", "IsEnabled_1:", "IsEnabled_0:"
+
+static void (*orig_setKV)(id, SEL, id, id);
+static void hook_setKV(id self, SEL _cmd, id k, id v) {
+    NSLog(@"[HOOK] SetKV(%@, %@) suppressed", k, v);
+    // لا شيء — يمنع تسجيل حالة الحماية
+}
+
+// ============================================================
+// 13. تعطيل استعلامات DNS الخبيثة (WGGetHostByNameAsyncWithTag)
+// ============================================================
+
+static void (*orig_WGGetHostByNameAsyncWithTag)(const char *, int, void *);
+static void hook_WGGetHostByNameAsyncWithTag(const char *h, int t, void *cb) {
+    NSLog(@"[HOOK] DNS query blocked: %s", h ? h : "?");
+    // لا نستدعي الأصل
+}
+
+// ============================================================
+// 14. مساعد التثبيت الآمن
+// ============================================================
+
+static void hook_export(const char *name, void *repl, void **orig) {
+    void *addr = addr_from_symbol(name);
+    if (!addr) { NSLog(@"[HOOK] symbol not found: %s", name); return; }
+    void *clean = strip_pac(addr);
+    if (DobbyHook(clean, repl, orig) == 0)
+        NSLog(@"[HOOK] hooked %s @ %p", name, clean);
+    else
+        NSLog(@"[HOOK] FAILED hook %s @ %p", name, clean);
+}
+
+// تثبيت هوك دالة ObjC
+static void hook_objc_method(const char *cls, const char *sel,
+                             void *repl, void **orig) {
+    Class c = objc_getClass(cls);
+    if (!c) return;
+    Method m = class_getInstanceMethod(c, sel_registerName(sel));
+    if (!m) return;
+    if (orig) *orig = (void *)method_getImplementation(m);
+    method_setImplementation(m, (IMP)repl);
+    NSLog(@"[HOOK] ObjC %s[%s] hooked", cls, sel);
+}
+
+// ============================================================
+// 15. نقطة الدخول
 // ============================================================
 
 __attribute__((constructor))
-static void init_hooks() {
-    NSLog(@"[HOOK] ======================================");
-    NSLog(@"[HOOK] MyHook initializing...");
-    NSLog(@"[HOOK] ======================================");
-    
-    // 1. فحص أمني أولي
-    master_security_check();
-    
-    // 2. مراقبة مستمرة
-    start_monitoring();
-    
-    // 3. حماية ptrace
-    void *ptrace_addr = addr_from_symbol("ptrace");
-    if (ptrace_addr) {
-        DobbyHook(strip_pac(ptrace_addr),
-                  (void *)hooked_ptrace,
-                  (void **)&orig_ptrace);
-        NSLog(@"[HOOK] ptrace() protected");
-    }
-    
-    NSLog(@"[HOOK] ======================================");
-    NSLog(@"[HOOK] All protections installed ✅");
-    NSLog(@"[HOOK] ======================================");
+static void init_hooks(void) {
+    NSLog(@"[HOOK] ====== init_hooks ======");
+
+    // ---------- 1) طبقة نظام الملفات (JB) ----------
+    hook_export("open",         (void *)hook_open,       (void **)&orig_open);
+    hook_export("openat",       (void *)hook_openat,     (void **)&orig_openat);
+    hook_export("access",       (void *)hook_access,     (void **)&orig_access);
+    hook_export("stat",         (void *)hook_stat,       (void **)&orig_stat);
+    hook_export("lstat",        (void *)hook_lstat,      (void **)&orig_lstat);
+    hook_export("fstatat",      (void *)hook_fstatat,    (void **)&orig_fstatat);
+    hook_export("fopen",        (void *)hook_fopen,      (void **)&orig_fopen);
+    hook_export("opendir",      (void *)hook_opendir,    (void **)&orig_opendir);
+
+    // ---------- 2) كشف المُحقّق ----------
+    hook_export("sysctl",       (void *)hook_sysctl,     (void **)&orig_sysctl);
+    hook_export("sysctlbyname", (void *)hook_sysctlbyname_emu,
+                                (void **)&orig_sysctlbyname);
+    hook_export("ptrace",       (void *)hook_ptrace,     (void **)&orig_ptrace);
+
+    // ---------- 3) حقن المكتبات ----------
+    hook_export("dlopen",       (void *)hook_dlopen,     (void **)&orig_dlopen);
+    hook_export("dlsym",        (void *)hook_dlsym,      (void **)&orig_dlsym);
+    hook_export("_dyld_image_count",
+                                (void *)hook_dyld_image_count,
+                                (void **)&orig_dyld_image_count);
+    hook_export("_dyld_get_image_name",
+                                (void *)hook_dyld_get_image_name,
+                                (void **)&orig_dyld_get_image_name);
+
+    // ---------- 4) Anti-Cheat SDK ----------
+    hook_export("AnoSDKInit",           (void *)hook_AnoSDKInit,           (void **)&orig_AnoSDKInit);
+    hook_export("AnoSDKIoctl",          (void *)hook_AnoSDKIoctl,          (void **)&orig_AnoSDKIoctl);
+    hook_export("AnoSDKIoctlOld",       (void *)hook_AnoSDKIoctlOld,       (void **)&orig_AnoSDKIoctlOld);
+    hook_export("AnoSDKGetReportData",  (void *)hook_AnoSDKGetReportData,  (void **)&orig_AnoSDKGetReportData);
+    hook_export("AnoSDKGetReportData2", (void *)hook_AnoSDKGetReportData2, (void **)&orig_AnoSDKGetReportData2);
+    hook_export("AnoSDKDelReportData",  (void *)hook_AnoSDKDelReportData,  (void **)&orig_AnoSDKDelReportData);
+    hook_export("AnoSDKSetUserInfo",    (void *)hook_AnoSDKSetUserInfo,    (void **)&orig_AnoSDKSetUserInfo);
+    hook_export("AnoSDKOnPause",        (void *)hook_AnoSDKOnPause,        (void **)&orig_AnoSDKOnPause);
+    hook_export("AnoSDKOnResume",       (void *)hook_AnoSDKOnResume,       (void **)&orig_AnoSDKOnResume);
+    hook_export("AnoSDKOnRecvData",     (void *)hook_AnoSDKOnRecvData,     (void **)&orig_AnoSDKOnRecvData);
+    hook_export("AnoSDKOnRecvSignature",(void *)hook_AnoSDKOnRecvSignature,(void **)&orig_AnoSDKOnRecvSignature);
+    hook_export("CheckSymbolSource",    (void *)hook_CheckSymbolSource,    (void **)&orig_CheckSymbolSource);
+
+    // ---------- 5) Crash Reporting (UQM) ----------
+    hook_export("_ZN3UQM8UQMCrash12SetUserValueERKNS_9UQMStringES3_", (void *)hook_UQM_SetUserValue, (void **)&orig_UQM_SetUserValue);
+    hook_export("_ZN3UQM8UQMCrash16SetCrashObserverEPNS_16UQMCrashObserverE", (void *)hook_UQM_SetCrashObserver, (void **)&orig_UQM_SetCrashObserver);
+    hook_export("_ZN3UQM8UQMCrash18ReportExceptionPRVEiRKNS_9UQMStringES3_S3_RKNS_9UQMVectorINS_9UQMKVPairELj16EEES3_bi", (void *)hook_UQM_ReportException, (void **)&orig_UQM_ReportException);
+    hook_export("_ZN3UQM8UQMCrash19SetCrashLogObserverEPNS_19UQMCrashLogObserverE", (void *)hook_UQM_SetCrashLogObserver, (void **)&orig_UQM_SetCrashLogObserver);
+    hook_export("_ZN3UQM8UQMCrash24ConfigCrashHandleTimeoutEi", (void *)hook_UQM_ConfigTimeout, (void **)&orig_UQM_ConfigTimeout);
+    hook_export("_ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_", (void *)hook_UQM_Init, (void **)&orig_UQM_Init);
+    hook_export("_ZN3UQM8UQMCrash7LogInfoEiRKNS_9UQMStringES3_", (void *)hook_UQM_LogInfo, (void **)&orig_UQM_LogInfo);
+    hook_export("_ZN3UQM8UQMCrash8SetAppIdERKNS_9UQMStringE", (void *)hook_UQM_SetAppId, (void **)&orig_UQM_SetAppId);
+    hook_export("_ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE", (void *)hook_UQM_SetUserId, (void **)&orig_UQM_SetUserId);
+
+    // ---------- 6) Crash Reporting (CrashSight) ----------
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent11ReportStuckEiilPKcS3_S3_iS3_", (void *)hook_CS_ReportStuck, (void **)&orig_CS_ReportStuck);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent12TestOomCrashEv", (void *)hook_CS_TestOomCrash, (void **)&orig_CS_TestOomCrash);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent13ReportLogInfoEPKcS3_", (void *)hook_CS_ReportLogInfo, (void **)&orig_CS_ReportLogInfo);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent16GetCrashThreadIdEv", (void *)hook_CS_GetCrashThreadId, (void **)&orig_CS_GetCrashThreadId);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent18IsLastSessionCrashEv", (void *)hook_CS_IsLastSessionCrash, (void **)&orig_CS_IsLastSessionCrash);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent18SetUploadThreadNumEi", (void *)hook_CS_SetUploadThreadNum, (void **)&orig_CS_SetUploadThreadNum);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent19ConfigCrashReporterEi", (void *)hook_CS_ConfigCrashReporter, (void **)&orig_CS_ConfigCrashReporter);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent19ReportExceptionJsonEiPKcS3_S3_S3_iS3_", (void *)hook_CS_ReportExceptionJson, (void **)&orig_CS_ReportExceptionJson);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent19SetCatchMultiSignalEb", (void *)hook_CS_SetCatchMultiSignal, (void **)&orig_CS_SetCatchMultiSignal);
+    hook_export("_ZN6GCloud10CrashSight21CrashSightMobileAgent20GetLastSessionUserIdEPvi", (void *)hook_CS_GetLastSessionUserId, (void **)&orig_CS_GetLastSessionUserId);
+
+    // ---------- 7) QAPM / TDM ----------
+    hook_export("QAPMReport",                  (void *)hook_QAPM_Report, (void **)&orig_NSLog /* reuse */);
+    hook_export("QAPMReportSenceCustomPref",   (void *)hook_QAPM_SenceCustomPref, (void **)&orig_NSLog);
+    hook_export("QAPMReportSenceEI",           (void *)hook_QAPM_SenceEI, (void **)&orig_NSLog);
+    hook_export("QAPMReportSencePI",           (void *)hook_QAPM_SencePI, (void **)&orig_NSLog);
+    hook_export("TdmEventNameEi",              (void *)hook_TdmEventNameEi, (void **)&orig_NSLog);
+    hook_export("TdmEventNamePi",              (void *)hook_TdmEventNamePi, (void **)&orig_NSLog);
+
+    // ---------- 8) قنوات الإبلاغ النصية ----------
+    hook_export("NSLog",   (void *)hook_NSLog,   (void **)&orig_NSLog);
+    hook_export("printf",  (void *)hook_printf,  (void **)&orig_printf);
+    hook_export("fprintf", (void *)hook_fprintf, (void **)&orig_fprintf);
+
+    // ---------- 9) DNS الخبيث ----------
+    hook_export("WGGetHostByNameAsyncWithTag",
+                (void *)hook_WGGetHostByNameAsyncWithTag,
+                (void **)&orig_WGGetHostByNameAsyncWithTag);
+
+    // ---------- 10) كشف تسجيل الشاشة (ObjC) ----------
+    hook_objc_method("UIScreen", "isCaptured",
+                     (void *)hook_isCaptured, (void **)&orig_isCaptured);
+
+    // ---------- 11) فحوصات داخلية (إن عُرفت عناوينها) ----------
+    //    عدّل العناوين التالية حسب نتائج Hopper/IDA لنسختك
+    //    مثال: tcj_encrypt / HBCheck / check_black_module
+    //
+    //    void *tcj  = addr_from_vmaddr("anogs", 0xXXXXXX);
+    //    void *hb   = addr_from_vmaddr("anogs", 0xYYYYYY);
+    //    void *blk  = addr_from_vmaddr("anogs", 0xZZZZZZ);
+    //    if (tcj) DobbyHook(strip_pac(tcj), (void*)hook_tcj_encrypt, (void**)&orig_tcj_encrypt);
+    //    if (hb ) DobbyHook(strip_pac(hb ), (void*)hook_HBCheck,      (void**)&orig_HBCheck);
+    //    if (blk) DobbyHook(strip_pac(blk), (void*)hook_check_black_module,
+    //                                       (void**)&orig_check_black_module);
+
+    NSLog(@"[HOOK] ====== all hooks installed ======");
 }
