@@ -18,13 +18,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # ---------- 1. Checkout ----------
       - name: 📥 Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # ---------- 2. Setup Xcode ----------
       - name: 🛠️ Setup Xcode
         run: |
           set -euo pipefail
@@ -32,7 +30,6 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
-      # ---------- 3. Cache Theos ----------
       - name: 💾 Cache Theos
         id: cache-theos
         uses: actions/cache@v4
@@ -40,7 +37,6 @@ jobs:
           path: /opt/theos
           key: ${{ runner.os }}-theos-v5
 
-      # ---------- 4. Install Theos ----------
       - name: 📦 Install Theos
         if: steps.cache-theos.outputs.cache-hit != 'true'
         run: |
@@ -49,36 +45,40 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" "$THEOS"
           git clone --recursive --depth 1 \
             https://github.com/theos/theos.git "$THEOS"
-          # Theos يتضمّن ldid خاصته — لا حاجة لـ brew
-          test -x "$THEOS/bin/ldid" || { echo "❌ ldid missing in Theos"; exit 1; }
-          echo "✅ Theos installed"
+          echo "✅ Theos cloned"
 
-      # ---------- 5. Configure Theos ----------
+      - name: 🔐 Install ldid
+        run: |
+          set -euo pipefail
+          brew install ldid
+          LDPATH="$(which ldid)"
+          echo "ldid found at: $LDPATH"
+          cp "$LDPATH" "$THEOS/bin/ldid"
+          chmod +x "$THEOS/bin/ldid"
+          "$THEOS/bin/ldid" -v 2>&1 | head -3 || true
+          echo "✅ ldid ready at $THEOS/bin/ldid"
+
       - name: 🔧 Configure Theos
         run: |
           set -euo pipefail
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
           ls -la "$THEOS/makefiles/" | head
+          ls -la "$THEOS/bin/ldid"
 
-      # ---------- 6. Verify required files ----------
       - name: 📋 Verify files
         run: |
           set -euo pipefail
-          echo "=== Root files ==="
           ls -la
-          echo "=== Check required files ==="
           test -f Makefile     || { echo "❌ Makefile missing";    exit 1; }
           test -f MyHook.mm    || { echo "❌ MyHook.mm missing";   exit 1; }
           test -f dobby.h      || { echo "❌ dobby.h missing";     exit 1; }
           test -f libdobby.a   || { echo "❌ libdobby.a missing";  exit 1; }
           echo "✅ All required files present"
 
-      # ---------- 7. Build Dylib ----------
       - name: 🔨 Build Dylib
         run: |
           set -euo pipefail
-          set -o pipefail
           export THEOS="$THEOS"
           export PATH="$THEOS/bin:$PATH"
 
@@ -92,28 +92,23 @@ jobs:
             ARCHS="arm64 arm64e" \
             -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build.log
 
-      # ---------- 8. Verify output ----------
       - name: 🔍 Verify output
         run: |
           set -euo pipefail
-          echo "=== Packages ==="
           ls -la packages/
 
-          echo "=== Locate dylib ==="
           DYLIB="$(find .theos -name 'MyHook.dylib' -type f | head -1)"
           [ -n "$DYLIB" ] || { echo "❌ MyHook.dylib not found"; exit 1; }
           echo "✅ Dylib: $DYLIB"
           ls -lh "$DYLIB"
-
-          echo "=== Verify architectures ==="
           lipo -info "$DYLIB"
+
           ARCHS="$(lipo -archs "$DYLIB")"
           echo "Detected archs: $ARCHS"
           echo "$ARCHS" | grep -qw "arm64"  || { echo "❌ arm64 missing";  exit 1; }
           echo "$ARCHS" | grep -qw "arm64e" || { echo "❌ arm64e missing"; exit 1; }
           echo "✅ Both arm64 and arm64e present"
 
-      # ---------- 9. Upload Dylib ----------
       - name: 📤 Upload Dylib
         uses: actions/upload-artifact@v4
         with:
@@ -122,7 +117,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # ---------- 10. Upload .deb ----------
       - name: 📤 Upload .deb
         uses: actions/upload-artifact@v4
         with:
@@ -131,7 +125,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # ---------- 11. Upload build log ----------
       - name: 📤 Upload log
         if: always()
         uses: actions/upload-artifact@v4
@@ -140,7 +133,6 @@ jobs:
           path: build.log
           if-no-files-found: ignore
 
-      # ---------- 12. Release on tag ----------
       - name: 🚀 Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
