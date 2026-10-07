@@ -2,10 +2,17 @@ name: Build MyHook Dylib
 
 on:
   push:
-    branches: [ main, master ]
-    tags: [ 'v*' ]
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+
   pull_request:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
+
   workflow_dispatch:
 
 env:
@@ -13,133 +20,316 @@ env:
 
 jobs:
   build:
-    name: Build Dylib (arm64 + arm64e)
+    name: Theos Build — arm64 + arm64e
     runs-on: macos-14
     timeout-minutes: 30
 
     steps:
-      - name: 📥 Checkout
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 🛠️ Setup Xcode
+      # ============================================================
+      # XCODE / SDK
+      # ============================================================
+      - name: Setup Xcode
+        shell: bash
         run: |
-          set -euo pipefail
-          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
+          set -Eeuo pipefail
 
-      - name: 💾 Cache Theos
+          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+          echo "=== Xcode ==="
+          xcodebuild -version
+
+          echo "=== iPhoneOS SDK ==="
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          test -d "$SDK_PATH"
+
+          echo "SDK: $SDK_PATH"
+
+      # ============================================================
+      # CACHE THEOS
+      # ============================================================
+      - name: Cache Theos
         id: cache-theos
         uses: actions/cache@v4
         with:
           path: /opt/theos
           key: ${{ runner.os }}-theos-v6
 
-      - name: 📦 Install Theos
+      # ============================================================
+      # INSTALL THEOS
+      # ============================================================
+      - name: Install Theos
         if: steps.cache-theos.outputs.cache-hit != 'true'
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
           sudo mkdir -p "$THEOS"
           sudo chown -R "$(id -u):$(id -g)" "$THEOS"
-          git clone --recursive --depth 1 \
-            https://github.com/theos/theos.git "$THEOS"
-          echo "✅ Theos cloned"
 
-      - name: 🔐 Install ldid (prebuilt binary → \$THEOS/bin)
+          git clone \
+            --recursive \
+            --depth 1 \
+            https://github.com/theos/theos.git \
+            "$THEOS"
+
+          test -d "$THEOS/makefiles"
+          test -d "$THEOS/bin"
+
+          echo "Theos installed successfully."
+
+      # ============================================================
+      # INSTALL LDID
+      # ============================================================
+      - name: Install ldid
+        shell: bash
         run: |
-          set -euo pipefail
-          curl -fsSL -o /tmp/ldid \
+          set -Eeuo pipefail
+
+          mkdir -p "$THEOS/bin"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --output /tmp/ldid \
             https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
-          chmod +x /tmp/ldid
-          cp /tmp/ldid "$THEOS/bin/ldid"
-          chmod +x "$THEOS/bin/ldid"
-          "$THEOS/bin/ldid" -v 2>&1 | head -3 || true
-          echo "✅ ldid installed at $THEOS/bin/ldid"
 
-      - name: 🔧 Configure Theos
+          test -s /tmp/ldid
+
+          chmod +x /tmp/ldid
+          install -m 755 /tmp/ldid "$THEOS/bin/ldid"
+
+          test -x "$THEOS/bin/ldid"
+
+          echo "=== ldid ==="
+          "$THEOS/bin/ldid" -v
+
+      # ============================================================
+      # CONFIGURE ENVIRONMENT
+      # ============================================================
+      - name: Configure Theos
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
-          test -x "$THEOS/bin/ldid" || { echo "❌ ldid missing"; exit 1; }
-          ls -la "$THEOS/bin/ldid"
 
-      - name: 📋 Verify files
+          export PATH="$THEOS/bin:$PATH"
+
+          test -d "$THEOS"
+          test -d "$THEOS/makefiles"
+          test -x "$THEOS/bin/ldid"
+
+          echo "THEOS=$THEOS"
+          echo "PATH=$PATH"
+
+      # ============================================================
+      # VERIFY SOURCE FILES
+      # ============================================================
+      - name: Verify Project
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          echo "=== Project ==="
+          pwd
           ls -la
-          test -f Makefile     || { echo "❌ Makefile missing";    exit 1; }
-          test -f MyHook.mm    || { echo "❌ MyHook.mm missing";   exit 1; }
-          test -f dobby.h      || { echo "❌ dobby.h missing";     exit 1; }
-          test -f libdobby.a   || { echo "❌ libdobby.a missing";  exit 1; }
-          echo "✅ All required files present"
 
-      - name: 🔨 Build with Theos
+          test -f Makefile
+          test -f MyHook.mm
+          test -f dobby.h
+          test -f libdobby.a
+
+          echo "Required project files found."
+
+      # ============================================================
+      # VERIFY DOBBY ARCHITECTURES
+      # ============================================================
+      - name: Verify libdobby.a
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+
+          echo "=== libdobby.a architectures ==="
+
+          lipo -info libdobby.a
+
+          ARCHS="$(lipo -archs libdobby.a)"
+
+          echo "Detected: $ARCHS"
+
+          echo "$ARCHS" | grep -qw "arm64" || {
+            echo "ERROR: libdobby.a does not contain arm64"
+            exit 1
+          }
+
+          echo "$ARCHS" | grep -qw "arm64e" || {
+            echo "ERROR: libdobby.a does not contain arm64e"
+            exit 1
+          }
+
+          echo "libdobby.a contains arm64 + arm64e."
+
+      # ============================================================
+      # THEOS BUILD ONLY
+      # ============================================================
+      - name: Build with Theos
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
           export THEOS="$THEOS"
           export PATH="$THEOS/bin:$PATH"
+
+          rm -f build.log
+
+          echo "========================================"
+          echo " THEOS BUILD"
+          echo "========================================"
+
+          echo "THEOS: $THEOS"
+          echo "ARCHS: arm64 arm64e"
 
           echo "=== Clean ==="
           make clean
 
-          echo "=== Build (arm64 + arm64e) ==="
-          make package \
+          echo "=== Build ==="
+
+          make \
+            package \
             FINALPACKAGE=1 \
             DEBUG=0 \
             ARCHS="arm64 arm64e" \
-            -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build.log
+            -j"$(sysctl -n hw.ncpu)" \
+            2>&1 | tee build.log
 
-      - name: 🔍 Verify output
+          echo "Theos build completed successfully."
+
+      # ============================================================
+      # VERIFY DYLIB
+      # ============================================================
+      - name: Verify Dylib
+        shell: bash
         run: |
-          set -euo pipefail
-          ls -la packages/
+          set -Eeuo pipefail
 
-          DYLIB="$(find .theos -name 'MyHook.dylib' -type f | head -1)"
-          [ -n "$DYLIB" ] || { echo "❌ MyHook.dylib not found"; exit 1; }
-          echo "✅ Dylib: $DYLIB"
+          DYLIB=".theos/obj/MyHook.dylib"
+
+          test -f "$DYLIB" || {
+            echo "ERROR: $DYLIB was not generated."
+            exit 1
+          }
+
+          echo "========================================"
+          echo " DYLIB"
+          echo "========================================"
+
           ls -lh "$DYLIB"
+
+          echo "=== Architectures ==="
           lipo -info "$DYLIB"
 
           ARCHS="$(lipo -archs "$DYLIB")"
-          echo "Detected archs: $ARCHS"
-          echo "$ARCHS" | grep -qw "arm64"  || { echo "❌ arm64 missing";  exit 1; }
-          echo "$ARCHS" | grep -qw "arm64e" || { echo "❌ arm64e missing"; exit 1; }
-          echo "✅ Both arm64 and arm64e present"
 
-      - name: 📤 Upload Dylib
+          echo "Detected: $ARCHS"
+
+          echo "$ARCHS" | grep -qw "arm64" || {
+            echo "ERROR: arm64 missing from dylib."
+            exit 1
+          }
+
+          echo "$ARCHS" | grep -qw "arm64e" || {
+            echo "ERROR: arm64e missing from dylib."
+            exit 1
+          }
+
+          COUNT="$(echo "$ARCHS" | wc -w | tr -d ' ')"
+
+          test "$COUNT" -eq 2 || {
+            echo "ERROR: Unexpected architecture count: $COUNT"
+            exit 1
+          }
+
+          echo "SUCCESS: MyHook.dylib contains arm64 + arm64e."
+
+      # ============================================================
+      # VERIFY THEOS PACKAGE
+      # ============================================================
+      - name: Verify Package
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "=== packages ==="
+
+          test -d packages
+          ls -lah packages/
+
+          DEB="$(find packages -maxdepth 1 -type f -name '*.deb' | head -1)"
+
+          test -n "$DEB" || {
+            echo "ERROR: Theos did not generate a .deb package."
+            exit 1
+          }
+
+          echo "Package: $DEB"
+
+      # ============================================================
+      # UPLOAD DYLIB
+      # ============================================================
+      - name: Upload Dylib
         uses: actions/upload-artifact@v4
         with:
-          name: MyHook-dylib
+          name: MyHook-dylib-arm64-arm64e
           path: .theos/obj/MyHook.dylib
           if-no-files-found: error
           retention-days: 30
 
-      - name: 📤 Upload .deb
+      # ============================================================
+      # UPLOAD DEB
+      # ============================================================
+      - name: Upload DEB
         uses: actions/upload-artifact@v4
         with:
-          name: MyHook-deb
+          name: MyHook-deb-arm64-arm64e
           path: packages/*.deb
           if-no-files-found: error
           retention-days: 30
 
-      - name: 📤 Upload log
+      # ============================================================
+      # UPLOAD BUILD LOG
+      # ============================================================
+      - name: Upload Build Log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: MyHook-build-log
           path: build.log
           if-no-files-found: ignore
+          retention-days: 30
 
-      - name: 🚀 Release
+      # ============================================================
+      # RELEASE
+      # ============================================================
+      - name: Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            packages/*.deb
             .theos/obj/MyHook.dylib
+            packages/*.deb
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
