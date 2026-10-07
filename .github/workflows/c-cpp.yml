@@ -35,7 +35,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /opt/theos
-          key: ${{ runner.os }}-theos-v5
+          key: ${{ runner.os }}-theos-v6
 
       - name: 📦 Install Theos
         if: steps.cache-theos.outputs.cache-hit != 'true'
@@ -47,23 +47,23 @@ jobs:
             https://github.com/theos/theos.git "$THEOS"
           echo "✅ Theos cloned"
 
-      - name: 🔐 Install ldid
+      - name: 🔐 Install ldid (prebuilt binary → \$THEOS/bin)
         run: |
           set -euo pipefail
-          brew install ldid
-          LDPATH="$(which ldid)"
-          echo "ldid found at: $LDPATH"
-          cp "$LDPATH" "$THEOS/bin/ldid"
+          curl -fsSL -o /tmp/ldid \
+            https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
+          chmod +x /tmp/ldid
+          cp /tmp/ldid "$THEOS/bin/ldid"
           chmod +x "$THEOS/bin/ldid"
           "$THEOS/bin/ldid" -v 2>&1 | head -3 || true
-          echo "✅ ldid ready at $THEOS/bin/ldid"
+          echo "✅ ldid installed at $THEOS/bin/ldid"
 
       - name: 🔧 Configure Theos
         run: |
           set -euo pipefail
           echo "THEOS=$THEOS" >> "$GITHUB_ENV"
           echo "$THEOS/bin" >> "$GITHUB_PATH"
-          ls -la "$THEOS/makefiles/" | head
+          test -x "$THEOS/bin/ldid" || { echo "❌ ldid missing"; exit 1; }
           ls -la "$THEOS/bin/ldid"
 
       - name: 📋 Verify files
@@ -76,7 +76,7 @@ jobs:
           test -f libdobby.a   || { echo "❌ libdobby.a missing";  exit 1; }
           echo "✅ All required files present"
 
-      - name: 🔨 Build Dylib
+      - name: 🔨 Build with Theos
         run: |
           set -euo pipefail
           export THEOS="$THEOS"
