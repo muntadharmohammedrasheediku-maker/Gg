@@ -37,7 +37,6 @@ jobs:
           set -Eeuo pipefail
           ROOT="$PWD/deps/OpenSSL.xcframework"
 
-          # ★ استبعد simulator و maccatalyst
           IOS_FW=""
           for d in "$ROOT"/*; do
             [ -d "$d" ] || continue
@@ -65,7 +64,6 @@ jobs:
           [ -f "$HEADERS_DIR/evp.h" ] || { echo "FATAL: evp.h missing"; exit 1; }
           [ -f "$BINARY" ] || { echo "FATAL: binary missing"; exit 1; }
 
-          # symlink openssl -> . ليعمل #include <openssl/evp.h>
           if [ ! -e "$HEADERS_DIR/openssl" ]; then
             ln -s . "$HEADERS_DIR/openssl"
             echo "Created symlink: openssl -> ."
@@ -144,7 +142,10 @@ jobs:
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 
-          # ★ ربط framework بشكل صحيح + rpath
+          echo "=== Undefined symbols pre-flight ==="
+          nm -u defcrypto.o defcrypto_bridge.o ShadowBypassXK.o ShadowMonitorXK.o \
+            | grep -Ev '^$|^[^ ]+\.o:$' | sort -u | head -80 || true
+
           clang++ -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -dynamiclib -O2 \
             -o ShadowXK.dylib \
@@ -155,6 +156,10 @@ jobs:
             -F "$OSSL_FW_PARENT" -framework OpenSSL \
             -framework Foundation \
             -framework UIKit \
+            -framework CoreGraphics \
+            -framework QuartzCore \
+            -framework CoreImage \
+            -framework CoreFoundation \
             -framework Security \
             -framework AdSupport \
             -lz \
@@ -176,17 +181,21 @@ jobs:
           echo "=== Bridge exports ==="
           nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || echo "(no exports found)"
           echo ""
+          echo "=== Undefined symbols (should be only system/libSystem) ==="
+          nm -u ShadowXK.dylib | grep -Ev '^\s*$|^$' | head -80 || true
+          echo ""
           echo "=== Size ==="
           ls -lh ShadowXK.dylib
 
       - name: Package with framework
         run: |
           set -Eeuo pipefail
+          rm -rf ShadowXK-pkg
           mkdir -p ShadowXK-pkg/Frameworks
           cp ShadowXK.dylib ShadowXK-pkg/
           cp -R "$OSSL_FW" ShadowXK-pkg/Frameworks/
           echo "=== Package contents ==="
-          find ShadowXK-pkg -type f | head -20
+          find ShadowXK-pkg -type f | head -40
           du -sh ShadowXK-pkg
 
       - name: Upload artifact
