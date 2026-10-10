@@ -1,10 +1,9 @@
 // ============================================================================
-// ShadowBypass XK v7.10.3 — iOS 14+ arm64 — ملف واحد كامل
+// ShadowBypass XK v7.10.4 — iOS 14+ arm64 — ملف واحد كامل مع تشفير مدمج
 //
-// يشمل كل الإصلاحات:
-//   v7.10.1 : إصلاح subscript pointer + فواصل منقوطة
-//   v7.10.2 : fishhook مصحح (indirectsymoff = uint32_t[])
-//   v7.10.3 : تنظيف ملفات مُصحَّح + g_viewer_done + حماية crash-loop
+//   - كل إصلاحات v7.10.3 (fishhook + crash-loop + cleanup)
+//   - تشفير defcrypto مدمج عبر الجسر
+//   - self-test للتشفير في الـconstructor
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -26,6 +25,8 @@
 #import <sys/mman.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
+#import <sys/socket.h>
+#import "defcrypto_bridge.h"
 
 // ============================================================================
 // القسم 0: تشفير النصوص XOR
@@ -126,7 +127,7 @@ static inline void sbxk_antidebug_timing(void) {
 static atomic_int  g_phase       = 0;
 static atomic_bool g_pending     = false;
 static atomic_int  g_crash_fd    = -1;
-static atomic_bool g_viewer_done = false;   // ← v7.10.3: علامة اكتمال العارض
+static atomic_bool g_viewer_done = false;
 
 #define SBXK_WLIT(fd, lit) do { \
     static const char _s[] = lit; \
@@ -151,6 +152,44 @@ static void sbxk_whex(int fd, const void *p) {
     char b[20]; int i = 0;
     while (v > 0 && i < 19) { b[i++] = hx[v & 0xF]; v >>= 4; }
     while (i > 0) { char c = b[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
+}
+
+// ============================================================================
+// القسم 1b: مساعد التشفير (defcrypto bridge wrappers)
+// ============================================================================
+
+static NSData *SBXK_EncryptData(NSData *data, NSData *password) {
+    if (!data.length || !password.length) return nil;
+    uint8_t buf[16384];
+    size_t blen = 0;
+    int rc = sbxk_encrypt_pwd(data.bytes, data.length,
+                              password.bytes, password.length,
+                              NULL, 0,
+                              buf, sizeof(buf), &blen);
+    if (rc != 0) return nil;
+    return [NSData dataWithBytes:buf length:blen];
+}
+
+static NSData *SBXK_DecryptData(NSData *data, NSData *password) {
+    if (!data.length || !password.length) return nil;
+    uint8_t buf[16384];
+    size_t blen = 0;
+    int rc = sbxk_decrypt_pwd(data.bytes, data.length,
+                              password.bytes, password.length,
+                              NULL, 0,
+                              buf, sizeof(buf), &blen);
+    if (rc != 0) return nil;
+    return [NSData dataWithBytes:buf length:blen];
+}
+
+static NSData *SBXK_RandomKey(void) {
+    uint8_t buf[32];
+    if (sbxk_random_key(buf) != 0) return nil;
+    return [NSData dataWithBytes:buf length:32];
+}
+
+static void SBXK_SecureWipe(void *p, size_t n) {
+    sbxk_wipe(p, n);
 }
 
 // ============================================================================
@@ -995,7 +1034,7 @@ struct sbxk_rb { const char *name; void *repl; void **replaced; };
 static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
                              struct sbxk_rb *b, int nb)
 {
-    if (mh->magic != MH_MAGIC_64) return 0;
+    if (!mh || mh->magic != MH_MAGIC_64) return 0;
     const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
     const struct segment_command_64 *le = NULL;
     const struct symtab_command *st = NULL;
@@ -1031,14 +1070,14 @@ static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
                 uint32_t start = sec->reserved1;
                 for (uint32_t k = 0; k < cnt; k++) {
                     uint32_t si = ind[start + k];
-                    if (si == 0 || si == 0x80000000u) continue;
-                    if (si >= nsyms) continue;
+                    if (si == 0 || si == 0x80000000u || si >= nsyms) continue;
                     const char *nm = str + sym[si].n_un.n_strx;
                     if (!nm || nm[0] != '_') continue;
                     const char *cl = nm + 1;
                     for (int x = 0; x < nb; x++) {
                         if (strcmp(b[x].name, cl) != 0) continue;
                         void **slot = (void **)(sl + sec->addr + k * sizeof(void *));
+                        if (!slot) continue;
                         if (b[x].replaced && *b[x].replaced == NULL) *b[x].replaced = *slot;
                         uintptr_t pg = (uintptr_t)slot & ~(PAGE_SIZE - 1);
                         kern_return_t kr = vm_protect(mach_task_self_, pg, PAGE_SIZE,
@@ -1811,7 +1850,7 @@ static void SBXK_RegReal(void) {
 }
 
 // ============================================================================
-// القسم 17: عارض سجل الأعطال (محدّث: يضبط g_viewer_done)
+// القسم 17: عارض سجل الأعطال
 // ============================================================================
 
 @interface SBXK_LogViewer : NSObject @end
@@ -1826,8 +1865,7 @@ static void SBXK_RegReal(void) {
                    dispatch_get_main_queue(), ^{ [self show]; });
 }
 + (void)show {
-    NSString *p = [NSHomeDirectory()
-                   stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
     NSData *d = [NSData dataWithContentsOfFile:p];
     if (!d.length) { atomic_store(&g_viewer_done, true); return; }
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
@@ -1852,15 +1890,11 @@ static void SBXK_RegReal(void) {
         w = [UIApplication sharedApplication].keyWindow;
 #pragma clang diagnostic pop
     }
-    // ← حتى لو ما نعرض، نعتبر العارض خلص والتنظيف يمشي
     atomic_store(&g_viewer_done, true);
-
     if (!w || !w.rootViewController || w.rootViewController.presentedViewController) return;
-    UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"SBXK" message:s
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"SBXK" message:s
         preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK"
-        style:UIAlertActionStyleDefault handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [w.rootViewController presentViewController:a animated:YES completion:nil];
 }
 @end
@@ -1868,20 +1902,14 @@ static void SBXK_RegReal(void) {
 // ============================================================================
 // القسم 18: تنظيف ملفات مُصحَّح
 // ============================================================================
-//
-// القاعدة الذهبية: نحذف ملفاتنا أولاً — هي اللي تحتوي أسماءنا في stack traces.
-// نحترم MMKV/Gamelet/state — عدم وجودها أسوأ من وجودها.
 
 static NSArray<NSString *> *sbxk_cleanup_exact_paths(void) {
     NSString *home = NSHomeDirectory();
     NSString *docs = [home stringByAppendingPathComponent:@"Documents"];
     NSString *lib  = [home stringByAppendingPathComponent:@"Library"];
     return @[
-        // ملفاتنا (الأولوية القصوى)
         [docs stringByAppendingPathComponent:@"sbxk_crash.log"],
         [docs stringByAppendingPathComponent:@"sbxk_crash_prev.log"],
-
-        // سجلات crash الخاصة بـSDK — قد تحتوي اسم dylib في backtrace
         [docs stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/UQMCrash"],
         [docs stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/CrashSight"],
         [docs stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/ano_crash.txt"],
@@ -1898,13 +1926,12 @@ static NSArray<NSString *> *sbxk_cleanup_dirs(void) {
     ];
 }
 
-// استثناءات — لا نحذفها أبداً
 static BOOL sbxk_should_skip(NSString *name) {
     if (!name.length) return YES;
-    if ([name isEqualToString:@"MMKV"])         return YES;  // حالة anti-cheat
-    if ([name isEqualToString:@"Gamelet"])      return YES;  // mini-game
+    if ([name isEqualToString:@"MMKV"])         return YES;
+    if ([name isEqualToString:@"Gamelet"])      return YES;
     if ([name isEqualToString:@"mmkv.default"]) return YES;
-    if ([name isEqualToString:@"kvcache8.dat"]) return YES;  // بصمة الجهاز
+    if ([name isEqualToString:@"kvcache8.dat"]) return YES;
     if ([name hasSuffix:@".crc"])               return YES;
     if ([name hasSuffix:@".sig"])               return YES;
     if ([name hasSuffix:@".dat"])               return YES;
@@ -1916,20 +1943,14 @@ static void sbxk_do_cleanup(void) {
     @try {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSError *err = nil;
-
-        // 1) الملفات المحددة بالضبط
         for (NSString *p in sbxk_cleanup_exact_paths()) {
-            // لا تحذف sbxk_crash_prev.log قبل أن يقرأه العارض
             if (!atomic_load(&g_viewer_done) &&
                 [p hasSuffix:@"sbxk_crash_prev.log"]) continue;
-
             if ([fm fileExistsAtPath:p]) {
                 [fm removeItemAtPath:p error:&err];
                 err = nil;
             }
         }
-
-        // 2) الملفات داخل مجلدات محددة — فقط .log/.txt/.dump/.stack
         for (NSString *dir in sbxk_cleanup_dirs()) {
             if (![fm fileExistsAtPath:dir]) continue;
             NSArray *items = [fm contentsOfDirectoryAtPath:dir error:&err];
@@ -1951,10 +1972,7 @@ static void sbxk_do_cleanup(void) {
 __attribute__((constructor))
 static void sbxk_start_cleanup_timer(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // تنظيف أولي فوري
         sbxk_do_cleanup();
-
-        // ثم كل 2 ثانية — نافذة قصيرة جداً
         [NSTimer scheduledTimerWithTimeInterval:2.0
                                          repeats:YES
                                            block:^(NSTimer *t) {
@@ -2000,7 +2018,7 @@ static void SBXK_Run(void) {
         return;
     }
     sbxk_mark_ok();
-    NSLog(@"[SBXK] v7.10.3 done=%lu skip=%lu",
+    NSLog(@"[SBXK] v7.10.4 done=%lu skip=%lu",
           (unsigned long)g_done.count, (unsigned long)g_skip.count);
 }
 
@@ -2016,7 +2034,15 @@ static void SBXK_Boot(void) {
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
         SBXK_ANTIDEBUG();
-        NSLog(@"[SBXK] v7.10.3 boot");
+        NSLog(@"[SBXK] v7.10.4 boot");
+
+        // ★ self-test للتشفير
+        uint8_t test_key[32];
+        if (sbxk_random_key(test_key) == 0) {
+            NSLog(@"[SBXK] crypto ready, hw_aes=%d", sbxk_has_hw_aes());
+            sbxk_wipe(test_key, 32);
+        }
+
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
