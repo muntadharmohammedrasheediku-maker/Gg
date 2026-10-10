@@ -29,7 +29,7 @@ jobs:
             https://github.com/krzyzanowskim/OpenSSL/releases/download/3.3.2000/OpenSSL.xcframework.zip
           unzip -q openssl.zip
           rm -f openssl.zip
-          echo "=== Available slices ==="
+          echo "=== Slices ==="
           ls -la OpenSSL.xcframework/
 
       - name: Prepare OpenSSL paths
@@ -51,44 +51,33 @@ jobs:
             fi
           done
 
-          if [ -z "$IOS_FW" ]; then
-            echo "FATAL: no iOS device framework found"
-            ls -la "$ROOT"
-            exit 1
-          fi
+          [ -n "$IOS_FW" ] || { echo "FATAL: no iOS device framework"; ls -la "$ROOT"; exit 1; }
           echo "Found: $IOS_FW"
 
           HEADERS_DIR="$IOS_FW/Headers"
           BINARY="$IOS_FW/OpenSSL"
 
           [ -f "$HEADERS_DIR/evp.h" ] || { echo "FATAL: evp.h missing"; exit 1; }
-          [ -f "$BINARY" ] || { echo "FATAL: binary missing"; exit 1; }
+          [ -f "$BINARY" ]            || { echo "FATAL: binary missing"; exit 1; }
 
           if [ ! -e "$HEADERS_DIR/openssl" ]; then
             ln -s . "$HEADERS_DIR/openssl"
-            echo "Created symlink: openssl -> ."
+            echo "Created symlink openssl -> ."
           fi
           test -f "$HEADERS_DIR/openssl/evp.h" || { echo "FATAL: symlink broken"; exit 1; }
 
-          echo "OSSL_INC=$HEADERS_DIR" >> $GITHUB_ENV
-          echo "OSSL_FW=$IOS_FW" >> $GITHUB_ENV
-          echo "OSSL_BIN=$BINARY" >> $GITHUB_ENV
-          echo "OSSL_FW_PARENT=$(dirname "$IOS_FW")" >> $GITHUB_ENV
-
-          echo "=== Paths ==="
-          echo "INC:         $HEADERS_DIR"
-          echo "FW:          $IOS_FW"
-          echo "FW_PARENT:   $(dirname "$IOS_FW")"
-          echo "BIN:         $BINARY"
+          echo "OSSL_INC=$HEADERS_DIR"                      >> $GITHUB_ENV
+          echo "OSSL_FW=$IOS_FW"                            >> $GITHUB_ENV
+          echo "OSSL_FW_PARENT=$(dirname "$IOS_FW")"        >> $GITHUB_ENV
           file "$BINARY"
 
-      - name: Verify required headers
+      - name: Verify headers
         run: |
           set -Eeuo pipefail
           for h in evp.h kdf.h core_names.h param_build.h rand.h crypto.h; do
             test -f "$OSSL_INC/openssl/$h" || { echo "missing: $h"; exit 1; }
           done
-          echo "All required OpenSSL headers present"
+          echo "headers OK"
 
       - name: Compile defcrypto.o
         run: |
@@ -97,7 +86,7 @@ jobs:
           clang++ -std=c++20 -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -O2 -fPIC \
             -fvisibility=hidden -fvisibility-inlines-hidden \
-            -I "$OSSL_INC" \
+            -I "$OSSL_INC" -I . \
             -c defcrypto.cpp -o defcrypto.o
           file defcrypto.o
 
@@ -107,7 +96,7 @@ jobs:
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           clang++ -std=c++20 -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -O2 -fPIC -fvisibility=hidden \
-            -I "$OSSL_INC" \
+            -I "$OSSL_INC" -I . \
             -c defcrypto_bridge.cpp -o defcrypto_bridge.o
           file defcrypto_bridge.o
 
@@ -137,7 +126,7 @@ jobs:
             -c ShadowMonitorXK.m -o ShadowMonitorXK.o
           file ShadowMonitorXK.o
 
-      - name: Link unified dylib
+      - name: Link ShadowXK.dylib
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -172,30 +161,23 @@ jobs:
       - name: Verify
         run: |
           set -Eeuo pipefail
-          echo "=== File info ==="
+          echo "=== info ==="
           file ShadowXK.dylib
-          echo ""
-          echo "=== Linked libraries ==="
+          echo "=== linked libs ==="
           otool -L ShadowXK.dylib
-          echo ""
-          echo "=== Bridge exports ==="
-          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || echo "(no exports found)"
-          echo ""
-          echo "=== Undefined symbols (should be only system/libSystem) ==="
-          nm -u ShadowXK.dylib | grep -Ev '^\s*$|^$' | head -80 || true
-          echo ""
-          echo "=== Size ==="
+          echo "=== exports ==="
+          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw|derive_key)" || echo "(none)"
+          echo "=== size ==="
           ls -lh ShadowXK.dylib
 
-      - name: Package with framework
+      - name: Package
         run: |
           set -Eeuo pipefail
           rm -rf ShadowXK-pkg
           mkdir -p ShadowXK-pkg/Frameworks
           cp ShadowXK.dylib ShadowXK-pkg/
           cp -R "$OSSL_FW" ShadowXK-pkg/Frameworks/
-          echo "=== Package contents ==="
-          find ShadowXK-pkg -type f | head -40
+          find ShadowXK-pkg -type f | head -30
           du -sh ShadowXK-pkg
 
       - name: Upload artifact
