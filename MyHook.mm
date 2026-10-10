@@ -1,7 +1,7 @@
 // ==========================================================================
-// MyHook.mm — Tweak كامل بـ CommonCrypto (لا OpenSSL)
+// MyHook.mm — Tweak كامل بدون OpenSSL وبدون private APIs
+// Build: Theos + clang (C++20)
 // Target: iOS 15+ / arm64 + arm64e
-// Build:  theos + clang
 // ==========================================================================
 
 #import <Foundation/Foundation.h>
@@ -12,24 +12,49 @@
 #import <CommonCrypto/CommonHMAC.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
+#import <dispatch/dispatch.h>
+#import <sys/types.h>
 #import <sys/sysctl.h>
 #import <mach-o/dyld.h>
-#import <chrono>
-#import <mutex>
-#import <string>
-#import <vector>
-#import <sstream>
-#import <algorithm>
-#import <cmath>
-#import <random>
+
+#include <cstring>
+#include <cstdint>
+#include <cstddef>
+#include <chrono>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <sstream>
+#include <algorithm>
+#include <cmath>
+#include <random>
 
 // ==========================================================================
-// SECTION 1 — AESGCM (CommonCrypto, no OpenSSL)
+// SECTION 1 — AES-256-CBC + HMAC-SHA256 (Encrypt-then-MAC)
+// Format: IV(16) || ciphertext || HMAC-SHA256(32)
 // ==========================================================================
 
-static const size_t kAESKeyLen   = 32;  // AES-256
-static const size_t kAESNonceLen = 12;  // GCM nonce
-static const size_t kAESTagLen   = 16;  // GCM tag
+static const size_t kAESKeyLen  = 32;   // AES-256
+static const size_t kAESIVLen   = 16;   // CBC block size
+static const size_t kAESMacLen  = 32;   // HMAC-SHA256 output
+
+// Constant-time comparison — يمنع timing attacks
+static bool AEGIS_ConstantTimeEqual(const uint8_t *a, const uint8_t *b, size_t n) {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < n; ++i) {
+        diff |= (uint8_t)(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+static NSData *AEGIS_HMAC_SHA256(NSData *key, NSData *data) {
+    uint8_t out[CC_SHA256_DIGEST_LENGTH];
+    CCHmac(kCCHmacAlgSHA256,
+           key.bytes, key.length,
+           data.bytes, data.length,
+           out);
+    return [NSData dataWithBytes:out length:CC_SHA256_DIGEST_LENGTH];
+}
 
 @interface AESGCM : NSObject
 @property (nonatomic, copy, readonly) NSData *key;
@@ -37,7 +62,7 @@ static const size_t kAESTagLen   = 16;  // GCM tag
 + (instancetype)randomKey;
 - (instancetype)initWithKey:(NSData *)key;
 
-// Layout of return: nonce(12) || ciphertext || tag(16)
+// Layout: IV(16) || ciphertext || HMAC(32)
 - (nullable NSData *)seal:(NSData *)plaintext error:(NSError **)error;
 - (nullable NSData *)open:(NSData *)sealed    error:(NSError **)error;
 @end
@@ -65,117 +90,120 @@ static const size_t kAESTagLen   = 16;  // GCM tag
     return self;
 }
 
+// Derive subkeys via HMAC(master, label)
+- (NSData *)deriveEncKey {
+    static NSData *label = nil;
+    if (!label) label = [@"aegis.enc.v1" dataUsingEncoding:NSUTF8StringEncoding];
+    return AEGIS_HMAC_SHA256(_key, label);
+}
+
+- (NSData *)deriveMacKey {
+    static NSData *label = nil;
+    if (!label) label = [@"aegis.mac.v1" dataUsingEncoding:NSUTF8StringEncoding];
+    return AEGIS_HMAC_SHA256(_key, label);
+}
+
 - (NSData *)seal:(NSData *)plaintext error:(NSError **)error {
-    uint8_t nonce[kAESNonceLen];
-    if (CCRandomGenerateBytes(nonce, kAESNonceLen) != kCCSuccess) {
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:-10 userInfo:nil];
+    // 1) Random IV
+    uint8_t iv[kAESIVLen];
+    if (CCRandomGenerateBytes(iv, kAESIVLen) != kCCSuccess) {
+        if (error) *error = [NSError errorWithDomain:@"AEGIS" code:-10 userInfo:nil];
         return nil;
     }
 
-    NSMutableData *out = [NSMutableData dataWithLength:kAESNonceLen +
-                                                 plaintext.length +
-                                                 kAESTagLen];
-    uint8_t *outBytes = out.mutableBytes;
-    memcpy(outBytes, nonce, kAESNonceLen);
+    // 2) Derive subkeys
+    NSData *encKey = [self deriveEncKey];
+    NSData *macKey = [self deriveMacKey];
 
-    CCCryptorRef crypto = NULL;
-    CCCryptorStatus st = CCCryptorCreateWithMode(
-        kCCEncrypt, kCCModeGCM, kCCAlgorithmAES, ccNoPadding,
-        nonce, self.key.bytes, kAESKeyLen,
-        NULL, 0, 0, 0, &crypto);
-    if (st != kCCSuccess) {
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
-        return nil;
-    }
-
+    // 3) Encrypt with AES-256-CBC + PKCS7 padding
+    const size_t bufSize = plaintext.length + kCCBlockSizeAES128;
+    NSMutableData *ct = [NSMutableData dataWithLength:bufSize];
     size_t written = 0;
-    st = CCCryptorUpdate(crypto, plaintext.bytes, plaintext.length,
-                         outBytes + kAESNonceLen, plaintext.length, &written);
+
+    CCCryptorStatus st = CCCrypt(
+        kCCEncrypt,
+        kCCAlgorithmAES,
+        kCCOptionPKCS7Padding,
+        encKey.bytes, encKey.length,
+        iv,
+        plaintext.bytes, plaintext.length,
+        ct.mutableBytes, bufSize,
+        &written);
     if (st != kCCSuccess) {
-        CCCryptorRelease(crypto);
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
+        if (error) *error = [NSError errorWithDomain:@"AEGIS" code:st userInfo:nil];
         return nil;
     }
+    ct.length = written;
 
-    size_t finalLen = 0;
-    st = CCCryptorFinal(crypto, outBytes + kAESNonceLen + written,
-                        plaintext.length - written, &finalLen);
-    if (st != kCCSuccess) {
-        CCCryptorRelease(crypto);
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
-        return nil;
-    }
+    // 4) HMAC over IV || ciphertext
+    NSMutableData *macInput = [NSMutableData dataWithCapacity:kAESIVLen + ct.length];
+    [macInput appendBytes:iv length:kAESIVLen];
+    [macInput appendData:ct];
+    NSData *tag = AEGIS_HMAC_SHA256(macKey, macInput);
 
-    size_t tagLen = kAESTagLen;
-    st = CCCryptorGCMFinal(crypto,
-                           outBytes + kAESNonceLen + written + finalLen,
-                           &tagLen);
-    CCCryptorRelease(crypto);
-
-    if (st != kCCSuccess) {
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
-        return nil;
-    }
-
-    out.length = kAESNonceLen + written + finalLen + kAESTagLen;
+    // 5) Output: IV || ciphertext || tag
+    NSMutableData *out = [NSMutableData dataWithCapacity:
+                          kAESIVLen + ct.length + kAESMacLen];
+    [out appendBytes:iv length:kAESIVLen];
+    [out appendData:ct];
+    [out appendData:tag];
     return out;
 }
 
 - (NSData *)open:(NSData *)sealed error:(NSError **)error {
-    if (sealed.length < kAESNonceLen + kAESTagLen) {
-        if (error) *error = [NSError errorWithDomain:@"AESGCM"
+    if (sealed.length < kAESIVLen + kAESMacLen) {
+        if (error) *error = [NSError errorWithDomain:@"AEGIS"
                                                 code:-11
                                             userInfo:@{NSLocalizedDescriptionKey:
                                                        @"short input"}];
         return nil;
     }
 
-    const uint8_t *in = sealed.bytes;
-    const size_t ctLen = sealed.length - kAESNonceLen - kAESTagLen;
+    const uint8_t *base = (const uint8_t *)sealed.bytes;
+    const uint8_t *iv   = base;
+    const size_t   ctLen = sealed.length - kAESIVLen - kAESMacLen;
+    const uint8_t *ct   = base + kAESIVLen;
+    const uint8_t *tag  = ct + ctLen;
 
-    NSMutableData *out = [NSMutableData dataWithLength:ctLen];
+    // 1) Derive subkeys
+    NSData *encKey = [self deriveEncKey];
+    NSData *macKey = [self deriveMacKey];
 
-    CCCryptorRef crypto = NULL;
-    CCCryptorStatus st = CCCryptorCreateWithMode(
-        kCCDecrypt, kCCModeGCM, kCCAlgorithmAES, ccNoPadding,
-        in, self.key.bytes, kAESKeyLen,
-        NULL, 0, 0, 0, &crypto);
-    if (st != kCCSuccess) {
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
+    // 2) Verify HMAC BEFORE decryption
+    NSMutableData *macInput = [NSMutableData dataWithCapacity:kAESIVLen + ctLen];
+    [macInput appendBytes:iv length:kAESIVLen];
+    [macInput appendBytes:ct length:ctLen];
+    NSData *expected = AEGIS_HMAC_SHA256(macKey, macInput);
+
+    if (expected.length != kAESMacLen ||
+        !AEGIS_ConstantTimeEqual((const uint8_t *)expected.bytes, tag, kAESMacLen)) {
+        if (error) *error = [NSError errorWithDomain:@"AEGIS"
+                                                code:-12
+                                            userInfo:@{NSLocalizedDescriptionKey:
+                                                       @"auth failed"}];
         return nil;
     }
 
-    // Tag must be provided BEFORE Update for GCM decrypt
-    st = CCCryptorGCMFinalize(crypto,
-                              (void *)(in + kAESNonceLen + ctLen),
-                              kAESTagLen);
-    if (st != kCCSuccess) {
-        CCCryptorRelease(crypto);
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
-        return nil;
-    }
-
+    // 3) Decrypt
+    const size_t bufSize = ctLen + kCCBlockSizeAES128;
+    NSMutableData *pt = [NSMutableData dataWithLength:bufSize];
     size_t written = 0;
-    st = CCCryptorUpdate(crypto, in + kAESNonceLen, ctLen,
-                         out.mutableBytes, ctLen, &written);
+
+    CCCryptorStatus st = CCCrypt(
+        kCCDecrypt,
+        kCCAlgorithmAES,
+        kCCOptionPKCS7Padding,
+        encKey.bytes, encKey.length,
+        iv,
+        ct, ctLen,
+        pt.mutableBytes, bufSize,
+        &written);
     if (st != kCCSuccess) {
-        CCCryptorRelease(crypto);
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
+        if (error) *error = [NSError errorWithDomain:@"AEGIS" code:st userInfo:nil];
         return nil;
     }
-
-    size_t finalLen = 0;
-    st = CCCryptorFinal(crypto, out.mutableBytes + written,
-                        ctLen - written, &finalLen);
-    CCCryptorRelease(crypto);
-
-    if (st != kCCSuccess) {
-        if (error) *error = [NSError errorWithDomain:@"AESGCM" code:st userInfo:nil];
-        return nil;
-    }
-
-    out.length = written + finalLen;
-    return out;
+    pt.length = written;
+    return pt;
 }
 
 @end
@@ -190,15 +218,8 @@ static NSData *AEGIS_SHA256(NSData *data) {
     return [NSData dataWithBytes:digest length:CC_SHA256_DIGEST_LENGTH];
 }
 
-static NSData *AEGIS_HMAC_SHA256(NSData *key, NSData *data) {
-    uint8_t out[CC_SHA256_DIGEST_LENGTH];
-    CCHmac(kCCHmacAlgSHA256, key.bytes, key.length,
-           data.bytes, data.length, out);
-    return [NSData dataWithBytes:out length:CC_SHA256_DIGEST_LENGTH];
-}
-
 // ==========================================================================
-// SECTION 3 — Types
+// SECTION 3 — Types (C++20)
 // ==========================================================================
 
 struct AEGISFrame {
@@ -372,7 +393,7 @@ struct AEGISVerdict {
 
     if (frames.empty()) return v;
 
-    v.human = 0.5f;  // no ML model => neutral
+    v.human = 0.5f;
 
     std::vector<double> speeds, jerks, reacts, fires;
     speeds.reserve(frames.size());
@@ -394,16 +415,9 @@ struct AEGISVerdict {
     v.anomaly = (float)std::clamp(-combined / 6.0, -1.0, 1.0);
     v.iso     = (float)aegis::isolation_score(speeds);
 
-    // reason strings
-    if (v.human < 0.30f) {
-        v.reasons.push_back("ml.human=" + std::to_string(v.human));
-    }
-    if (v.anomaly < -0.5f) {
-        v.reasons.push_back("stat.anomaly=" + std::to_string(v.anomaly));
-    }
-    if (v.iso < -0.4f) {
-        v.reasons.push_back("iso=" + std::to_string(v.iso));
-    }
+    if (v.human < 0.30f)   v.reasons.push_back("ml.human=" + std::to_string(v.human));
+    if (v.anomaly < -0.5f) v.reasons.push_back("stat.anomaly=" + std::to_string(v.anomaly));
+    if (v.iso < -0.4f)     v.reasons.push_back("iso=" + std::to_string(v.iso));
     if (!reacts.empty()) {
         double minr = *std::min_element(reacts.begin(), reacts.end());
         if (minr < 0.08) v.reasons.push_back("react.min=" + std::to_string(minr));
@@ -478,7 +492,7 @@ struct AEGISVerdict {
 @end
 
 // ==========================================================================
-// SECTION 8 — Integrity Checks
+// SECTION 8 — Integrity
 // ==========================================================================
 
 static bool AEGIS_HasDebugger(void) {
@@ -513,14 +527,14 @@ static bool AEGIS_HasSuspiciousEnv(void) {
 }
 
 static bool AEGIS_IntegrityOK(void) {
-    if (AEGIS_HasDebugger())        return false;
-    if (AEGIS_HasSuspiciousDylibs())return false;
-    if (AEGIS_HasSuspiciousEnv())   return false;
+    if (AEGIS_HasDebugger())         return false;
+    if (AEGIS_HasSuspiciousDylibs()) return false;
+    if (AEGIS_HasSuspiciousEnv())    return false;
     return true;
 }
 
 // ==========================================================================
-// SECTION 9 — Shared Global State
+// SECTION 9 — Global State
 // ==========================================================================
 
 static AEGISRegistry *gRegistry = nil;
@@ -541,7 +555,7 @@ static void AEGIS_Bootstrap(void) {
 }
 
 // ==========================================================================
-// SECTION 10 — Public API (used by game hook)
+// SECTION 10 — Public API
 // ==========================================================================
 
 void AEGIS_IngestFrame(NSString *sessionID, const AEGISFrame& f) {
@@ -549,7 +563,6 @@ void AEGIS_IngestFrame(NSString *sessionID, const AEGISFrame& f) {
     AEGISSession *s = [gRegistry getOrCreate:sessionID ?: @"unknown"];
     [s ingest:f];
 
-    // Evaluate + log every 30 frames
     if (s.count % 30 == 0) {
         auto frames = [s snapshot:kSeqLen];
         AEGISVerdict v = [gAnalyzer evaluate:frames total:s.count];
@@ -568,9 +581,7 @@ NSData *AEGIS_Seal(NSData *plaintext) {
     AEGIS_Bootstrap();
     NSError *e = nil;
     NSData *out = [gCipher seal:plaintext error:&e];
-    if (!out) {
-        NSLog(@"[AEGIS] seal error: %@", e);
-    }
+    if (!out) NSLog(@"[AEGIS] seal error: %@", e);
     return out;
 }
 
@@ -578,9 +589,7 @@ NSData *AEGIS_Open(NSData *sealed) {
     AEGIS_Bootstrap();
     NSError *e = nil;
     NSData *out = [gCipher open:sealed error:&e];
-    if (!out) {
-        NSLog(@"[AEGIS] open error: %@", e);
-    }
+    if (!out) NSLog(@"[AEGIS] open error: %@", e);
     return out;
 }
 
@@ -589,16 +598,16 @@ bool AEGIS_CheckIntegrity(void) {
 }
 
 // ==========================================================================
-// SECTION 11 — Constructor: hook install
+// SECTION 11 — Constructor
 // ==========================================================================
 
 __attribute__((constructor))
 static void MyHook_Init(void) {
     @autoreleasepool {
         AEGIS_Bootstrap();
-        NSLog(@"[MyHook] loaded — integrity=%s", AEGIS_IntegrityOK() ? "OK" : "FAIL");
+        NSLog(@"[MyHook] loaded — integrity=%s",
+              AEGIS_IntegrityOK() ? "OK" : "FAIL");
 
-        // Example: hook a UIViewController's viewDidAppear just to verify tweak runs
         Class VC = objc_getClass("UIViewController");
         if (VC) {
             SEL orig = @selector(viewDidAppear:);
@@ -614,7 +623,7 @@ static void MyHook_Init(void) {
 }
 
 // ==========================================================================
-// SECTION 12 — Swizzled implementation (must be in category)
+// SECTION 12 — Swizzled Category
 // ==========================================================================
 
 @interface UIViewController (AEGISHook)
@@ -623,10 +632,8 @@ static void MyHook_Init(void) {
 @implementation UIViewController (AEGISHook)
 
 - (void)aegis_viewDidAppear:(BOOL)animated {
-    // Call original (swapped)
     [self aegis_viewDidAppear:animated];
 
-    // Sanity check: seal + open roundtrip on first appearance
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         NSString *hello = @"AEGIS handshake";
@@ -635,7 +642,8 @@ static void MyHook_Init(void) {
         NSData *rt = AEGIS_Open(ct);
         NSString *back = [[NSString alloc] initWithData:rt
                                                encoding:NSUTF8StringEncoding];
-        NSLog(@"[MyHook] crypto roundtrip: %@", [back isEqualToString:hello] ? @"PASS" : @"FAIL");
+        NSLog(@"[MyHook] crypto roundtrip: %@",
+              [back isEqualToString:hello] ? @"PASS" : @"FAIL");
     });
 }
 
