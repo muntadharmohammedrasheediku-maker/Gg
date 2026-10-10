@@ -1,6 +1,9 @@
-name: build-shadowxk
+name: build-shadowxk-unified
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -15,82 +18,130 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
       - name: List repo files
-        run: ls -la
-
-      - name: Syntax check — ShadowBypassXK.m
         run: |
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -fobjc-arc -O0 \
-            -Wno-incompatible-pointer-types \
-            -Wno-implicit-function-declaration \
-            -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
-            -fsyntax-only \
-            ShadowBypassXK.m
+          echo "=== Repo files ==="
+          ls -la
 
-      - name: Syntax check — ShadowMonitorXK.m
+      - name: Fetch OpenSSL 3.x xcframework for iOS
         run: |
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -fobjc-arc -O0 \
-            -Wno-incompatible-pointer-types \
-            -Wno-implicit-function-declaration \
-            -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
-            -fsyntax-only \
-            ShadowMonitorXK.m
+          set -Eeuo pipefail
+          mkdir -p deps
+          cd deps
+          curl -fsSL -o openssl.zip \
+            https://github.com/krzyzanowskim/OpenSSL/releases/download/3.3.2000/OpenSSL.xcframework.zip
+          unzip -q openssl.zip
+          rm -f openssl.zip
+          echo "=== XCFramework structure ==="
+          find OpenSSL.xcframework -maxdepth 2 -type d
 
-      - name: Build ShadowBypassXK.dylib
+      - name: Set OpenSSL env
+        run: |
+          set -Eeuo pipefail
+          R="$PWD/deps/OpenSSL.xcframework"
+          if [ -d "$R/ios-arm64" ]; then
+            D="$R/ios-arm64"
+          elif [ -d "$R/ios-arm64_armv7" ]; then
+            D="$R/ios-arm64_armv7"
+          elif [ -d "$R/ios-arm64-arm64e" ]; then
+            D="$R/ios-arm64-arm64e"
+          else
+            echo "cannot find ios-arm64 in $R"
+            find "$R" -maxdepth 2 -type d
+            exit 1
+          fi
+          echo "OSSL_INC=$D/Headers" >> $GITHUB_ENV
+          echo "OSSL_LIB=$D" >> $GITHUB_ENV
+          echo "=== IOS slice ==="
+          ls -la "$D"
+          echo "=== Headers ==="
+          ls -la "$D/Headers" 2>/dev/null || ls -la "$D/include" 2>/dev/null || true
+
+      - name: Compile defcrypto.o
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -fobjc-arc -fblocks -O2 -dynamiclib \
-            -Wno-incompatible-pointer-types \
-            -Wno-implicit-function-declaration \
-            -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
-            ShadowBypassXK.m \
-            -framework Foundation -framework UIKit -framework Security \
-            -framework AdSupport -framework AppTrackingTransparency \
-            -o ShadowBypassXK.dylib
+          clang++ -std=c++20 -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 -O2 -fPIC \
+            -fvisibility=hidden -fvisibility-inlines-hidden \
+            -I "$OSSL_INC" \
+            -c defcrypto.cpp -o defcrypto.o
+          file defcrypto.o
 
-      - name: Build ShadowMonitorXK.dylib
+      - name: Compile defcrypto_bridge.o
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -arch arm64 \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -fobjc-arc -fblocks -O2 -dynamiclib \
-            -Wno-incompatible-pointer-types \
-            -Wno-implicit-function-declaration \
+          clang++ -std=c++20 -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 -O2 -fPIC -fvisibility=hidden \
+            -I "$OSSL_INC" \
+            -c defcrypto_bridge.cpp -o defcrypto_bridge.o
+          file defcrypto_bridge.o
+
+      - name: Compile ShadowBypassXK.o
+        run: |
+          set -Eeuo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang -x objective-c++ -std=c++20 -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
             -Wno-nullability-completeness \
             -Wno-deprecated-declarations \
-            ShadowMonitorXK.m \
-            -framework Foundation -framework UIKit -framework Security \
-            -o ShadowMonitorXK.dylib
+            -Wno-incompatible-pointer-types \
+            -I "$OSSL_INC" -I . \
+            -c ShadowBypassXK.m -o ShadowBypassXK.o
+          file ShadowBypassXK.o
 
-      - name: Verify outputs
+      - name: Compile ShadowMonitorXK.o
         run: |
-          file ShadowBypassXK.dylib ShadowMonitorXK.dylib
-          echo "---"
-          otool -L ShadowBypassXK.dylib
-          echo "---"
-          otool -L ShadowMonitorXK.dylib
+          set -Eeuo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang -x objective-c++ -std=c++20 -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
+            -Wno-nullability-completeness \
+            -Wno-deprecated-declarations \
+            -Wno-incompatible-pointer-types \
+            -I "$OSSL_INC" -I . \
+            -c ShadowMonitorXK.m -o ShadowMonitorXK.o
+          file ShadowMonitorXK.o
 
-      - name: Upload artifacts
+      - name: Link unified dylib
+        run: |
+          set -Eeuo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang++ -arch arm64 -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 -dynamiclib -O2 \
+            -o ShadowXK.dylib \
+            defcrypto.o \
+            defcrypto_bridge.o \
+            ShadowBypassXK.o \
+            ShadowMonitorXK.o \
+            "$OSSL_LIB/libcrypto.a" \
+            "$OSSL_LIB/libssl.a" \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Security \
+            -framework AdSupport \
+            -lz
+          file ShadowXK.dylib
+
+      - name: Verify
+        run: |
+          set -Eeuo pipefail
+          echo "=== File info ==="
+          file ShadowXK.dylib
+          echo ""
+          echo "=== Linked libraries ==="
+          otool -L ShadowXK.dylib
+          echo ""
+          echo "=== Exported bridge symbols ==="
+          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || echo "(none found — check visibility)"
+          echo ""
+          echo "=== Size ==="
+          ls -lh ShadowXK.dylib
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ShadowXK-dylibs
-          path: |
-            ShadowBypassXK.dylib
-            ShadowMonitorXK.dylib
+          name: ShadowXK-unified
+          path: ShadowXK.dylib
           if-no-files-found: error
+          retention-days: 30
