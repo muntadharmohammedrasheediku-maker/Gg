@@ -35,6 +35,7 @@ jobs:
             -fsyntax-only \
             -I deps \
             ShadowBypassXK.m
+            ShadowMonitorXK.m
 
       - name: Build dylib
         run: |
