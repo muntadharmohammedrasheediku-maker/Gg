@@ -1,5 +1,5 @@
 // ============================================================================
-// ShadowMonitor XK v2.0 — iOS 14+ arm64 — تشفير مدمج
+// ShadowMonitor XK v2.1 — iOS 14+ arm64 — تشفير مدمج + إصلاحات
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -24,12 +24,12 @@ static const NSInteger kSMDyldSampleCap = 60;
 static const NSInteger kSMMaxDetail     = 220;
 
 // ============================================================================
-// 0b. مساعد التشفير
+// 0b. مساعد التشفير — ★ إصلاح أسبقية العملية
 // ============================================================================
 
 static NSString *SMEncryptText(NSString *text) {
     if (!text.length || text.length > 4000) return text;
-    const char *bid = [[NSBundle mainBundle].bundleIdentifier ?: @"sbxk"] UTF8String;
+    const char *bid = [([NSBundle mainBundle].bundleIdentifier ?: @"sbxk") UTF8String];
     const uint8_t *pwd = (const uint8_t *)bid;
     size_t pwd_len = strlen(bid);
     const uint8_t *pt = (const uint8_t *)text.UTF8String;
@@ -209,7 +209,6 @@ typedef NS_ENUM(NSInteger, SMKind) {
 - (void)add:(SMKind)k text:(NSString *)t detail:(NSString *)d flagged:(BOOL)f {
     if (self.paused) return;
 
-    // تشفير النص الحساس
     NSString *storedDetail = d ?: @"";
     BOOL encrypted = NO;
     if (d.length > 0 && d.length < 4000) {
@@ -1013,6 +1012,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ [self.fab setBadge:total]; });
 }
 
+// ★ إصلاح: @available(iOS 16.0, *) للدالة detentWithIdentifier:resolver:
 - (void)_openPanel {
     if (self.presenting) return;
     if (!self.overlay) { [self _installNow]; }
@@ -1060,7 +1060,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 __attribute__((constructor))
 static void SM_Boot(void) {
     @autoreleasepool {
-        NSLog(@"[SM-XK] v2.0 boot");
+        NSLog(@"[SM-XK] v2.1 boot");
         [NSURLProtocol registerClass:[SMURLProtocol class]];
 
         struct sm_rb rb[] = {
