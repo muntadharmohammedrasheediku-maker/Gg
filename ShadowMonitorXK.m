@@ -1,5 +1,8 @@
 // ============================================================================
-// ShadowMonitor XK v2.1 — iOS 14+ arm64 — تشفير مدمج + إصلاحات
+// ShadowMonitor XK v2.2 — iOS 14+ arm64 — نسخة نهائية مستقرة
+// - تشفير defcrypto مدمج
+// - إصلاح detent (largeDetent فقط — متوافق iOS 15+ بدون bugs)
+// - إصلاح أسبقية UTF8String
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -24,12 +27,13 @@ static const NSInteger kSMDyldSampleCap = 60;
 static const NSInteger kSMMaxDetail     = 220;
 
 // ============================================================================
-// 0b. مساعد التشفير — ★ إصلاح أسبقية العملية
+// 0b. مساعد التشفير
 // ============================================================================
 
 static NSString *SMEncryptText(NSString *text) {
     if (!text.length || text.length > 4000) return text;
-    const char *bid = [([NSBundle mainBundle].bundleIdentifier ?: @"sbxk") UTF8String];
+    NSString *bidNS = [NSBundle mainBundle].bundleIdentifier ?: @"sbxk";
+    const char *bid = [bidNS UTF8String];
     const uint8_t *pwd = (const uint8_t *)bid;
     size_t pwd_len = strlen(bid);
     const uint8_t *pt = (const uint8_t *)text.UTF8String;
@@ -936,7 +940,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 @end
 
 // ============================================================================
-// 9. مدير الواجهة
+// 9. مدير الواجهة — ★ الحل النهائي: largeDetent فقط
 // ============================================================================
 
 @interface SMManager : NSObject <SMLogObserver>
@@ -1012,7 +1016,8 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ [self.fab setBadge:total]; });
 }
 
-// ★ إصلاح: @available(iOS 16.0, *) للدالة detentWithIdentifier:resolver:
+// ★ لا نستخدم detentWithIdentifier:resolver: إطلاقاً
+// largeDetent متاح من iOS 15 ويعطي نفس النتيجة
 - (void)_openPanel {
     if (self.presenting) return;
     if (!self.overlay) { [self _installNow]; }
@@ -1025,25 +1030,17 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     self.presenting = YES;
 
     SMPanel *p = [SMPanel new];
-    p.modalPresentationStyle = UIModalPresentationPageSheet;
 
     if (@available(iOS 15.0, *)) {
+        p.modalPresentationStyle = UIModalPresentationPageSheet;
         UISheetPresentationController *sc = p.sheetPresentationController;
         if (sc) {
-            if (@available(iOS 16.0, *)) {
-                UISheetPresentationControllerDetent *big =
-                    [UISheetPresentationControllerDetent
-                        detentWithIdentifier:@"big"
-                        resolver:^CGFloat(id<UISheetPresentationControllerDetentResolutionContext> ctx) {
-                            return ctx.maximumDetentValue;
-                        }];
-                sc.detents = @[big];
-            } else {
-                sc.detents = @[UISheetPresentationControllerDetent.largeDetent];
-            }
+            sc.detents = @[UISheetPresentationControllerDetent.largeDetent];
             sc.prefersGrabberVisible = YES;
             sc.preferredCornerRadius = 20;
         }
+    } else {
+        p.modalPresentationStyle = UIModalPresentationFullScreen;
     }
 
     __weak typeof(self) wself = self;
@@ -1060,7 +1057,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 __attribute__((constructor))
 static void SM_Boot(void) {
     @autoreleasepool {
-        NSLog(@"[SM-XK] v2.1 boot");
+        NSLog(@"[SM-XK] v2.2 boot");
         [NSURLProtocol registerClass:[SMURLProtocol class]];
 
         struct sm_rb rb[] = {
