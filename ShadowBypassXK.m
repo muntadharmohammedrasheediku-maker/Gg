@@ -1,7 +1,7 @@
 // ============================================================================
-// ShadowBypass XK v2 — single-file iOS arm64/arm64e implant (no jailbreak)
+// ShadowBypass XK v2.1 — single-file iOS arm64/arm64e implant (no jailbreak)
 //
-// Build (macOS + Xcode 15+):
+// Build:
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 //   clang -arch arm64 -arch arm64e \
 //         -isysroot "$SDK" -miphoneos-version-min=13.0 \
@@ -13,8 +13,6 @@
 //         -framework Foundation -framework UIKit -framework Security \
 //         -framework AdSupport -framework AppTrackingTransparency \
 //         -o ShadowBypassXK.dylib
-//
-// Inject: sideload + LC_LOAD_DYLIB patch, TrollStore, atau CoreTrust bundle.
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -50,7 +48,7 @@
 #pragma mark =========================================================
 
 typedef struct {
-    const char *name;         // symbol asm name (no leading _)
+    const char *name;
     void       *replacement;
     void      **replaced;
 } sbxk_binding_t;
@@ -149,10 +147,10 @@ static void SBXK_HookInstanceMethod(const char *cls, const char *sel, IMP imp) {
     class_replaceMethod(c, s, imp, method_getTypeEncoding(m));
 }
 
-#define HOOK_I(cls, sel) SBXK_HookInstanceMethod(#cls, sel, (IMP)SBXK_##cls##_##sel)
+#define HOOK_I(cls, sel) SBXK_HookInstanceMethod(#cls, #sel, (IMP)SBXK_##cls##_##sel)
 
 #pragma mark =========================================================
-#pragma mark 3. ORIGINAL POINTERS (populated by rebind)
+#pragma mark 3. ORIGINAL POINTERS
 #pragma mark =========================================================
 
 // RSA
@@ -382,13 +380,13 @@ static int SBXK_access(const char *path, int amode) {
 }
 
 #pragma mark =========================================================
-#pragma mark 5. INTEGRITY / DETECT HOOKS
+#pragma mark 5. INTEGRITY / DETECT HOOKS — MACROS
 #pragma mark =========================================================
 
-#define IMP_NO(cls, sel)  static BOOL SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return NO; }
-#define IMP_YES(cls, sel) static BOOL SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return YES; }
+#define IMP_NO(cls, sel)  static BOOL SBXK_##cls##_##sel(id s, SEL _cmd) { (void)s; (void)_cmd; return NO; }
+#define IMP_YES(cls, sel) static BOOL SBXK_##cls##_##sel(id s, SEL _cmd) { (void)s; (void)_cmd; return YES; }
 
-// Jailbreak / simulator / debugger / hook / tamper / injection / reversing detection
+// Jailbreak / simulator / debugger / hook / tamper / injection / reversing
 IMP_NO(IntegrityChecker, integrity_detect)
 IMP_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
 IMP_NO(JailbreakDetector, isJailbroken)
@@ -431,11 +429,9 @@ IMP_YES(SecurityChecker, CheckFileHeader)
 IMP_YES(SecurityChecker, IsFileExistInResDir)
 IMP_YES(SecurityChecker, verifySignature)
 
-// GAD specific
 IMP_YES(GADAppOpenAd, adDidDismissFullScreenContent_)
 IMP_YES(GADAppOpenAd, adWillDismissFullScreenContent_)
 
-// GSDK DetectPort / UDP / WIFI / Reachability / Audio
 IMP_YES(AReachability, isConnectionOnDemand)
 IMP_YES(AReachability, isConnectionRequired)
 IMP_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
@@ -444,32 +440,57 @@ IMP_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
 #pragma mark 6. GAME LOGIC HOOKS
 #pragma mark =========================================================
 
-static id SBXK_WeaponProcessor_CalculateDamage(id s, SEL c, id target, float dist) {
-    (void)s; (void)c; (void)target; (void)dist; return @(0);
+static id SBXK_WeaponProcessor_CalculateDamage(id s, SEL _cmd, id target, float dist) {
+    (void)s; (void)_cmd; (void)target; (void)dist; return @(0);
 }
-static BOOL SBXK_CharacterMovement_IsSpeedExceeded(id s, SEL c) { (void)s; (void)c; return NO; }
-static id SBXK_BulletSimulator_CheckWallCollision(id s, SEL c) { (void)s; (void)c; return nil; }
-static void SBXK_NetworkManager_SendSecurityReport(id s, SEL c, id r) {
-    (void)s; (void)c; (void)r; SBXK_LOG(@"suppressed SecurityReport");
+static BOOL SBXK_CharacterMovement_IsSpeedExceeded(id s, SEL _cmd) { (void)s; (void)_cmd; return NO; }
+static id SBXK_BulletSimulator_CheckWallCollision(id s, SEL _cmd) { (void)s; (void)_cmd; return nil; }
+static void SBXK_NetworkManager_SendSecurityReport(id s, SEL _cmd, id r) {
+    (void)s; (void)_cmd; (void)r; SBXK_LOG(@"suppressed SecurityReport");
 }
 
 #pragma mark =========================================================
 #pragma mark 7. GENERIC ZERO-RETURN / NOOP MACROS
 #pragma mark =========================================================
 
-#define Z_ID(cls, sel)   static id   SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return @(0); }
-#define N_ID(cls, sel)   static id   SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return nil;  }
-#define Z_ID_A(cls, sel, a)          static id SBXK_##cls##_##sel(id s, SEL c, id a) { (void)s;(void)c;(void)a; return @(0); }
-#define Z_ID_AA(cls, sel, a, b)      static id SBXK_##cls##_##sel(id s, SEL c, id a, id b) { (void)s;(void)c;(void)a;(void)b; return @(0); }
-#define Z_ID_AAA(cls, sel, a, b, cc) static id SBXK_##cls##_##sel(id s, SEL c, id a, id b, id cc) { (void)s;(void)c;(void)a;(void)b;(void)cc; return @(0); }
-#define Z_ID_AB(cls, sel, a, b)      static id SBXK_##cls##_##sel(id s, SEL c, id a, BOOL b) { (void)s;(void)c;(void)a;(void)b; return @(0); }
-#define Z_V_A(cls, sel, a)           static void SBXK_##cls##_##sel(id s, SEL c, id a) { (void)s;(void)c;(void)a; }
-#define Z_V_AB(cls, sel, a, b)       static void SBXK_##cls##_##sel(id s, SEL c, id a, BOOL b) { (void)s;(void)c;(void)a;(void)b; }
-#define Z_V_AI(cls, sel, a, b)       static void SBXK_##cls##_##sel(id s, SEL c, id a, int b) { (void)s;(void)c;(void)a;(void)b; }
-#define Z_V_AA(cls, sel, a, b)       static void SBXK_##cls##_##sel(id s, SEL c, id a, id b) { (void)s;(void)c;(void)a;(void)b; }
-#define Z_V_AAB(cls, sel, a, b, cc)  static void SBXK_##cls##_##sel(id s, SEL c, id a, id b, BOOL cc) { (void)s;(void)c;(void)a;(void)b;(void)cc; }
-#define Z_V_AII(cls, sel, a, b, cc)  static void SBXK_##cls##_##sel(id s, SEL c, id a, int b, int cc) { (void)s;(void)c;(void)a;(void)b;(void)cc; }
-#define Z_V_AIID(cls, sel, a, b, cc, d) static void SBXK_##cls##_##sel(id s, SEL c, id a, int b, int cc, int d) { (void)s;(void)c;(void)a;(void)b;(void)cc;(void)d; }
+#define Z_ID(cls, sel) \
+    static id SBXK_##cls##_##sel(id s, SEL _cmd) { (void)s; (void)_cmd; return @(0); }
+
+#define N_ID(cls, sel) \
+    static id SBXK_##cls##_##sel(id s, SEL _cmd) { (void)s; (void)_cmd; return nil; }
+
+#define Z_ID_A(cls, sel, a) \
+    static id SBXK_##cls##_##sel(id s, SEL _cmd, id a) { (void)s;(void)_cmd;(void)a; return @(0); }
+
+#define Z_ID_AA(cls, sel, a, b) \
+    static id SBXK_##cls##_##sel(id s, SEL _cmd, id a, id b) { (void)s;(void)_cmd;(void)a;(void)b; return @(0); }
+
+#define Z_ID_AAA(cls, sel, a, b, d) \
+    static id SBXK_##cls##_##sel(id s, SEL _cmd, id a, id b, id d) { (void)s;(void)_cmd;(void)a;(void)b;(void)d; return @(0); }
+
+#define Z_ID_AB(cls, sel, a, b) \
+    static id SBXK_##cls##_##sel(id s, SEL _cmd, id a, BOOL b) { (void)s;(void)_cmd;(void)a;(void)b; return @(0); }
+
+#define Z_V_A(cls, sel, a) \
+    static void SBXK_##cls##_##sel(id s, SEL _cmd, id a) { (void)s;(void)_cmd;(void)a; }
+
+#define Z_V_AB(cls, sel, a, b) \
+    static void SBXK_##cls##_##sel(id s, SEL _cmd, id a, BOOL b) { (void)s;(void)_cmd;(void)a;(void)b; }
+
+#define Z_V_AI(cls, sel, a, b) \
+    static void SBXK_##cls##_##sel(id s, SEL _cmd, id a, int b) { (void)s;(void)_cmd;(void)a;(void)b; }
+
+#define Z_V_AA(cls, sel, a, b) \
+    static void SBXK_##cls##_##sel(id s, SEL _cmd, id a, id b) { (void)s;(void)_cmd;(void)a;(void)b; }
+
+#define Z_V_AAB(cls, sel, a, b, d) \
+    static void SBXK_##cls##_##sel(id s, SEL _cmd, id a, id b, BOOL d) { (void)s;(void)_cmd;(void)a;(void)b;(void)d; }
+
+#define Z_V_AII(cls, sel, a, b, d) \
+    static void SBXK_##cls##_##sel(id s, SEL _cmd, id a, int b, int d) { (void)s;(void)_cmd;(void)a;(void)b;(void)d; }
+
+#define Z_V_AIID(cls, sel, a, b, d, e) \
+    static void SBXK_##cls##_##sel(id s, SEL _cmd, id a, int b, int d, int e) { (void)s;(void)_cmd;(void)a;(void)b;(void)d;(void)e; }
 
 #pragma mark =========================================================
 #pragma mark 8. GSDK HOOKS
@@ -527,11 +548,11 @@ Z_ID(SimplePing, pingPacketWithType_payload_requiresChecksum_)
 
 Z_ID(GVGCloudVoice, openMic)
 Z_ID(GVGCloudVoice, openSpeaker)
-Z_V_A(GVGCloudVoice, setAppInfo_withKey_andOpenID_, a)   // simplify: 3 args tidak dipakai
+Z_V_A(GVGCloudVoice, setAppInfo_withKey_andOpenID_, a)
 Z_ID(GVGCloudVoiceExtension, GetBGMPlayState)
 Z_ID(GVGCloudVoiceExtension, GetMicState)
 Z_ID(GVGCloudVoiceExtension, GetSpeakerState)
-Z_ID(GVGCloudVoiceExtension, EnableKeyWordsDetect_)       // simplify
+Z_ID(GVGCloudVoiceExtension, EnableKeyWordsDetect_)
 Z_ID(GVoiceMuteSwitch, detectMuteSwitch)
 Z_ID(GCloudVoiceEngine, StartTve)
 Z_ID(GCloudVoiceEngine, StopRecording)
@@ -560,12 +581,12 @@ Z_ID(GCloudUnityPlugin, ReportEvent)
 Z_ID(GCloudUnityPlugin, SetGameObjectName_)
 Z_ID(GCloudVoiceEngine, GetFileParam_data_time_)
 
-Z_V_AII(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout_, a, b, c)
+Z_V_AII(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout_, a, b, d)
 Z_V_AI(GCloudVoiceEngine, QuitRoom_Scenes_timeout_, a, b)
 Z_V_AB(GCloudVoiceEngine, EnableMultiRoom_, a, b)
 Z_V_AB(GCloudVoiceEngine, EnableRoomMicrophone_enable_, a, b)
 Z_V_AB(GCloudVoiceEngine, EnableRoomSpeaker_enable_, a, b)
-Z_V_AII(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout_, a, b, c)
+Z_V_AII(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout_, a, b, d)
 Z_V_A(GCloudVoiceEngine, StartRecording_, a)
 Z_V_A(GCloudVoiceEngine, SetBGMPath_, a)
 Z_V_A(GCloudVoiceEngine, SetLogCallBack_, a)
@@ -661,13 +682,13 @@ Z_ID(SCSDKLoginClient, logout)
 #pragma mark 11. ADVERTISING / TRACKING
 #pragma mark =========================================================
 
-static NSString *SBXK_ASIdentifierManager_advertisingIdentifier(id s, SEL c) {
-    (void)s; (void)c;
+static NSString *SBXK_ASIdentifierManager_advertisingIdentifier(id s, SEL _cmd) {
+    (void)s; (void)_cmd;
     return @"00000000-0000-0000-0000-000000000000";
 }
-static NSInteger SBXK_ATTrackingManager_trackingAuthorizationStatus(id s, SEL c) {
-    (void)s; (void)c;
-    return 3; // authorized
+static NSInteger SBXK_ATTrackingManager_trackingAuthorizationStatus(id s, SEL _cmd) {
+    (void)s; (void)_cmd;
+    return 3;
 }
 
 #pragma mark =========================================================
@@ -1079,7 +1100,6 @@ static void SBXK_InstallAllSwizzles(void) {
 
 static void SBXK_InstallRebindings(void) {
     sbxk_binding_t b[] = {
-        // RSA
         {"RSA_public_encrypt",  (void *)SBXK_RSA_public_encrypt,  (void **)&orig_RSA_public_encrypt},
         {"RSA_private_decrypt", (void *)SBXK_RSA_private_decrypt, (void **)&orig_RSA_private_decrypt},
         {"RSA_private_encrypt", (void *)SBXK_RSA_private_encrypt, (void **)&orig_RSA_private_encrypt},
@@ -1091,7 +1111,6 @@ static void SBXK_InstallRebindings(void) {
         {"RSA_padding_add_PKCS1_type_1", (void *)SBXK_RSA_padding_add_PKCS1_type_1, (void **)&orig_RSA_padding_add_PKCS1_type_1},
         {"RSA_padding_add_PKCS1_type_2", (void *)SBXK_RSA_padding_add_PKCS1_type_2, (void **)&orig_RSA_padding_add_PKCS1_type_2},
 
-        // AES / DES
         {"AES_set_encrypt_key", (void *)SBXK_AES_set_encrypt_key, (void **)&orig_AES_set_encrypt_key},
         {"AES_set_decrypt_key", (void *)SBXK_AES_set_decrypt_key, (void **)&orig_AES_set_decrypt_key},
         {"AES_encrypt",         (void *)SBXK_AES_encrypt,         (void **)&orig_AES_encrypt},
@@ -1102,7 +1121,6 @@ static void SBXK_InstallRebindings(void) {
         {"DES_cbc_encrypt",     (void *)SBXK_DES_cbc_encrypt,     (void **)&orig_DES_cbc_encrypt},
         {"DES_set_key",         (void *)SBXK_DES_set_key,         (void **)&orig_DES_set_key},
 
-        // Hash
         {"MD5_Init",    (void *)SBXK_MD5_Init,    (void **)&orig_MD5_Init},
         {"MD5_Update",  (void *)SBXK_MD5_Update,  (void **)&orig_MD5_Update},
         {"MD5_Final",   (void *)SBXK_MD5_Final,   (void **)&orig_MD5_Final},
@@ -1119,7 +1137,6 @@ static void SBXK_InstallRebindings(void) {
         {"HMAC_Update", (void *)SBXK_HMAC_Update, (void **)&orig_HMAC_Update},
         {"HMAC_Final",  (void *)SBXK_HMAC_Final,  (void **)&orig_HMAC_Final},
 
-        // EVP / SSL / X509
         {"EVP_SignFinal",     (void *)SBXK_EVP_SignFinal,     (void **)&orig_EVP_SignFinal},
         {"EVP_VerifyFinal",   (void *)SBXK_EVP_VerifyFinal,   (void **)&orig_EVP_VerifyFinal},
         {"EVP_DigestSign",    (void *)SBXK_EVP_DigestSign,    (void **)&orig_EVP_DigestSign},
@@ -1129,10 +1146,7 @@ static void SBXK_InstallRebindings(void) {
         {"SSL_CTX_set_verify",(void *)SBXK_SSL_CTX_set_verify,(void **)&orig_SSL_CTX_set_verify},
         {"SSL_set_verify",    (void *)SBXK_SSL_set_verify,    (void **)&orig_SSL_set_verify},
 
-        // RAND
         {"RAND_bytes", (void *)SBXK_RAND_bytes, (void **)&orig_RAND_bytes},
-
-        // POSIX
         {"access",     (void *)SBXK_access,     (void **)&orig_access},
     };
     sbxk_rebind_all(b, (int)(sizeof(b) / sizeof(b[0])));
@@ -1145,23 +1159,14 @@ static void SBXK_InstallRebindings(void) {
 __attribute__((constructor))
 static void SBXK_Bootstrap(void) {
     @autoreleasepool {
-        SBXK_LOG(@"v2 boot");
+        SBXK_LOG(@"v2.1 boot");
 
-        // 1) Fishhook — kena symbol libcrypto/libSystem via lazy binding.
         SBXK_InstallRebindings();
-
-        // 2) Swizzle semua kelas — skip yang tidak ada.
         SBXK_InstallAllSwizzles();
-
-        // 3) FileManager.
         SBXK_InstallFileManagerSwizzle();
-
-        // 4) AppDelegate proxy (kalau sudah dibentuk).
         [SBXK_AppDelegateProxy installIfPossible];
-
-        // 5) Timer pembersih.
         SBXK_StartCleanupTimer();
 
-        SBXK_LOG(@"v2 ready");
+        SBXK_LOG(@"v2.1 ready");
     }
 }
