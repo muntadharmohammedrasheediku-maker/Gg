@@ -1,5 +1,5 @@
 // ============================================================================
-// defcrypto_bridge.cpp — تنفيذ الجسر C
+// defcrypto_bridge.cpp — تنفيذ الجسر C بين C++ و ObjC
 // ============================================================================
 
 #include "defcrypto_bridge.h"
@@ -15,7 +15,7 @@
 using namespace defcrypto;
 
 // ============================================================================
-// 1. تشفير/فك تشفير بمفتاح خام
+// 1. تشفير/فك تشفير بمفتاح خام 32 بايت
 // ============================================================================
 
 extern "C" int sbxk_encrypt(const uint8_t *pt,  size_t pt_len,
@@ -73,7 +73,7 @@ extern "C" int sbxk_decrypt(const uint8_t *pkt, size_t pkt_len,
 }
 
 // ============================================================================
-// 2. تشفير/فك تشفير بكلمة مرور
+// 2. تشفير/فك تشفير بكلمة مرور (KDF تلقائي)
 // ============================================================================
 
 extern "C" int sbxk_encrypt_pwd(const uint8_t *pt,  size_t pt_len,
@@ -131,19 +131,19 @@ extern "C" int sbxk_decrypt_pwd(const uint8_t *pkt, size_t pkt_len,
 }
 
 // ============================================================================
-// 3. تشفير/فك تشفير بث — عبر istream/ostream مخصصين
+// 3. تشفير/فك تشفير بث (Streaming)
 // ============================================================================
 
 namespace {
 
-// istream مبني على callback read
+// ★ التصحيح: المخزن صار char* حتى يطابق streambuf::setg المطلوب
 class CallbackIStreamBuf : public std::streambuf {
 public:
     CallbackIStreamBuf(sbxk_read_fn rd, void *ctx) : rd_(rd), ctx_(ctx) {}
 protected:
     int_type underflow() override {
         size_t got = 0;
-        int rc = rd_(ctx_, buf_, sizeof(buf_), &got);
+        int rc = rd_(ctx_, reinterpret_cast<uint8_t*>(buf_), sizeof(buf_), &got);
         if (rc != 0 || got == 0) return traits_type::eof();
         setg(buf_, buf_, buf_ + got);
         return traits_type::to_int_type(*gptr());
@@ -151,7 +151,7 @@ protected:
 private:
     sbxk_read_fn rd_;
     void        *ctx_;
-    uint8_t      buf_[64 * 1024];
+    char         buf_[64 * 1024];
 };
 
 class CallbackOStreamBuf : public std::streambuf {
@@ -160,13 +160,15 @@ public:
 protected:
     int_type overflow(int_type ch) override {
         if (ch != traits_type::eof()) {
-            char c = (char)ch;
-            if (wr_(ctx_, (const uint8_t*)&c, 1) != 0) return traits_type::eof();
+            char c = static_cast<char>(ch);
+            if (wr_(ctx_, reinterpret_cast<const uint8_t*>(&c), 1) != 0)
+                return traits_type::eof();
         }
         return ch;
     }
     std::streamsize xsputn(const char *s, std::streamsize n) override {
-        if (wr_(ctx_, (const uint8_t*)s, (size_t)n) != 0) return 0;
+        if (wr_(ctx_, reinterpret_cast<const uint8_t*>(s), static_cast<size_t>(n)) != 0)
+            return 0;
         return n;
     }
 private:
