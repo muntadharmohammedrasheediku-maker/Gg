@@ -1,18 +1,6 @@
 // ============================================================================
-// ShadowBypass XK v7.4 — hooks lengkap, aman-by-design
-//
-// قاعدة صارمة:
-//   ✓ BOOL  → return NO/YES  (آمن)
-//   ✓ void  → no-op          (آمن)
-//   ✓ id    → pass-through للأصل حصراً، أو nil. ممنوع إرجاع فئة مختلفة.
-//   ✗ أي محاولة لإرجاع كائن من فئة غير الفئة الأصلية = جريمة.
-//
-// الدرس (من الكراش السابق):
-//   __NSCFConstantString UUIDString → abort.
-//   السبب: hook أرجَع NSString حيث كان NSUUID متوقعاً.
-//   القاعدة: id-returning = pass-through دائماً، أو nil.
-//
-// البناء:
+// ShadowBypass XK v7.5 — iOS 14+, arm64
+// Build (GitHub Actions macOS runner):
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 //   clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=14.0 \
 //         -fobjc-arc -fblocks -O2 -dynamiclib -Wno-nullability-completeness \
@@ -33,7 +21,7 @@
 #import <stdatomic.h>
 
 #pragma mark =========================================================
-#pragma mark 0. الحالة العامة
+#pragma mark 0. GLOBALS
 #pragma mark =========================================================
 
 static atomic_int  g_phase    = 0;
@@ -41,10 +29,10 @@ static atomic_bool g_pending  = false;
 static atomic_int  g_crash_fd = -1;
 
 #pragma mark =========================================================
-#pragma mark 1. كتابة AS-safe
+#pragma mark 1. AS-SAFE WRITERS
 #pragma mark =========================================================
 
-#define SBXK_WLIT(fd, lit)  do { \
+#define SBXK_WLIT(fd, lit) do { \
     static const char _s[] = lit; \
     ssize_t _r = write((fd), _s, sizeof(_s) - 1); (void)_r; \
 } while (0)
@@ -70,7 +58,7 @@ static void sbxk_whex(int fd, const void *p) {
 }
 
 #pragma mark =========================================================
-#pragma mark 2. معالج الانهيار
+#pragma mark 2. CRASH HANDLER
 #pragma mark =========================================================
 
 static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
@@ -78,8 +66,8 @@ static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
     int fd = atomic_load(&g_crash_fd);
     if (fd >= 0) {
         SBXK_WLIT(fd, "\n=== SBXK CRASH ===\n");
-        SBXK_WLIT(fd, "signal="); sbxk_wdec(fd, sig);                    SBXK_WLIT(fd, "\n");
-        SBXK_WLIT(fd, "phase=");  sbxk_wdec(fd, atomic_load(&g_phase));  SBXK_WLIT(fd, "\n");
+        SBXK_WLIT(fd, "signal="); sbxk_wdec(fd, sig); SBXK_WLIT(fd, "\n");
+        SBXK_WLIT(fd, "phase=");  sbxk_wdec(fd, atomic_load(&g_phase)); SBXK_WLIT(fd, "\n");
         if (info) {
             SBXK_WLIT(fd, "si_addr="); sbxk_whex(fd, info->si_addr); SBXK_WLIT(fd, "\n");
         }
@@ -103,7 +91,7 @@ static void sbxk_on_exception(NSException *e) {
 }
 
 #pragma mark =========================================================
-#pragma mark 3. المسارات
+#pragma mark 3. PATHS
 #pragma mark =========================================================
 
 static char g_crash_path[512] = {0};
@@ -151,7 +139,7 @@ static void SBXK_RotateCrashLog(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 4. registry swizzle
+#pragma mark 4. SWIZZLE REGISTRY
 #pragma mark =========================================================
 
 static NSMutableDictionary<NSString *, NSValue *> *g_orig = nil;
@@ -173,11 +161,6 @@ static BOOL SBXK_MethodIsOwn(Class c, SEL s) {
     }
     free(list);
     return found;
-}
-
-static BOOL SBXK_EncodingMatches(const char *actual, const char *expected) {
-    if (!actual || !expected) return NO;
-    return strcmp(actual, expected) == 0;
 }
 
 static BOOL SBXK_SwizzleFull(const char *clsName, const char *selName,
@@ -216,9 +199,7 @@ static BOOL SBXK_SwizzleFull(const char *clsName, const char *selName,
     }
 
     const char *enc = method_getTypeEncoding(m);
-    if (!SBXK_EncodingMatches(enc, expectedEncoding)) {
-        NSLog(@"[SBXK-diag] verify failed: %s %s — got '%s' want '%s'",
-              clsName, selName, enc ? enc : "(null)", expectedEncoding);
+    if (!enc || strcmp(enc, expectedEncoding) != 0) {
         [g_skip addObject:key];
         return NO;
     }
@@ -250,66 +231,65 @@ static IMP SBXK_Original(const char *cls, const char *sel) {
 }
 
 #pragma mark =========================================================
-#pragma mark 5. IMP — الدفعة الكاملة
+#pragma mark 5. IMP MACROS — كلها معرّفة، بلا استخدامات ناقصة
 #pragma mark =========================================================
-//
-// كل IMP هنا إما:
-//   BOOL   → return NO/YES
-//   void   → no-op
-//   id     → pass-through للأصل (SBXK_Original) أو nil
-//
-// لا شيء آخر. لا NSString، لا NSNumber، لا NSData من عندنا.
 
-// ─────────────── Detection — Force NO ───────────────
+#define DEF_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return NO; }
+#define DEF_YES(cls, name) static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return YES; }
 
-#define DEF_NO(cls, name) \
-    static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return NO; }
+#define DEF_V1(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; }
+#define DEF_V2(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; }
+#define DEF_V3(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3; }
 
-DEF_NO(IntegrityChecker,    integrity_detect)
-DEF_NO(IntegrityChecker,    MTML_INTEGRITY_DETECT)
-DEF_NO(JailbreakDetector,   isJailbroken)
-DEF_NO(JailbreakDetector,   isJailbreak)
-DEF_NO(JailbreakDetector,   checkJailbreak)
-DEF_NO(JailbreakDetector,   jailbreakDetection)
-DEF_NO(SimulatorDetector,   isSimulator)
-DEF_NO(SimulatorDetector,   isSimulatorDevice)
-DEF_NO(SimulatorDetector,   checkSimulator)
-DEF_NO(SecurityChecker,     IsFileSystemModified)
-DEF_NO(SecurityChecker,     isDebuggerAttached)
-DEF_NO(SecurityChecker,     isDebugged)
-DEF_NO(SecurityChecker,     checkDebugger)
-DEF_NO(SecurityChecker,     amIBeingDebugged)
-DEF_NO(SecurityChecker,     checkDebuggerAttach)
-DEF_NO(SecurityChecker,     isHooked)
-DEF_NO(SecurityChecker,     isHookDetected)
-DEF_NO(SecurityChecker,     checkHook)
-DEF_NO(SecurityChecker,     detectHook)
-DEF_NO(SecurityChecker,     antiHookCheck)
-DEF_NO(SecurityChecker,     isTampered)
-DEF_NO(SecurityChecker,     checkTamper)
-DEF_NO(SecurityChecker,     antiTamperCheck)
-DEF_NO(SecurityChecker,     isInjected)
-DEF_NO(SecurityChecker,     isLibraryInjected)
-DEF_NO(SecurityChecker,     checkInjection)
-DEF_NO(SecurityChecker,     antiInjectionCheck)
-DEF_NO(SecurityChecker,     isReversingDetected)
-DEF_NO(SecurityChecker,     checkReversing)
-DEF_NO(SecurityChecker,     antiReversingCheck)
-DEF_NO(SecurityChecker,     isBlocked)
-DEF_NO(SecurityChecker,     antiBlockingCheck)
-DEF_NO(SecurityChecker,     isVPNUsed)
-DEF_NO(SecurityChecker,     isProxyUsed)
-DEF_NO(SecurityChecker,     isFridaRunning)
-DEF_NO(SecurityChecker,     isSubstrateLoaded)
-DEF_NO(SecurityChecker,     isCydiaInstalled)
-DEF_NO(SecurityChecker,     hasSuspiciousFiles)
-DEF_NO(SecurityChecker,     isEnvironmentClean)
+#define DEF_V1B(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, BOOL _b) { (void)_s;(void)_c;(void)_a1;(void)_b; }
+#define DEF_V1I(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, int _i) { (void)_s;(void)_c;(void)_a1;(void)_i; }
 
-// ─────────────── Detection — Force YES ───────────────
+#pragma mark =========================================================
+#pragma mark 6. IMP DEFINITIONS
+#pragma mark =========================================================
 
-#define DEF_YES(cls, name) \
-    static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return YES; }
+// ─── Detection — Force NO ───
+DEF_NO(IntegrityChecker,  integrity_detect)
+DEF_NO(IntegrityChecker,  MTML_INTEGRITY_DETECT)
+DEF_NO(JailbreakDetector, isJailbroken)
+DEF_NO(JailbreakDetector, isJailbreak)
+DEF_NO(JailbreakDetector, checkJailbreak)
+DEF_NO(JailbreakDetector, jailbreakDetection)
+DEF_NO(SimulatorDetector, isSimulator)
+DEF_NO(SimulatorDetector, isSimulatorDevice)
+DEF_NO(SimulatorDetector, checkSimulator)
+DEF_NO(SecurityChecker,   IsFileSystemModified)
+DEF_NO(SecurityChecker,   isDebuggerAttached)
+DEF_NO(SecurityChecker,   isDebugged)
+DEF_NO(SecurityChecker,   checkDebugger)
+DEF_NO(SecurityChecker,   amIBeingDebugged)
+DEF_NO(SecurityChecker,   checkDebuggerAttach)
+DEF_NO(SecurityChecker,   isHooked)
+DEF_NO(SecurityChecker,   isHookDetected)
+DEF_NO(SecurityChecker,   checkHook)
+DEF_NO(SecurityChecker,   detectHook)
+DEF_NO(SecurityChecker,   antiHookCheck)
+DEF_NO(SecurityChecker,   isTampered)
+DEF_NO(SecurityChecker,   checkTamper)
+DEF_NO(SecurityChecker,   antiTamperCheck)
+DEF_NO(SecurityChecker,   isInjected)
+DEF_NO(SecurityChecker,   isLibraryInjected)
+DEF_NO(SecurityChecker,   checkInjection)
+DEF_NO(SecurityChecker,   antiInjectionCheck)
+DEF_NO(SecurityChecker,   isReversingDetected)
+DEF_NO(SecurityChecker,   checkReversing)
+DEF_NO(SecurityChecker,   antiReversingCheck)
+DEF_NO(SecurityChecker,   isBlocked)
+DEF_NO(SecurityChecker,   antiBlockingCheck)
+DEF_NO(SecurityChecker,   isVPNUsed)
+DEF_NO(SecurityChecker,   isProxyUsed)
+DEF_NO(SecurityChecker,   isFridaRunning)
+DEF_NO(SecurityChecker,   isSubstrateLoaded)
+DEF_NO(SecurityChecker,   isCydiaInstalled)
+DEF_NO(SecurityChecker,   hasSuspiciousFiles)
+DEF_NO(SecurityChecker,   isEnvironmentClean)
 
+// ─── Detection — Force YES ───
 DEF_YES(SecurityChecker, verifyIntegrity)
 DEF_YES(SecurityChecker, checkTokenValid)
 DEF_YES(SecurityChecker, isEnvironmentSafe)
@@ -318,20 +298,7 @@ DEF_YES(AReachability,   isConnectionOnDemand)
 DEF_YES(AReachability,   isConnectionRequired)
 DEF_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
 
-// ─────────────── Void — No-op ───────────────
-
-#define DEF_V1(cls, name) \
-    static void SBXK_##cls##_##name(id _s, SEL _c, id _a1) { \
-        (void)_s; (void)_c; (void)_a1; }
-
-#define DEF_V2(cls, name) \
-    static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { \
-        (void)_s; (void)_c; (void)_a1; (void)_a2; }
-
-#define DEF_V3(cls, name) \
-    static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { \
-        (void)_s; (void)_c; (void)_a1; (void)_a2; (void)_a3; }
-
+// ─── GAD — void(id) ───
 DEF_V1(GADAppOpenAd, adDidDismissFullScreenContent)
 DEF_V1(GADAppOpenAd, adWillDismissFullScreenContent)
 DEF_V1(GADAppOpenAd, adDidRecordClick)
@@ -341,72 +308,38 @@ DEF_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
 DEF_V1(GADAppOpenAd, setPaidEventHandler)
 DEF_V1(GADAppOpenAd, adDidRecordUserInteraction)
 
-DEF_V1(GSDKPing,     ping)
-DEF_V1(GSDKPing,     stopPing)
-DEF_V1(GSDKPing,     simplePing_didFailToSendPacket_sequenceNumber_error)
-DEF_V1(GSDKPing,     simplePing_didFailWithError)
-DEF_V1(GSDKPing,     simplePing_didReceivePingResponsePacket_sequenceNumber)
-DEF_V1(GSDKPing,     simplePing_didReceiveUnexpectedPacket)
-DEF_V1(GSDKPing,     simplePing_didSendPacket_sequenceNumber)
-DEF_V1(GSDKPing,     simplePing_didStartWithAddress)
-
+// ─── GSDK — void(id) ───
+DEF_V1(GSDKPing, ping)
+DEF_V1(GSDKPing, stopPing)
+DEF_V1(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error)
+DEF_V1(GSDKPing, simplePing_didFailWithError)
+DEF_V1(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber)
+DEF_V1(GSDKPing, simplePing_didReceiveUnexpectedPacket)
+DEF_V1(GSDKPing, simplePing_didSendPacket_sequenceNumber)
+DEF_V1(GSDKPing, simplePing_didStartWithAddress)
 DEF_V1(GSDKInGameManager, GSDKRealTimeDetect)
 DEF_V1(GSDKInGameSystem,  GSDKInnerRealTimeDetect)
-
-DEF_V1(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env)
-DEF_V1(GSDKInitManager, detectOperation)
+DEF_V1(GSDKHttpRequest,   requestControl_Openid_Acctype_Zoneid_Env)
+DEF_V1(GSDKInitManager,   detectOperation)
 DEF_V1(GSDKRealTimeDetect, pingDelayDetect)
 DEF_V1(GSDKRealTimeDetect, updDelayDetect_Port)
-DEF_V1(GSDKUdpDetect, isUDPConnect_Port)
-DEF_V1(GSDKWIFI, ping)
-DEF_V1(GSDKDetectPort, isConnection_Port)
+DEF_V1(GSDKUdpDetect,     isUDPConnect_Port)
+DEF_V1(GSDKWIFI,          ping)
+DEF_V1(GSDKDetectPort,    isConnection_Port)
 
-DEF_V1(GCloudVoiceEngine, StartTve)
+// ─── GCloud — نقتصر على void(id) فقط ───
 DEF_V1(GCloudVoiceEngine, StopRecording)
-DEF_V1(GCloudVoiceEngine, TestMic)
 DEF_V1(GCloudVoiceEngine, StartBGMPlay)
 DEF_V1(GCloudVoiceEngine, StopBGMPlay)
 DEF_V1(GCloudVoiceEngine, PauseBGMPlay)
 DEF_V1(GCloudVoiceEngine, ResumeBGMPlay)
 DEF_V1(GCloudVoiceEngine, RSTSStopRecording)
 DEF_V1(GCloudVoiceEngine, TextToStreamSpeechStop)
-DEF_V1(GCloudVoiceEngine, StopKaraokeRecording)
 DEF_V1(GCloudVoiceEngine, StartRecording)
 DEF_V1(GCloudVoiceEngine, SetBGMPath)
 DEF_V1(GCloudVoiceEngine, SetLogCallBack)
 
-DEF_V1(GCloudVoiceEngine, SetMicVolume)
-DEF_V1(GCloudVoiceEngine, SetSpeakerVolume)
-DEF_V1(GCloudVoiceEngine, SetBitRate)
-DEF_V1(GCloudVoiceEngine, SetDataFree)
-DEF_V1(GCloudVoiceEngine, SetReportBufferTime)
-DEF_V1(GCloudVoiceEngine, SetBGMPlayTime)
-DEF_V1(GCloudVoiceEngine, SetKaraokeVoiceVol)
-DEF_V1(GCloudVoiceEngine, SetKaraokeAccVol)
-DEF_V1(GCloudVoiceEngine, SetKaraokeVoiceDelay)
-DEF_V1(GCloudVoiceEngine, SeekTimeMsForPreview)
-DEF_V1(GCloudVoiceEngine, SeekTimeMsForAcc)
-
-DEF_V2(GVGCloudVoice, setAppInfo_withKey_andOpenID)
-DEF_V2(GCloudVoiceEngine, EnableMultiRoom)
-DEF_V2(GCloudVoiceEngine, EnableRoomMicrophone_enable)
-DEF_V2(GCloudVoiceEngine, EnableRoomSpeaker_enable)
-DEF_V2(GCloudVoiceEngine, EnableLog)
-DEF_V2(GCloudVoiceEngine, EnableNativeBGMPlay)
-DEF_V2(GCloudVoiceEngine, EnableRecvMagicVoice)
-DEF_V2(GCloudVoiceEngine, EnableReportALL)
-DEF_V2(GCloudVoiceEngine, EnableReportALLAbroad)
-DEF_V2(GCloudVoiceEngine, EnableReportForAbroad)
-DEF_V2(GCloudVoiceEngine, EnableCivilFile)
-DEF_V2(GCloudVoiceEngine, EnableCivilVoice)
-DEF_V2(GCloudVoiceEngine, EnableEarBack)
-DEF_V2(GCloudVoiceEngine, EnableAccFilePlay)
-DEF_V2(GCloudVoiceExtension, EnableKeyWordsDetect)
-
-DEF_V3(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout)
-DEF_V3(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout)
-DEF_V3(GCloudVoiceEngine, QuitRoom_Scenes_timeout)
-
+// ─── Ads / Firebase / APM — void(id) ───
 DEF_V1(NetworkManager, SendSecurityReport)
 DEF_V1(FBAdMonitor,    startMonitoringAd)
 DEF_V1(FBAdEvent,      logEvent_withParameters)
@@ -429,226 +362,135 @@ DEF_V1(TikTokAuth,     handleOpenURL)
 DEF_V1(VKAuth,         authorizeWithPermissions)
 DEF_V1(SCSDKLoginClient, loginWithCompletion)
 
-// ─────────────── id — pass-through حصراً ───────────────
-//
-// هذه الدوال يجب أن تُرجع نفس نوع الأصل. ممنوع إرجاع NSString/NSUUID/NSError
-// من عندنا. إن أردنا تعديل النتيجة، نعدّلها ثم نعيدها كما هي (نفس الفئة).
-
-#define DEF_ID_PASS(cls, name) \
-    static id SBXK_##cls##_##name(id _s, SEL _c) { \
-        IMP orig = SBXK_Original(#cls, #name); \
-        if (!orig) return nil; \
-        id (*fn)(id, SEL) = (void *)orig; \
-        return fn(_s, _c); \
-    }
-
-// هذه الدوال تُرجع id بمعامل — مثال: -[Foo barWithArg:]
-#define DEF_ID_PASS1(cls, name) \
-    static id SBXK_##cls##_##name(id _s, SEL _c, id _a1) { \
-        IMP orig = SBXK_Original(#cls, #name); \
-        if (!orig) return nil; \
-        id (*fn)(id, SEL, id) = (void *)orig; \
-        return fn(_s, _c, _a1); \
-    }
-
-// Placeholders — تُنشّط إذا ALPHA أراد pass-through لفئات محددة.
-// الافتراضي: لا شيء. لأن أي id-hook قد يُدخل فئة جديدة على التطبيق.
-//
-// مثال مُعطَّل:
-// DEF_ID_PASS(GADAppOpenAd, responseInfo)
-// DEF_ID_PASS(FIRMessaging, APNSToken)
-// DEF_ID_PASS1(FIRMessaging, retrieveFCMTokenForSenderID_completion)
-
 #pragma mark =========================================================
-#pragma mark 6. التسجيل
+#pragma mark 7. REGISTRATION
 #pragma mark =========================================================
 
 static void SBXK_RegisterAll(void) {
 
-    // ───── Detection BOOL (0 args → "B@:") ─────
+#define REG_B(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
+#define REG_V1(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@")
 
-#define REG_BOOL_NO(cls, name) \
-    SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
+    // Detection NO
+    REG_B(IntegrityChecker,  integrity_detect);
+    REG_B(IntegrityChecker,  MTML_INTEGRITY_DETECT);
+    REG_B(JailbreakDetector, isJailbroken);
+    REG_B(JailbreakDetector, isJailbreak);
+    REG_B(JailbreakDetector, checkJailbreak);
+    REG_B(JailbreakDetector, jailbreakDetection);
+    REG_B(SimulatorDetector, isSimulator);
+    REG_B(SimulatorDetector, isSimulatorDevice);
+    REG_B(SimulatorDetector, checkSimulator);
+    REG_B(SecurityChecker,   IsFileSystemModified);
+    REG_B(SecurityChecker,   isDebuggerAttached);
+    REG_B(SecurityChecker,   isDebugged);
+    REG_B(SecurityChecker,   checkDebugger);
+    REG_B(SecurityChecker,   amIBeingDebugged);
+    REG_B(SecurityChecker,   checkDebuggerAttach);
+    REG_B(SecurityChecker,   isHooked);
+    REG_B(SecurityChecker,   isHookDetected);
+    REG_B(SecurityChecker,   checkHook);
+    REG_B(SecurityChecker,   detectHook);
+    REG_B(SecurityChecker,   antiHookCheck);
+    REG_B(SecurityChecker,   isTampered);
+    REG_B(SecurityChecker,   checkTamper);
+    REG_B(SecurityChecker,   antiTamperCheck);
+    REG_B(SecurityChecker,   isInjected);
+    REG_B(SecurityChecker,   isLibraryInjected);
+    REG_B(SecurityChecker,   checkInjection);
+    REG_B(SecurityChecker,   antiInjectionCheck);
+    REG_B(SecurityChecker,   isReversingDetected);
+    REG_B(SecurityChecker,   checkReversing);
+    REG_B(SecurityChecker,   antiReversingCheck);
+    REG_B(SecurityChecker,   isBlocked);
+    REG_B(SecurityChecker,   antiBlockingCheck);
+    REG_B(SecurityChecker,   isVPNUsed);
+    REG_B(SecurityChecker,   isProxyUsed);
+    REG_B(SecurityChecker,   isFridaRunning);
+    REG_B(SecurityChecker,   isSubstrateLoaded);
+    REG_B(SecurityChecker,   isCydiaInstalled);
+    REG_B(SecurityChecker,   hasSuspiciousFiles);
+    REG_B(SecurityChecker,   isEnvironmentClean);
 
-#define REG_BOOL_YES(cls, name) \
-    SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
+    // Detection YES
+    REG_B(SecurityChecker,   verifyIntegrity);
+    REG_B(SecurityChecker,   checkTokenValid);
+    REG_B(SecurityChecker,   isEnvironmentSafe);
+    REG_B(SecurityChecker,   verifySignature);
+    REG_B(AReachability,     isConnectionOnDemand);
+    REG_B(AReachability,     isConnectionRequired);
+    REG_B(GVGCloudVoiceExtension, CheckDeviceMuteStat);
 
-    REG_BOOL_NO (IntegrityChecker,  integrity_detect);
-    REG_BOOL_NO (IntegrityChecker,  MTML_INTEGRITY_DETECT);
-    REG_BOOL_NO (JailbreakDetector, isJailbroken);
-    REG_BOOL_NO (JailbreakDetector, isJailbreak);
-    REG_BOOL_NO (JailbreakDetector, checkJailbreak);
-    REG_BOOL_NO (JailbreakDetector, jailbreakDetection);
-    REG_BOOL_NO (SimulatorDetector, isSimulator);
-    REG_BOOL_NO (SimulatorDetector, isSimulatorDevice);
-    REG_BOOL_NO (SimulatorDetector, checkSimulator);
-    REG_BOOL_NO (SecurityChecker,   IsFileSystemModified);
-    REG_BOOL_NO (SecurityChecker,   isDebuggerAttached);
-    REG_BOOL_NO (SecurityChecker,   isDebugged);
-    REG_BOOL_NO (SecurityChecker,   checkDebugger);
-    REG_BOOL_NO (SecurityChecker,   amIBeingDebugged);
-    REG_BOOL_NO (SecurityChecker,   checkDebuggerAttach);
-    REG_BOOL_NO (SecurityChecker,   isHooked);
-    REG_BOOL_NO (SecurityChecker,   isHookDetected);
-    REG_BOOL_NO (SecurityChecker,   checkHook);
-    REG_BOOL_NO (SecurityChecker,   detectHook);
-    REG_BOOL_NO (SecurityChecker,   antiHookCheck);
-    REG_BOOL_NO (SecurityChecker,   isTampered);
-    REG_BOOL_NO (SecurityChecker,   checkTamper);
-    REG_BOOL_NO (SecurityChecker,   antiTamperCheck);
-    REG_BOOL_NO (SecurityChecker,   isInjected);
-    REG_BOOL_NO (SecurityChecker,   isLibraryInjected);
-    REG_BOOL_NO (SecurityChecker,   checkInjection);
-    REG_BOOL_NO (SecurityChecker,   antiInjectionCheck);
-    REG_BOOL_NO (SecurityChecker,   isReversingDetected);
-    REG_BOOL_NO (SecurityChecker,   checkReversing);
-    REG_BOOL_NO (SecurityChecker,   antiReversingCheck);
-    REG_BOOL_NO (SecurityChecker,   isBlocked);
-    REG_BOOL_NO (SecurityChecker,   antiBlockingCheck);
-    REG_BOOL_NO (SecurityChecker,   isVPNUsed);
-    REG_BOOL_NO (SecurityChecker,   isProxyUsed);
-    REG_BOOL_NO (SecurityChecker,   isFridaRunning);
-    REG_BOOL_NO (SecurityChecker,   isSubstrateLoaded);
-    REG_BOOL_NO (SecurityChecker,   isCydiaInstalled);
-    REG_BOOL_NO (SecurityChecker,   hasSuspiciousFiles);
-    REG_BOOL_NO (SecurityChecker,   isEnvironmentClean);
+    // GAD
+    REG_V1(GADAppOpenAd, adDidDismissFullScreenContent);
+    REG_V1(GADAppOpenAd, adWillDismissFullScreenContent);
+    REG_V1(GADAppOpenAd, adDidRecordClick);
+    REG_V1(GADAppOpenAd, adDidRecordImpression);
+    REG_V1(GADAppOpenAd, adWillPresentFullScreenContent);
+    REG_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError);
+    REG_V1(GADAppOpenAd, setPaidEventHandler);
+    REG_V1(GADAppOpenAd, adDidRecordUserInteraction);
 
-    REG_BOOL_YES(SecurityChecker,   verifyIntegrity);
-    REG_BOOL_YES(SecurityChecker,   checkTokenValid);
-    REG_BOOL_YES(SecurityChecker,   isEnvironmentSafe);
-    REG_BOOL_YES(SecurityChecker,   verifySignature);
-    REG_BOOL_YES(AReachability,     isConnectionOnDemand);
-    REG_BOOL_YES(AReachability,     isConnectionRequired);
-    REG_BOOL_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat);
+    // GSDK
+    REG_V1(GSDKPing, ping);
+    REG_V1(GSDKPing, stopPing);
+    REG_V1(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error);
+    REG_V1(GSDKPing, simplePing_didFailWithError);
+    REG_V1(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber);
+    REG_V1(GSDKPing, simplePing_didReceiveUnexpectedPacket);
+    REG_V1(GSDKPing, simplePing_didSendPacket_sequenceNumber);
+    REG_V1(GSDKPing, simplePing_didStartWithAddress);
+    REG_V1(GSDKInGameManager, GSDKRealTimeDetect);
+    REG_V1(GSDKInGameSystem,  GSDKInnerRealTimeDetect);
+    REG_V1(GSDKHttpRequest,   requestControl_Openid_Acctype_Zoneid_Env);
+    REG_V1(GSDKInitManager,   detectOperation);
+    REG_V1(GSDKRealTimeDetect, pingDelayDetect);
+    REG_V1(GSDKRealTimeDetect, updDelayDetect_Port);
+    REG_V1(GSDKUdpDetect,     isUDPConnect_Port);
+    REG_V1(GSDKWIFI,          ping);
+    REG_V1(GSDKDetectPort,    isConnection_Port);
 
-    // ───── Void: encoding "v@:" أو "v@:@" أو "v@:@@" أو "v@:@@@" ─────
+    // GCloud — void(id)
+    REG_V1(GCloudVoiceEngine, StopRecording);
+    REG_V1(GCloudVoiceEngine, StartBGMPlay);
+    REG_V1(GCloudVoiceEngine, StopBGMPlay);
+    REG_V1(GCloudVoiceEngine, PauseBGMPlay);
+    REG_V1(GCloudVoiceEngine, ResumeBGMPlay);
+    REG_V1(GCloudVoiceEngine, RSTSStopRecording);
+    REG_V1(GCloudVoiceEngine, TextToStreamSpeechStop);
+    REG_V1(GCloudVoiceEngine, StartRecording);
+    REG_V1(GCloudVoiceEngine, SetBGMPath);
+    REG_V1(GCloudVoiceEngine, SetLogCallBack);
 
-#define REG_VOID_1(cls, name) \
-    SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@")
+    // Ads / Firebase / APM
+    REG_V1(NetworkManager, SendSecurityReport);
+    REG_V1(FBAdMonitor,    startMonitoringAd);
+    REG_V1(FBAdEvent,      logEvent_withParameters);
+    REG_V1(FBAdLogger,     logMessage_withLevel);
+    REG_V1(FIRMessaging,   retrieveFCMTokenForSenderID_completion);
+    REG_V1(FIRMessaging,   deleteFCMTokenForSenderID_completion);
+    REG_V1(FIRMessaging,   subscribeToTopic_completion);
+    REG_V1(FIRMessaging,   unsubscribeFromTopic_completion);
+    REG_V1(FIRMessaging,   setAPNSToken_withUserInfo);
+    REG_V1(APMMonitor,     handleEvent);
+    REG_V1(APMMonitor,     startMonitoring);
+    REG_V1(APMCollector,   collectMetrics);
+    REG_V1(TApmSceneMarker, markLoadLevel);
+    REG_V1(TApmSceneMarker, postStepEvent);
+    REG_V1(TApmSceneMarker, postStreamEvent);
+    REG_V1(TDataMasterApplication, handleOpenURL);
+    REG_V1(TcApiTool,      openUniversallinkIfNeed);
+    REG_V1(TikTokAuth,     authorizeWithPermissions);
+    REG_V1(TikTokAuth,     handleOpenURL);
+    REG_V1(VKAuth,         authorizeWithPermissions);
+    REG_V1(SCSDKLoginClient, loginWithCompletion);
 
-#define REG_VOID_2(cls, name) \
-    SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@@")
-
-#define REG_VOID_3(cls, name) \
-    SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@@@")
-
-    // GAD callbacks — signature: void(id self, SEL, id arg)
-    REG_VOID_1(GADAppOpenAd, adDidDismissFullScreenContent);
-    REG_VOID_1(GADAppOpenAd, adWillDismissFullScreenContent);
-    REG_VOID_1(GADAppOpenAd, adDidRecordClick);
-    REG_VOID_1(GADAppOpenAd, adDidRecordImpression);
-    REG_VOID_1(GADAppOpenAd, adWillPresentFullScreenContent);
-    REG_VOID_1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError);
-    REG_VOID_1(GADAppOpenAd, setPaidEventHandler);
-    REG_VOID_1(GADAppOpenAd, adDidRecordUserInteraction);
-
-    // GSDK ping — many signatures start with "v@:@"
-    REG_VOID_1(GSDKPing, ping);
-    REG_VOID_1(GSDKPing, stopPing);
-    REG_VOID_1(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error);
-    REG_VOID_1(GSDKPing, simplePing_didFailWithError);
-    REG_VOID_1(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber);
-    REG_VOID_1(GSDKPing, simplePing_didReceiveUnexpectedPacket);
-    REG_VOID_1(GSDKPing, simplePing_didSendPacket_sequenceNumber);
-    REG_VOID_1(GSDKPing, simplePing_didStartWithAddress);
-
-    REG_VOID_1(GSDKInGameManager, GSDKRealTimeDetect);
-    REG_VOID_1(GSDKInGameSystem,  GSDKInnerRealTimeDetect);
-    REG_VOID_1(GSDKHttpRequest,   requestControl_Openid_Acctype_Zoneid_Env);
-    REG_VOID_1(GSDKInitManager,   detectOperation);
-    REG_VOID_1(GSDKRealTimeDetect, pingDelayDetect);
-    REG_VOID_1(GSDKRealTimeDetect, updDelayDetect_Port);
-    REG_VOID_1(GSDKUdpDetect,     isUDPConnect_Port);
-    REG_VOID_1(GSDKWIFI,          ping);
-    REG_VOID_1(GSDKDetectPort,    isConnection_Port);
-
-    REG_VOID_1(GCloudVoiceEngine, StartTve);
-    REG_VOID_1(GCloudVoiceEngine, StopRecording);
-    REG_VOID_1(GCloudVoiceEngine, TestMic);
-    REG_VOID_1(GCloudVoiceEngine, StartBGMPlay);
-    REG_VOID_1(GCloudVoiceEngine, StopBGMPlay);
-    REG_VOID_1(GCloudVoiceEngine, PauseBGMPlay);
-    REG_VOID_1(GCloudVoiceEngine, ResumeBGMPlay);
-    REG_VOID_1(GCloudVoiceEngine, RSTSStopRecording);
-    REG_VOID_1(GCloudVoiceEngine, TextToStreamSpeechStop);
-    REG_VOID_1(GCloudVoiceEngine, StopKaraokeRecording);
-    REG_VOID_1(GCloudVoiceEngine, StartRecording);
-    REG_VOID_1(GCloudVoiceEngine, SetBGMPath);
-    REG_VOID_1(GCloudVoiceEngine, SetLogCallBack);
-    REG_VOID_1(GCloudVoiceEngine, SetMicVolume);
-    REG_VOID_1(GCloudVoiceEngine, SetSpeakerVolume);
-    REG_VOID_1(GCloudVoiceEngine, SetBitRate);
-    REG_VOID_1(GCloudVoiceEngine, SetDataFree);
-    REG_VOID_1(GCloudVoiceEngine, SetReportBufferTime);
-    REG_VOID_1(GCloudVoiceEngine, SetBGMPlayTime);
-    REG_VOID_1(GCloudVoiceEngine, SetKaraokeVoiceVol);
-    REG_VOID_1(GCloudVoiceEngine, SetKaraokeAccVol);
-    REG_VOID_1(GCloudVoiceEngine, SetKaraokeVoiceDelay);
-    REG_VOID_1(GCloudVoiceEngine, SeekTimeMsForPreview);
-    REG_VOID_1(GCloudVoiceEngine, SeekTimeMsForAcc);
-
-    REG_VOID_2(GVGCloudVoice,     setAppInfo_withKey_andOpenID);
-    REG_VOID_2(GCloudVoiceEngine, EnableMultiRoom);
-    REG_VOID_2(GCloudVoiceEngine, EnableRoomMicrophone_enable);
-    REG_VOID_2(GCloudVoiceEngine, EnableRoomSpeaker_enable);
-    REG_VOID_2(GCloudVoiceEngine, EnableLog);
-    REG_VOID_2(GCloudVoiceEngine, EnableNativeBGMPlay);
-    REG_VOID_2(GCloudVoiceEngine, EnableRecvMagicVoice);
-    REG_VOID_2(GCloudVoiceEngine, EnableReportALL);
-    REG_VOID_2(GCloudVoiceEngine, EnableReportALLAbroad);
-    REG_VOID_2(GCloudVoiceEngine, EnableReportForAbroad);
-    REG_VOID_2(GCloudVoiceEngine, EnableCivilFile);
-    REG_VOID_2(GCloudVoiceEngine, EnableCivilVoice);
-    REG_VOID_2(GCloudVoiceEngine, EnableEarBack);
-    REG_VOID_2(GCloudVoiceEngine, EnableAccFilePlay);
-    REG_VOID_2(GVGCloudVoiceExtension, EnableKeyWordsDetect);
-
-    REG_VOID_3(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout);
-    REG_VOID_3(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout);
-    REG_VOID_3(GCloudVoiceEngine, QuitRoom_Scenes_timeout);
-
-    REG_VOID_1(NetworkManager, SendSecurityReport);
-    REG_VOID_1(FBAdMonitor,    startMonitoringAd);
-    REG_VOID_1(FBAdEvent,      logEvent_withParameters);
-    REG_VOID_1(FBAdLogger,     logMessage_withLevel);
-    REG_VOID_1(FIRMessaging,   retrieveFCMTokenForSenderID_completion);
-    REG_VOID_1(FIRMessaging,   deleteFCMTokenForSenderID_completion);
-    REG_VOID_1(FIRMessaging,   subscribeToTopic_completion);
-    REG_VOID_1(FIRMessaging,   unsubscribeFromTopic_completion);
-    REG_VOID_1(FIRMessaging,   setAPNSToken_withUserInfo);
-    REG_VOID_1(APMMonitor,     handleEvent);
-    REG_VOID_1(APMMonitor,     startMonitoring);
-    REG_VOID_1(APMCollector,   collectMetrics);
-    REG_VOID_1(TApmSceneMarker, markLoadLevel);
-    REG_VOID_1(TApmSceneMarker, postStepEvent);
-    REG_VOID_1(TApmSceneMarker, postStreamEvent);
-    REG_VOID_1(TDataMasterApplication, handleOpenURL);
-    REG_VOID_1(TcApiTool,      openUniversallinkIfNeed);
-    REG_VOID_1(TikTokAuth,     authorizeWithPermissions);
-    REG_VOID_1(TikTokAuth,     handleOpenURL);
-    REG_VOID_1(VKAuth,         authorizeWithPermissions);
-    REG_VOID_1(SCSDKLoginClient, loginWithCompletion);
-
-    // ───── id pass-through — مُعطَّل عمداً ─────
-    //
-    // لا نُنشّط أي id-hook. القاعدة:
-    //   لا تُنشّط DEF_ID_PASS إلا إذا كنت تعرف فئة الإرجاع بالضبط،
-    //   والـ IMP يعيد نفس الفئة.
-    //
-    // مثال لو احتجت يوماً:
-    // SBXK_SwizzleFull("GADAppOpenAd", "responseInfo",
-    //                  (IMP)SBXK_GADAppOpenAd_responseInfo, "@@:");
-    // حيث DEF_ID_PASS(GADAppOpenAd, responseInfo) — يعيد نفس الكائن الأصلي.
-
-#undef REG_BOOL_NO
-#undef REG_BOOL_YES
-#undef REG_VOID_1
-#undef REG_VOID_2
-#undef REG_VOID_3
+#undef REG_B
+#undef REG_V1
 }
 
 #pragma mark =========================================================
-#pragma mark 7. عارض السجل
+#pragma mark 8. LOG VIEWER
 #pragma mark =========================================================
 
 @interface SBXK_LogViewer : NSObject
@@ -713,7 +555,7 @@ static void SBXK_RegisterAll(void) {
 @end
 
 #pragma mark =========================================================
-#pragma mark 8. Retry + Entry
+#pragma mark 9. RETRY + ENTRY
 #pragma mark =========================================================
 
 static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
@@ -733,7 +575,7 @@ static void SBXK_RunInstall(void) {
     atomic_store(&g_phase, 20);
     SBXK_RegisterAll();
     atomic_store(&g_phase, 30);
-    NSLog(@"[SBXK] v7.4 install: done=%lu skip=%lu",
+    NSLog(@"[SBXK] v7.5 install: done=%lu skip=%lu",
           (unsigned long)g_done.count, (unsigned long)g_skip.count);
 }
 
@@ -751,7 +593,7 @@ static void SBXK_Bootstrap(void) {
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
 
-        NSLog(@"[SBXK] v7.4 boot");
+        NSLog(@"[SBXK] v7.5 boot");
 
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
