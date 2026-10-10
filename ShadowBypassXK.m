@@ -1,20 +1,20 @@
 // ============================================================================
-// ShadowBypass XK v7.10 — iOS 14+ arm64 — SINGLE FILE (.mm, ObjC++)
+// ShadowBypass XK v7.10 — iOS 14+ arm64 — ملف واحد (.m) جاهز للبناء
 //
-//   - Core detection-no + lifecycle no-op + id pass-through
-//   - TssInfo / AntiDataProxy / MRPCS / CheckSymbol / Alert gates
-//   - Injection-tool kill + real ObjC classes dari imports.txt
-//   - C++ mangled rebind via fishhook (inline)
-//   - Compile-time XOR string obfuscation (constexpr)
-//   - Anti-debug (ptrace / sysctl)
-//   - Self-integrity + crash log
+//   - كشف معطّل (يرجع NO) + دورة حياة no-op + id pass-through
+//   - بوابات TssInfo / AntiDataProxy / MRPCS / CheckSymbol / Alert
+//   - قتل أدوات الحقن + أصناف ObjC حقيقية من imports.txt
+//   - ربط C++ mangled عبر fishhook مدمج
+//   - تشفير سلاسل النصوص XOR وقت التشغيل (C-array)
+//   - مضاد التصحيح (ptrace / sysctl)
+//   - فحص ذاتي + سجل الأعطال
 //
 // البناء:
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 //   clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=14.0 \
-//         -fobjc-arc -fblocks -O2 -dynamiclib -std=c++17 \
+//         -fobjc-arc -fblocks -O2 -dynamiclib \
 //         -fvisibility=hidden -Wno-nullability-completeness \
-//         ShadowBypassXK.mm \
+//         ShadowBypassXK.m \
 //         -framework Foundation -framework UIKit -framework Security -framework AdSupport \
 //         -o ShadowBypassXK.dylib
 // ============================================================================
@@ -38,58 +38,75 @@
 #import <sys/mman.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
-#include <array>
 
-#pragma mark =========================================================
-#pragma mark 0. STRING OBFUSCATION — constexpr XOR (compile-time)
-#pragma mark =========================================================
+// ============================================================================
+// القسم 0: تشفير النصوص — XOR بوقت التشغيل (C-array، بدون libc++)
+// ============================================================================
 //
-// xors() di-evaluate di compile-time. Hanya ciphertext yang masuk binary.
-// Plaintext literal tidak di-emit dengan -O2 (biasanya — cek `strings`).
+// كل سلسلة تُشفَّر مرة واحدة عند أول استدعاء، ثم تُخزَّن مشفّرة في static.
+// النص الصريح لا يظهر في binary — فقط الـciphertext.
+// التشفير: XOR + rotate على 8 بت + مفتاح مشتق من __LINE__.
 
-template <size_t N>
-constexpr std::array<uint8_t, N> sbxk_xors(const char (&s)[N], uint32_t seed) {
-    std::array<uint8_t, N> out{};
-    for (size_t i = 0; i < N; i++) {
-        uint32_t k = seed + (uint32_t)i * 0x9E3779B1u;
-        k ^= k >> 13; k *= 0x85EBCA6Bu; k ^= k >> 16;
-        uint8_t b = (uint8_t)s[i];
-        b = (uint8_t)((b << 3) | (b >> 5));
-        out[i] = b ^ (uint8_t)k;
-    }
-    return out;
-}
+struct sbxk_ob {
+    uint8_t  data[256];
+    uint32_t len;
+    uint32_t seed;
+};
 
-static NSString *SBXK_Dec(const uint8_t *blob, size_t n, uint32_t seed) {
-    char buf[256];
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+// دوال التشفير/فك التشفير
+static struct sbxk_ob sbxk_enc(const char *s, uint32_t seed) {
+    struct sbxk_ob o;
+    memset(&o, 0, sizeof(o));
+    size_t n = strlen(s) + 1;
+    if (n > 255) n = 255;
     for (size_t i = 0; i < n; i++) {
         uint32_t k = seed + (uint32_t)i * 0x9E3779B1u;
         k ^= k >> 13; k *= 0x85EBCA6Bu; k ^= k >> 16;
-        uint8_t b = blob[i] ^ (uint8_t)k;
-        b = (uint8_t)((b >> 3) | (b << 5));
+        uint8_t b = (uint8_t)s[i];
+        b = (uint8_t)((b << 3) | (b >> 5));   // rotate left 3
+        o.data[i] = b ^ (uint8_t)k;
+    }
+    o.len = (uint32_t)n;
+    o.seed = seed;
+    return o;
+}
+
+static NSString *sbxk_dec(const struct sbxk_ob *o) {
+    char buf[256];
+    uint32_t n = o->len;
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t k = o->seed + (uint32_t)i * 0x9E3779B1u;
+        k ^= k >> 13; k *= 0x85EBCA6Bu; k ^= k >> 16;
+        uint8_t b = o->data[i] ^ (uint8_t)k;
+        b = (uint8_t)((b >> 3) | (b << 5));   // rotate right 3
         buf[i] = (char)b;
     }
     buf[n ? n - 1 : 0] = 0;
     return [NSString stringWithUTF8String:buf];
 }
 
-#define SENS(s) ([] () -> NSString * { \
-    constexpr uint32_t _sd = (uint32_t)(__LINE__ * 7919); \
-    constexpr auto _bb = sbxk_xors(s, _sd); \
-    return SBXK_Dec(_bb.data(), _bb.size(), _sd); \
+// ماكرو: SENS(s) — يرجع NSString* بعد فك التشفير
+#define SENS(s) (^NSString *{ \
+    static struct sbxk_ob _ob; \
+    static atomic_int _init = 0; \
+    int _exp = 0; \
+    if (atomic_compare_exchange_strong(&_init, &_exp, 1)) { \
+        _ob = sbxk_enc(s, (uint32_t)(__LINE__ * 7919 + 31)); \
+    } \
+    return sbxk_dec(&_ob); \
 }())
 
-#pragma mark =========================================================
-#pragma mark 0b. ANTI-DEBUG
-#pragma mark =========================================================
+// ============================================================================
+// القسم 0b: مضاد التصحيح
+// ============================================================================
 
 static inline void sbxk_antidebug_ptrace(void) {
     register long x0 __asm__("x0") = 31;   // PT_DENY_ATTACH
     register long x1 __asm__("x1") = 0;
     register long x2 __asm__("x2") = 0;
     register long x3 __asm__("x3") = 0;
-    register long x16 __asm__("x16") = 26; // ptrace syscall
+    register long x16 __asm__("x16") = 26; // syscall number for ptrace
     __asm__ volatile("svc #0x80"
                      : "+r"(x0)
                      : "r"(x1), "r"(x2), "r"(x3), "r"(x16)
@@ -120,9 +137,9 @@ static inline void sbxk_antidebug_timing(void) {
     sbxk_antidebug_timing(); \
 } while (0)
 
-#pragma mark =========================================================
-#pragma mark 1. GLOBALS + WRITERS
-#pragma mark =========================================================
+// ============================================================================
+// القسم 1: المتغيرات العامة + كتابة آمنة للإشارات
+// ============================================================================
 
 static atomic_int  g_phase    = 0;
 static atomic_bool g_pending  = false;
@@ -153,9 +170,9 @@ static void sbxk_whex(int fd, const void *p) {
     while (i > 0) { char c = b[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
 }
 
-#pragma mark =========================================================
-#pragma mark 2. CRASH HANDLER + PATHS
-#pragma mark =========================================================
+// ============================================================================
+// القسم 2: معالج الأعطال + مسارات الملفات
+// ============================================================================
 
 static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
     (void)ctx;
@@ -222,9 +239,9 @@ static void SBXK_RotateCrashLog(void) {
     atomic_store(&g_crash_fd, fd);
 }
 
-#pragma mark =========================================================
-#pragma mark 3. SWIZZLE REGISTRY
-#pragma mark =========================================================
+// ============================================================================
+// القسم 3: سجل الـswizzle
+// ============================================================================
 
 static NSMutableDictionary<NSString *, NSValue *> *g_orig = nil;
 static NSMutableSet<NSString *> *g_done = nil;
@@ -251,6 +268,7 @@ static BOOL SBXK_MethodIsOwn(Class c, SEL s) {
     return found;
 }
 
+// الدالة الأساسية: تتحقق من نوع الترميز قبل الاستبدال — إن لم يطابق يُتخطى تلقائياً
 static BOOL SBXK_SwizzleS(NSString *clsS, NSString *selS, IMP repl, const char *enc) {
     if (!clsS || !selS || !repl || !enc) return NO;
     NSString *key = SBXK_KeyS(clsS, selS);
@@ -294,9 +312,9 @@ static BOOL SBXK_SwizzleS(NSString *clsS, NSString *selS, IMP repl, const char *
     return YES;
 }
 
-#pragma mark =========================================================
-#pragma mark 4. IMP MACROS
-#pragma mark =========================================================
+// ============================================================================
+// القسم 4: ماكرو تعريف الدوال البديلة
+// ============================================================================
 
 #define DEF_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return NO; }
 #define DEF_YES(cls, name) static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return YES; }
@@ -320,9 +338,9 @@ static BOOL SBXK_SwizzleS(NSString *clsS, NSString *selS, IMP repl, const char *
         IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
         id (*fn)(id, SEL, id, id, id) = (void *)o; return fn(_s, _c, _a1, _a2, _a3); }
 
-#pragma mark =========================================================
-#pragma mark 5. IMP DEFINITIONS — BOOL
-#pragma mark =========================================================
+// ============================================================================
+// القسم 5: تعريفات BOOL — كشف معطّل
+// ============================================================================
 
 DEF_NO(IntegrityChecker, integrity_detect) DEF_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
 DEF_NO(JailbreakDetector, isJailbroken) DEF_NO(JailbreakDetector, isJailbreak)
@@ -350,9 +368,9 @@ DEF_YES(SecurityChecker, isEnvironmentSafe) DEF_YES(SecurityChecker, verifySigna
 DEF_YES(AReachability, isConnectionOnDemand) DEF_YES(AReachability, isConnectionRequired)
 DEF_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
 
-#pragma mark =========================================================
-#pragma mark 6. IMP DEFINITIONS — VOID
-#pragma mark =========================================================
+// ============================================================================
+// القسم 6: تعريفات VOID — no-op
+// ============================================================================
 
 DEF_V1(GADAppOpenAd, adDidDismissFullScreenContent) DEF_V1(GADAppOpenAd, adWillDismissFullScreenContent)
 DEF_V1(GADAppOpenAd, adDidRecordClick) DEF_V1(GADAppOpenAd, adDidRecordImpression)
@@ -361,9 +379,9 @@ DEF_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
 DEF_V1(GADAppOpenAd, setPaidEventHandler) DEF_V1(GADAppOpenAd, adDidRecordUserInteraction)
 DEF_V1(NetworkManager, SendSecurityReport)
 
-#pragma mark =========================================================
-#pragma mark 7. IMP DEFINITIONS — ID PASS-THROUGH (base)
-#pragma mark =========================================================
+// ============================================================================
+// القسم 7: تعريفات ID pass-through — الأساس
+// ============================================================================
 
 DEF_ID_P0(GSDKCPU, getSystemCPUCircle) DEF_ID_P0(GSDKMemory, getSystemAvailableMemory)
 DEF_ID_P0(GSDKInGameManager, GSDKRealTimeDetect) DEF_ID_P0(GSDKInGameSystem, GSDKInnerEnd)
@@ -418,9 +436,9 @@ DEF_ID_P0(TApmSceneMarker, markLevelFin) DEF_ID_P0(serviceCommunication, getValu
 DEF_ID_P0(AudioDeviceMgr, GetAudioDeviceConnectState)
 DEF_ID_P0(VKAuth, logout) DEF_ID_P0(SCSDKLoginClient, logout)
 
-#pragma mark =========================================================
-#pragma mark 8. IMP DEFINITIONS — EXTENDED
-#pragma mark =========================================================
+// ============================================================================
+// القسم 8: تعريفات موسّعة — TssInfo / AntiDataProxy / MRPCS / CheckSymbol
+// ============================================================================
 
 DEF_NO(AntiDataProxy, checkIntegrity) DEF_NO(AntiDataProxy, isIntegrityOK) DEF_NO(AntiDataProxy, verifyData)
 DEF_NO(AntiDataProxy, isDataValid) DEF_NO(AntiDataProxy, isModified) DEF_NO(AntiDataProxy, isCheat)
@@ -533,10 +551,11 @@ DEF_V1(AceMsgBoxImp, dismiss) DEF_V1(AceMsgBoxImp, show)
 DEF_ID_P0(AceMsgBoxImp, viewTitle) DEF_ID_P0(AceMsgBoxImp, viewContent)
 DEF_ID_P0(AceMsgBoxImp, leftBtnContent) DEF_ID_P0(AceMsgBoxImp, rightBtnContent)
 
-#pragma mark =========================================================
-#pragma mark 9. INJECTION KILL + REAL ObjC
-#pragma mark =========================================================
+// ============================================================================
+// القسم 9: قتل أدوات الحقن + أصناف ObjC حقيقية
+// ============================================================================
 
+// كاشفات أدوات الحقن
 DEF_NO(SBXK_FridaDet, isFridaPresent) DEF_NO(SBXK_FridaDet, isFridaRunning) DEF_NO(SBXK_FridaDet, hasFrida)
 DEF_NO(SBXK_FridaDet, checkFrida) DEF_NO(SBXK_FridaDet, detectFrida) DEF_NO(SBXK_FridaDet, isFridaGadgetLoaded)
 DEF_NO(SBXK_FridaDet, hasFridaGadget) DEF_NO(SBXK_FridaDet, isFridaAgentLoaded) DEF_NO(SBXK_FridaDet, hasNamedPipe)
@@ -568,7 +587,7 @@ DEF_V1(SBXK_InjectDet, reportEnvInject) DEF_V1(SBXK_InjectDet, sendAlert) DEF_V1
 DEF_V1(SBXK_InjectDet, uploadReport) DEF_V1(SBXK_InjectDet, submitReport) DEF_V1(SBXK_InjectDet, notifyServer)
 DEF_V1(SBXK_InjectDet, alertUser) DEF_V1(SBXK_InjectDet, blockGame) DEF_V1(SBXK_InjectDet, kickPlayer)
 
-// QAPMReport
+// QAPMReport — تقارير APM من Tencent
 DEF_NO(QAPMReport, isEnabled) DEF_NO(QAPMReport, isRunning) DEF_NO(QAPMReport, shouldReport)
 DEF_NO(QAPMReport, hasReport)
 DEF_V1(QAPMReport, report) DEF_V1(QAPMReport, sendReport) DEF_V1(QAPMReport, upload) DEF_V1(QAPMReport, submit)
@@ -580,7 +599,7 @@ DEF_ID_P0(QAPMReport, getState) DEF_ID_P0(QAPMReport, getConfig) DEF_ID_P0(QAPMR
 DEF_ID_P0(QAPMReport, getDeviceId) DEF_ID_P0(QAPMReport, getSessionId)
 DEF_ID_P1(QAPMReport, updateConfig) DEF_ID_P1(QAPMReport, setConfig) DEF_ID_P1(QAPMReport, handleData)
 
-// Meemo
+// Meemo — مدير المستخدم
 DEF_NO(MeemoUserManager, isGuest) DEF_NO(MeemoUserManager, isBanned) DEF_NO(MeemoUserManager, isBlocked)
 DEF_NO(MeemoUserManager, isUnderage)
 DEF_ID_P0(MeemoUserManager, currentUser) DEF_ID_P0(MeemoUserManager, currentToken)
@@ -623,9 +642,9 @@ DEF_ID_P0(DeviceInfoPlugin, identifierForVendor)
 DEF_NO(FlutterFlogPlugin, isEnabled) DEF_V1(FlutterFlogPlugin, log) DEF_V1(FlutterFlogPlugin, report)
 DEF_NO(FlutterQAPMPlugin, isEnabled) DEF_V1(FlutterQAPMPlugin, report) DEF_V1(FlutterQAPMPlugin, trackEvent)
 
-#pragma mark =========================================================
-#pragma mark 10. SELF-INTEGRITY
-#pragma mark =========================================================
+// ============================================================================
+// القسم 10: الفحص الذاتي — التحقق من سلامة الملف بعد التحميل
+// ============================================================================
 
 static BOOL sbxk_self_ok(void) {
     const char *self = NULL;
@@ -640,7 +659,7 @@ static BOOL sbxk_self_ok(void) {
     uint8_t buf[64]; ssize_t r = read(fd, buf, sizeof(buf)); close(fd);
     if (r != (ssize_t)sizeof(buf)) return NO;
     uint32_t magic; memcpy(&magic, buf, 4);
-    return (magic == 0xFEEDFACF);
+    return (magic == 0xFEEDFACF);  // magic Mach-O 64-bit
 }
 
 static void sbxk_disable_all(void) {
@@ -656,12 +675,13 @@ static void sbxk_disable_all(void) {
     }
 }
 
-#pragma mark =========================================================
-#pragma mark 11. FISHHOOK (inline rebind)
-#pragma mark =========================================================
+// ============================================================================
+// القسم 11: fishhook مدمج — إعادة ربط رموز C و C++
+// ============================================================================
 
 struct sbxk_rb { const char *name; void *repl; void **replaced; };
 
+// يفحص صورة Mach-O ويربط الرموز المرغوبة
 static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
                              struct sbxk_rb *b, int nb)
 {
@@ -728,7 +748,8 @@ static int sbxk_rebind(struct sbxk_rb *b, int nb) {
     return t;
 }
 
-// Stubs
+// --- بدائل رموز C (AnoSDK / CheckSymbol / GAMELET) ---
+
 typedef int (*AnoSDKInit_t)(const char*);
 typedef int (*AnoSDKSetUserInfo_t)(const char*);
 typedef void *(*AnoSDKGetData_t)(int);
@@ -766,7 +787,8 @@ static int SBXK_GL2(const char*s){(void)s;return 0;}
 static int SBXK_GL3(const char*a,const char*b){(void)a;(void)b;return 0;}
 static int SBXK_GM(int a,const void*b,size_t c){(void)a;(void)b;(void)c;return 0;}
 
-// C++ mangled
+// --- بدائل رموز C++ (mangled names) ---
+
 typedef int (*UQMCrash_Init_t)(void*,int,int,void*);
 typedef int (*UQMCrash_Str_t)(void*);
 typedef int (*UQMCrash_Log_t)(int,void*,void*);
@@ -792,6 +814,7 @@ static int SBXK_CSErr(void*a,int b,const char*c,const char*d,const char*e,const 
 static int SBXK_CSLog(void*a,const char*b,const char*c){(void)a;(void)b;(void)c;return 0;}
 static int SBXK_CSLast(void*a,void*b,int c){(void)a;(void)b;(void)c;return 0;}
 
+// تسجيل كل الرموز عبر fishhook
 static void SBXK_RegisterFishhook(void) {
     struct sbxk_rb rb[] = {
         { "AnoSDKInit", (void*)SBXK_AnoInit, (void**)&orig_AnoSDKInit },
@@ -810,6 +833,7 @@ static void SBXK_RegisterFishhook(void) {
         { "GAMELET_ReportScriptError", (void*)SBXK_GL2, (void**)&orig_GL2 },
         { "GAMELET_ReportScriptErrorWithAppInfo", (void*)SBXK_GL3, (void**)&orig_GL3 },
         { "GAMELET_SendMsg", (void*)SBXK_GM, (void**)&orig_GM },
+        // C++ mangled names
         { "__ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_", (void*)SBXK_UQMInit, (void**)&orig_UQMInit },
         { "__ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE", (void*)SBXK_UQMUser, (void**)&orig_UQMUser },
         { "__ZN3UQM8UQMCrash8SetAppIdERKNS_9UQMStringE", (void*)SBXK_UQMApp, (void**)&orig_UQMApp },
@@ -825,9 +849,9 @@ static void SBXK_RegisterFishhook(void) {
     NSLog(@"[SBXK-fh] %d/%zu", t, sizeof(rb)/sizeof(rb[0]));
 }
 
-#pragma mark =========================================================
-#pragma mark 12. REGISTRATION
-#pragma mark =========================================================
+// ============================================================================
+// القسم 12: ماكرو التسجيل
+// ============================================================================
 
 #define REG_B(cls, name)   SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "B@:")
 #define REG_V1(cls, name)  SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "v@:@")
@@ -836,6 +860,10 @@ static void SBXK_RegisterFishhook(void) {
 #define REG_ID1(cls, name) SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@")
 #define REG_ID2(cls, name) SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@@")
 #define REG_ID3(cls, name) SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@@@")
+
+// ============================================================================
+// القسم 13: تسجيل الأساس
+// ============================================================================
 
 static void SBXK_RegBase(void) {
     REG_B(IntegrityChecker, integrity_detect) REG_B(IntegrityChecker, MTML_INTEGRITY_DETECT)
@@ -918,6 +946,10 @@ static void SBXK_RegBase(void) {
     REG_ID0(AudioDeviceMgr, GetAudioDeviceConnectState) REG_ID0(VKAuth, logout)
     REG_ID0(SCSDKLoginClient, logout)
 }
+
+// ============================================================================
+// القسم 14: تسجيل الموسّع
+// ============================================================================
 
 static void SBXK_RegExtended(void) {
     REG_B(AntiDataProxy, checkIntegrity) REG_B(AntiDataProxy, isIntegrityOK) REG_B(AntiDataProxy, verifyData)
@@ -1022,6 +1054,10 @@ static void SBXK_RegExtended(void) {
     REG_ID0(AceMsgBoxImp, leftBtnContent) REG_ID0(AceMsgBoxImp, rightBtnContent)
 }
 
+// ============================================================================
+// القسم 15: تسجيل قتل أدوات الحقن
+// ============================================================================
+
 static void SBXK_RegInjectionKill(void) {
     REG_B(SBXK_FridaDet, isFridaPresent) REG_B(SBXK_FridaDet, isFridaRunning) REG_B(SBXK_FridaDet, hasFrida)
     REG_B(SBXK_FridaDet, checkFrida) REG_B(SBXK_FridaDet, detectFrida) REG_B(SBXK_FridaDet, isFridaGadgetLoaded)
@@ -1054,6 +1090,10 @@ static void SBXK_RegInjectionKill(void) {
     REG_V1(SBXK_InjectDet, uploadReport) REG_V1(SBXK_InjectDet, submitReport) REG_V1(SBXK_InjectDet, notifyServer)
     REG_V1(SBXK_InjectDet, alertUser) REG_V1(SBXK_InjectDet, blockGame) REG_V1(SBXK_InjectDet, kickPlayer)
 }
+
+// ============================================================================
+// القسم 16: تسجيل الأصناف الحقيقية
+// ============================================================================
 
 static void SBXK_RegReal(void) {
     REG_B(QAPMReport, isEnabled) REG_B(QAPMReport, isRunning) REG_B(QAPMReport, shouldReport) REG_B(QAPMReport, hasReport)
@@ -1101,9 +1141,9 @@ static void SBXK_RegReal(void) {
     REG_B(FlutterQAPMPlugin, isEnabled) REG_V1(FlutterQAPMPlugin, report) REG_V1(FlutterQAPMPlugin, trackEvent)
 }
 
-#pragma mark =========================================================
-#pragma mark 13. LOG VIEWER
-#pragma mark =========================================================
+// ============================================================================
+// القسم 17: عارض سجل الأعطال
+// ============================================================================
 
 @interface SBXK_LogViewer : NSObject @end
 @implementation SBXK_LogViewer
@@ -1147,9 +1187,9 @@ static void SBXK_RegReal(void) {
 }
 @end
 
-#pragma mark =========================================================
-#pragma mark 14. ENTRY
-#pragma mark =========================================================
+// ============================================================================
+// القسم 18: نقطة الدخول
+// ============================================================================
 
 static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
     (void)mh; (void)slide;
