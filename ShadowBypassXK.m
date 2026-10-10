@@ -1,24 +1,14 @@
 // ============================================================================
-// ShadowBypass XK v6.1 — iOS 14+, arm64/arm64e, no jailbreak
+// ShadowBypass XK v6.1.1 — iOS 14+, arm64/arm64e, no jailbreak
 //
-// Fixes over v6 (from audit):
-//   [1] كل Selectors متعددة الوسائط أصبحت تحتوي النقطتين ":" الفعليتين
-//       — كان كل hook يُسكَب بسبب _ بدل :
-//   [2] Banner: بدل swizzle على didFinishLaunching (الذي استُدعي بالفعل عند
-//       t=7s)، نستخدم UIApplicationDidFinishLaunchingNotification المثبَّت
-//       في الـ constructor قبل أن يُستدعى.
-//   [3] إزالة كل hooks dealloc — لا يمكن استبدال dealloc بـ no-op دون تسرّب.
-//   [4] install لـ class methods أيضاً (trackingAuthorizationStatus).
-//   [5] استبدال @synchronized داخل dyld callback بـ os_unfair_lock.
-//   [6] فحص نوع الإرجاع بـ NSMethodSignature (full return type) بدل الحرف الأول.
-//   [7] تشخيص runtime: يُسجَّل سبب كل skip.
-//   [8] إزالة أو تصحيح مدخلات كان توقيعها الداخلي متناقضاً.
+// Fixes over v6.1:
+//   [A] كل Macros لا تطلب أسماء معاملات — تستخدم _a1.._aN داخلياً
+//   [B] g_hooks[] مقدَّم قبل SBXK_InstallAllSwizzles
 //
 // Build:
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 //   clang -arch arm64 -arch arm64e -isysroot "$SDK" -miphoneos-version-min=14.0 \
-//         -fobjc-arc -O2 -dynamiclib \
-//         -Wno-nullability-completeness \
+//         -fobjc-arc -O2 -dynamiclib -Wno-nullability-completeness \
 //         ShadowBypassXK.m \
 //         -framework Foundation -framework UIKit -framework Security \
 //         -framework AdSupport -framework AppTrackingTransparency \
@@ -36,11 +26,9 @@
 #define SBXK_LOG(fmt, ...) NSLog(@"[SBXK] " fmt, ##__VA_ARGS__)
 
 #pragma mark =========================================================
-#pragma mark 1. HOOK TABLE TYPES
+#pragma mark 1. HOOK TABLE TYPE
 #pragma mark =========================================================
 
-// expectedRet هي السلسلة الكاملة التي يُرجعها NSMethodSignature.methodReturnType
-// مثل: "v", "B", "c", "i", "q", "d", "@", "#". المقارنة تتم على السلسلة كاملة.
 typedef struct {
     const char *cls;
     const char *sel;
@@ -48,283 +36,281 @@ typedef struct {
     const char *expectedRet;
 } sbxk_hook_t;
 
-static NSMutableSet<NSString *> *g_pendingClasses = nil;  // main queue only
+static NSMutableSet<NSString *> *g_pendingClasses = nil;
 static os_unfair_lock g_retry_lock = OS_UNFAIR_LOCK_INIT;
 static volatile bool  g_retry_pending = false;
 
 #pragma mark =========================================================
-#pragma mark 2. IMP DEFINITION MACROS
+#pragma mark 2. IMP DEFINITION MACROS — بدون arg names
 #pragma mark =========================================================
-//
-// التسمية: D_<kind>_<args>(Class, c_safe_name, ...)
-// الـ c_safe_name هو اسم صالح كـ C identifier (قد يحتوي _)
-// Selector الحقيقي بالنقطتين يُعطى لاحقاً في g_hooks[].
 
-#define D_NO(cls, name)  static BOOL SBXK_##cls##_##name(id s, SEL _cmd) { (void)s;(void)_cmd; return NO; }
-#define D_YES(cls, name) static BOOL SBXK_##cls##_##name(id s, SEL _cmd) { (void)s;(void)_cmd; return YES; }
+#define DEF_BOOL_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return NO; }
+#define DEF_BOOL_YES(cls, name) static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return YES; }
 
-#define D_ID(cls, name)             static id SBXK_##cls##_##name(id s, SEL _cmd) { (void)s;(void)_cmd; return @(0); }
-#define D_ID_A(cls, name, a)        static id SBXK_##cls##_##name(id s, SEL _cmd, id a) { (void)s;(void)_cmd;(void)a; return @(0); }
-#define D_ID_AA(cls, name, a, b)    static id SBXK_##cls##_##name(id s, SEL _cmd, id a, id b) { (void)s;(void)_cmd;(void)a;(void)b; return @(0); }
-#define D_ID_AAA(cls, name, a, b, c) static id SBXK_##cls##_##name(id s, SEL _cmd, id a, id b, id c) { (void)s;(void)_cmd;(void)a;(void)b;(void)c; return @(0); }
-#define D_ID_AB(cls, name, a, b)    static id SBXK_##cls##_##name(id s, SEL _cmd, id a, BOOL b) { (void)s;(void)_cmd;(void)a;(void)b; return @(0); }
+#define DEF_ID_0(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return @(0); }
+#define DEF_ID_1(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; return @(0); }
+#define DEF_ID_2(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; return @(0); }
+#define DEF_ID_3(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3; return @(0); }
+#define DEF_ID_4(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3, id _a4) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3;(void)_a4; return @(0); }
+#define DEF_ID_5(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3, id _a4, id _a5) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3;(void)_a4;(void)_a5; return @(0); }
 
-#define D_V(cls, name)              static void SBXK_##cls##_##name(id s, SEL _cmd) { (void)s;(void)_cmd; }
-#define D_V_A(cls, name, a)         static void SBXK_##cls##_##name(id s, SEL _cmd, id a) { (void)s;(void)_cmd;(void)a; }
-#define D_V_AA(cls, name, a, b)     static void SBXK_##cls##_##name(id s, SEL _cmd, id a, id b) { (void)s;(void)_cmd;(void)a;(void)b; }
-#define D_V_AB(cls, name, a, b)     static void SBXK_##cls##_##name(id s, SEL _cmd, id a, BOOL b) { (void)s;(void)_cmd;(void)a;(void)b; }
-#define D_V_AI(cls, name, a, b)     static void SBXK_##cls##_##name(id s, SEL _cmd, id a, int b) { (void)s;(void)_cmd;(void)a;(void)b; }
-#define D_V_AII(cls, name, a, b, c) static void SBXK_##cls##_##name(id s, SEL _cmd, id a, int b, int c) { (void)s;(void)_cmd;(void)a;(void)b;(void)c; }
+#define DEF_VOID_0(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; }
+#define DEF_VOID_1(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; }
+#define DEF_VOID_2(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; }
+#define DEF_VOID_2B(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, BOOL _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; }
+#define DEF_VOID_2I(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, int _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; }
+#define DEF_VOID_3(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3; }
+#define DEF_VOID_3I(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, int _a2, int _a3) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3; }
 
 #pragma mark =========================================================
 #pragma mark 3. IMPLEMENTATIONS
 #pragma mark =========================================================
 
-// --- Detection — كلها BOOL / (id, SEL) ---
-D_NO(IntegrityChecker, integrity_detect)
-D_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
-D_NO(JailbreakDetector, isJailbroken)
-D_NO(JailbreakDetector, isJailbreak)
-D_NO(JailbreakDetector, checkJailbreak)
-D_NO(JailbreakDetector, jailbreakDetection)
-D_NO(SimulatorDetector, isSimulator)
-D_NO(SimulatorDetector, isSimulatorDevice)
-D_NO(SimulatorDetector, checkSimulator)
-D_NO(SecurityChecker, IsFileSystemModified)
-D_NO(SecurityChecker, isDebuggerAttached)
-D_NO(SecurityChecker, isDebugged)
-D_NO(SecurityChecker, checkDebugger)
-D_NO(SecurityChecker, amIBeingDebugged)
-D_NO(SecurityChecker, checkDebuggerAttach)
-D_NO(SecurityChecker, isHooked)
-D_NO(SecurityChecker, isHookDetected)
-D_NO(SecurityChecker, checkHook)
-D_NO(SecurityChecker, detectHook)
-D_NO(SecurityChecker, antiHookCheck)
-D_NO(SecurityChecker, isTampered)
-D_NO(SecurityChecker, checkTamper)
-D_NO(SecurityChecker, antiTamperCheck)
-D_NO(SecurityChecker, isInjected)
-D_NO(SecurityChecker, isLibraryInjected)
-D_NO(SecurityChecker, checkInjection)
-D_NO(SecurityChecker, antiInjectionCheck)
-D_NO(SecurityChecker, isReversingDetected)
-D_NO(SecurityChecker, checkReversing)
-D_NO(SecurityChecker, antiReversingCheck)
-D_NO(SecurityChecker, isBlocked)
-D_NO(SecurityChecker, antiBlockingCheck)
-D_YES(SecurityChecker, verifyIntegrity)
-D_YES(SecurityChecker, checkTokenValid)
-D_YES(AReachability, isConnectionOnDemand)
-D_YES(AReachability, isConnectionRequired)
-D_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
+// --- Detection ---
+DEF_BOOL_NO(IntegrityChecker, integrity_detect)
+DEF_BOOL_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
+DEF_BOOL_NO(JailbreakDetector, isJailbroken)
+DEF_BOOL_NO(JailbreakDetector, isJailbreak)
+DEF_BOOL_NO(JailbreakDetector, checkJailbreak)
+DEF_BOOL_NO(JailbreakDetector, jailbreakDetection)
+DEF_BOOL_NO(SimulatorDetector, isSimulator)
+DEF_BOOL_NO(SimulatorDetector, isSimulatorDevice)
+DEF_BOOL_NO(SimulatorDetector, checkSimulator)
+DEF_BOOL_NO(SecurityChecker, IsFileSystemModified)
+DEF_BOOL_NO(SecurityChecker, isDebuggerAttached)
+DEF_BOOL_NO(SecurityChecker, isDebugged)
+DEF_BOOL_NO(SecurityChecker, checkDebugger)
+DEF_BOOL_NO(SecurityChecker, amIBeingDebugged)
+DEF_BOOL_NO(SecurityChecker, checkDebuggerAttach)
+DEF_BOOL_NO(SecurityChecker, isHooked)
+DEF_BOOL_NO(SecurityChecker, isHookDetected)
+DEF_BOOL_NO(SecurityChecker, checkHook)
+DEF_BOOL_NO(SecurityChecker, detectHook)
+DEF_BOOL_NO(SecurityChecker, antiHookCheck)
+DEF_BOOL_NO(SecurityChecker, isTampered)
+DEF_BOOL_NO(SecurityChecker, checkTamper)
+DEF_BOOL_NO(SecurityChecker, antiTamperCheck)
+DEF_BOOL_NO(SecurityChecker, isInjected)
+DEF_BOOL_NO(SecurityChecker, isLibraryInjected)
+DEF_BOOL_NO(SecurityChecker, checkInjection)
+DEF_BOOL_NO(SecurityChecker, antiInjectionCheck)
+DEF_BOOL_NO(SecurityChecker, isReversingDetected)
+DEF_BOOL_NO(SecurityChecker, checkReversing)
+DEF_BOOL_NO(SecurityChecker, antiReversingCheck)
+DEF_BOOL_NO(SecurityChecker, isBlocked)
+DEF_BOOL_NO(SecurityChecker, antiBlockingCheck)
+DEF_BOOL_YES(SecurityChecker, verifyIntegrity)
+DEF_BOOL_YES(SecurityChecker, checkTokenValid)
+DEF_BOOL_YES(AReachability, isConnectionOnDemand)
+DEF_BOOL_YES(AReachability, isConnectionRequired)
+DEF_BOOL_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
 
-// --- GAD callbacks — كلها void (id, SEL, id) ---
-D_V_A(GADAppOpenAd, adDidDismissFullScreenContent)
-D_V_A(GADAppOpenAd, adWillDismissFullScreenContent)
-D_V_A(GADAppOpenAd, adDidRecordClick)
-D_V_A(GADAppOpenAd, adDidRecordImpression)
-D_V_A(GADAppOpenAd, adWillPresentFullScreenContent)
-D_V_A(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
-D_V_A(GADAppOpenAd, setPaidEventHandler)
-D_ID(GADAppOpenAd, responseInfo)
-D_ID(GADMobileAds, initializationStatus)
-D_ID(GADAdNetworkResponseInfo, adUnitMapping)
+// --- GAD callbacks — void (id, SEL, id) ---
+DEF_VOID_1(GADAppOpenAd, adDidDismissFullScreenContent)
+DEF_VOID_1(GADAppOpenAd, adWillDismissFullScreenContent)
+DEF_VOID_1(GADAppOpenAd, adDidRecordClick)
+DEF_VOID_1(GADAppOpenAd, adDidRecordImpression)
+DEF_VOID_1(GADAppOpenAd, adWillPresentFullScreenContent)
+DEF_VOID_1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
+DEF_VOID_1(GADAppOpenAd, setPaidEventHandler)
+DEF_ID_0(GADAppOpenAd, responseInfo)
+DEF_ID_0(GADMobileAds, initializationStatus)
+DEF_ID_0(GADAdNetworkResponseInfo, adUnitMapping)
 
-// --- Game logic ---
-static id SBXK_WeaponProcessor_CalculateDamage(id s, SEL _cmd, id target, float dist) {
-    (void)s; (void)_cmd; (void)target; (void)dist; return @(0);
+// --- Game ---
+static id SBXK_WeaponProcessor_CalculateDamage(id _s, SEL _c, id _t, float _d) {
+    (void)_s; (void)_c; (void)_t; (void)_d; return @(0);
 }
-D_NO(CharacterMovement, IsSpeedExceeded)
-static id SBXK_BulletSimulator_CheckWallCollision(id s, SEL _cmd) { (void)s;(void)_cmd; return nil; }
-static void SBXK_NetworkManager_SendSecurityReport(id s, SEL _cmd, id r) {
-    (void)s; (void)_cmd; (void)r; SBXK_LOG(@"suppressed SecurityReport");
+DEF_BOOL_NO(CharacterMovement, IsSpeedExceeded)
+DEF_ID_0(BulletSimulator, CheckWallCollision)
+static void SBXK_NetworkManager_SendSecurityReport(id _s, SEL _c, id _r) {
+    (void)_s; (void)_c; (void)_r; SBXK_LOG(@"suppressed SecurityReport");
 }
 
 // --- GSDK ---
-D_ID(GSDKCPU, getSystemCPUCircle)
-D_ID(GSDKMemory, getSystemAvailableMemory)
-D_ID(GSDKInGameManager, GSDKRealTimeDetect)
-D_ID(GSDKInGameSystem, GSDKInnerEnd)
-D_ID(GSDKInGameSystem, GSDKInnerRealTimeDetect)
-D_ID(GSDKPing, ping)
-D_ID(GSDKPing, stopPing)
-D_ID(GSDKPingDetect, ping)
-D_ID(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env)
-D_ID(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots)
-D_ID(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP)
-D_ID(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error)
-D_ID(GSDKPing, simplePing_didFailWithError)
-D_ID(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber)
-D_ID(GSDKPing, simplePing_didReceiveUnexpectedPacket)
-D_ID(GSDKPing, simplePing_didSendPacket_sequenceNumber)
-D_ID(GSDKPing, simplePing_didStartWithAddress)
-D_ID(GSDKPingDetect, simplePing_didFailToSendPacket_sequenceNumber_error)
-D_ID(GSDKPingDetect, simplePing_didFailWithError)
-D_ID(GSDKPingDetect, simplePing_didReceivePingResponsePacket_sequenceNumber)
-D_ID(GSDKPingDetect, simplePing_didReceiveUnexpectedPacket)
-D_ID(GSDKPingDetect, simplePing_didSendPacket_sequenceNumber)
-D_ID(GSDKPingDetect, simplePing_didStartWithAddress)
-D_ID(GSDKRealTimeDetect, pingDelayDetect)
-D_ID(GSDKRealTimeDetect, updDelayDetect_Port)
-D_ID(GSDKUdpDetect, isUDPConnect_Port)
-D_ID(GSDKWIFI, ping)
-D_ID(GSDKDetectPort, isConnection_Port)
-D_ID(GSDKInitManager, detectOperation)
-D_ID(GSDKPayEvent, GSDKPay_Tag_Status_Msg)
-D_ID(PingDelegate, pingTimer)
-D_ID(PingDelegate, simplePing_didFailToSendPacket_sequenceNumber_error)
-D_ID(PingDelegate, simplePing_didSendPacket_sequenceNumber)
-D_ID(SimplePing, start)
-D_ID(SimplePing, startWithHostAddress)
-D_ID(SimplePing, readData)
-D_ID(SimplePing, didFailWithError)
-D_ID(SimplePing, sendPingWithData)
-D_ID(SimplePing, validatePingResponsePacket_sequenceNumber)
-D_ID(SimplePing, pingPacketWithType_payload_requiresChecksum)
+DEF_ID_0(GSDKCPU, getSystemCPUCircle)
+DEF_ID_0(GSDKMemory, getSystemAvailableMemory)
+DEF_ID_0(GSDKInGameManager, GSDKRealTimeDetect)
+DEF_ID_0(GSDKInGameSystem, GSDKInnerEnd)
+DEF_ID_0(GSDKInGameSystem, GSDKInnerRealTimeDetect)
+DEF_ID_0(GSDKPing, ping)
+DEF_ID_0(GSDKPing, stopPing)
+DEF_ID_0(GSDKPingDetect, ping)
+DEF_ID_0(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots)
+DEF_ID_0(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP)
+DEF_ID_0(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env)
+DEF_ID_0(GSDKInitManager, detectOperation)
+DEF_ID_0(GSDKPayEvent, GSDKPay_Tag_Status_Msg)
+DEF_ID_0(GSDKRealTimeDetect, pingDelayDetect)
+DEF_ID_0(GSDKRealTimeDetect, updDelayDetect_Port)
+DEF_ID_0(GSDKUdpDetect, isUDPConnect_Port)
+DEF_ID_0(GSDKWIFI, ping)
+DEF_ID_0(GSDKDetectPort, isConnection_Port)
+DEF_ID_0(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error)
+DEF_ID_0(GSDKPing, simplePing_didFailWithError)
+DEF_ID_0(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber)
+DEF_ID_0(GSDKPing, simplePing_didReceiveUnexpectedPacket)
+DEF_ID_0(GSDKPing, simplePing_didSendPacket_sequenceNumber)
+DEF_ID_0(GSDKPing, simplePing_didStartWithAddress)
+DEF_ID_0(GSDKPingDetect, simplePing_didFailToSendPacket_sequenceNumber_error)
+DEF_ID_0(GSDKPingDetect, simplePing_didFailWithError)
+DEF_ID_0(GSDKPingDetect, simplePing_didReceivePingResponsePacket_sequenceNumber)
+DEF_ID_0(GSDKPingDetect, simplePing_didReceiveUnexpectedPacket)
+DEF_ID_0(GSDKPingDetect, simplePing_didSendPacket_sequenceNumber)
+DEF_ID_0(GSDKPingDetect, simplePing_didStartWithAddress)
+DEF_ID_0(PingDelegate, pingTimer)
+DEF_ID_0(PingDelegate, simplePing_didFailToSendPacket_sequenceNumber_error)
+DEF_ID_0(PingDelegate, simplePing_didSendPacket_sequenceNumber)
+DEF_ID_0(SimplePing, start)
+DEF_ID_0(SimplePing, startWithHostAddress)
+DEF_ID_0(SimplePing, readData)
+DEF_ID_0(SimplePing, didFailWithError)
+DEF_ID_0(SimplePing, sendPingWithData)
+DEF_ID_0(SimplePing, validatePingResponsePacket_sequenceNumber)
+DEF_ID_0(SimplePing, pingPacketWithType_payload_requiresChecksum)
 
 // --- Voice ---
-D_ID(GVGCloudVoice, openMic)
-D_ID(GVGCloudVoice, openSpeaker)
-D_V_AAA(GVGCloudVoice, setAppInfo_withKey_andOpenID, a, b, c)  // macro مخصص أدناه
-D_ID(GVGCloudVoiceExtension, GetBGMPlayState)
-D_ID(GVGCloudVoiceExtension, GetMicState)
-D_ID(GVGCloudVoiceExtension, GetSpeakerState)
-D_ID(GVGCloudVoiceExtension, EnableKeyWordsDetect)
-D_ID(GVoiceMuteSwitch, detectMuteSwitch)
-D_ID(GCloudVoiceEngine, StartTve)
-D_ID(GCloudVoiceEngine, StopRecording)
-D_ID(GCloudVoiceEngine, TestMic)
-D_ID(GCloudVoiceEngine, StartBGMPlay)
-D_ID(GCloudVoiceEngine, StopBGMPlay)
-D_ID(GCloudVoiceEngine, PauseBGMPlay)
-D_ID(GCloudVoiceEngine, ResumeBGMPlay)
-D_ID(GCloudVoiceEngine, RSTSStopRecording)
-D_ID(GCloudVoiceEngine, TextToStreamSpeechStop)
-D_ID(GCloudVoiceEngine, StartPreview)
-D_ID(GCloudVoiceEngine, StopPreview)
-D_ID(GCloudVoiceEngine, PauseKaraoke)
-D_ID(GCloudVoiceEngine, ResumeKaraoke)
-D_ID(GCloudVoiceEngine, GetMicLevel)
-D_ID(GCloudVoiceEngine, GetSpeakerLevel)
-D_ID(GCloudVoiceEngine, GetBGMLevel)
-D_ID(GCloudVoiceEngine, GetBGMFileTime)
-D_ID(GCloudVoiceEngine, GetBGMPlayTime)
-D_ID(GCloudVoiceEngine, GetRecordKaraokeTotalTime)
-D_ID(GCloudVoiceEngine, StopKaraokeRecording)
-D_ID(GCloudVoiceEngine, GetFileParam_data_time)
-D_ID(GCloudCoreRemoteConfig, updateConfig)
-D_ID(GCloudCoreRemoteConfig, getConfig)
-D_ID(GCloudUnityPlugin, Initialize)
-D_ID(GCloudUnityPlugin, ReportEvent)
-D_ID(GCloudUnityPlugin, SetGameObjectName)
-D_V_AII(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout, a, b, c)
-D_V_AI(GCloudVoiceEngine, QuitRoom_Scenes_timeout, a, b)
-D_V_AB(GCloudVoiceEngine, EnableMultiRoom, a, b)
-D_V_AB(GCloudVoiceEngine, EnableRoomMicrophone_enable, a, b)
-D_V_AB(GCloudVoiceEngine, EnableRoomSpeaker_enable, a, b)
-D_V_AII(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout, a, b, c)
-D_V_A(GCloudVoiceEngine, StartRecording, a)
-D_V_A(GCloudVoiceEngine, SetBGMPath, a)
-D_V_A(GCloudVoiceEngine, SetLogCallBack, a)
-D_V_AI(GCloudVoiceEngine, SetMicVolume, a, b)
-D_V_AI(GCloudVoiceEngine, SetSpeakerVolume, a, b)
-D_V_AI(GCloudVoiceEngine, SetBitRate, a, b)
-D_V_AI(GCloudVoiceEngine, SetDataFree, a, b)
-D_V_AI(GCloudVoiceEngine, SetReportBufferTime, a, b)
-D_V_AI(GCloudVoiceEngine, SetBGMPlayTime, a, b)
-D_V_AI(GCloudVoiceEngine, SetKaraokeVoiceVol, a, b)
-D_V_AI(GCloudVoiceEngine, SetKaraokeAccVol, a, b)
-D_V_AI(GCloudVoiceEngine, SetKaraokeVoiceDelay, a, b)
-D_V_AI(GCloudVoiceEngine, SeekTimeMsForPreview, a, b)
-D_V_AI(GCloudVoiceEngine, SeekTimeMsForAcc, a, b)
-D_V_AB(GCloudVoiceEngine, EnableLog, a, b)
-D_V_AB(GCloudVoiceEngine, EnableNativeBGMPlay, a, b)
-D_V_AB(GCloudVoiceEngine, EnableRecvMagicVoice, a, b)
-D_V_AB(GCloudVoiceEngine, EnableReportALL, a, b)
-D_V_AB(GCloudVoiceEngine, EnableReportALLAbroad, a, b)
-D_V_AB(GCloudVoiceEngine, EnableReportForAbroad, a, b)
-D_V_AB(GCloudVoiceEngine, EnableCivilFile, a, b)
-D_V_AB(GCloudVoiceEngine, EnableCivilVoice, a, b)
-D_V_AB(GCloudVoiceEngine, EnableEarBack, a, b)
-D_V_AB(GCloudVoiceEngine, EnableAccFilePlay, a, b)
+DEF_ID_0(GVGCloudVoice, openMic)
+DEF_ID_0(GVGCloudVoice, openSpeaker)
+DEF_VOID_3(GVGCloudVoice, setAppInfo_withKey_andOpenID)
+DEF_ID_0(GVGCloudVoiceExtension, GetBGMPlayState)
+DEF_ID_0(GVGCloudVoiceExtension, GetMicState)
+DEF_ID_0(GVGCloudVoiceExtension, GetSpeakerState)
+DEF_ID_0(GVGCloudVoiceExtension, EnableKeyWordsDetect)
+DEF_ID_0(GVoiceMuteSwitch, detectMuteSwitch)
+DEF_ID_0(GCloudVoiceEngine, StartTve)
+DEF_ID_0(GCloudVoiceEngine, StopRecording)
+DEF_ID_0(GCloudVoiceEngine, TestMic)
+DEF_ID_0(GCloudVoiceEngine, StartBGMPlay)
+DEF_ID_0(GCloudVoiceEngine, StopBGMPlay)
+DEF_ID_0(GCloudVoiceEngine, PauseBGMPlay)
+DEF_ID_0(GCloudVoiceEngine, ResumeBGMPlay)
+DEF_ID_0(GCloudVoiceEngine, RSTSStopRecording)
+DEF_ID_0(GCloudVoiceEngine, TextToStreamSpeechStop)
+DEF_ID_0(GCloudVoiceEngine, StartPreview)
+DEF_ID_0(GCloudVoiceEngine, StopPreview)
+DEF_ID_0(GCloudVoiceEngine, PauseKaraoke)
+DEF_ID_0(GCloudVoiceEngine, ResumeKaraoke)
+DEF_ID_0(GCloudVoiceEngine, GetMicLevel)
+DEF_ID_0(GCloudVoiceEngine, GetSpeakerLevel)
+DEF_ID_0(GCloudVoiceEngine, GetBGMLevel)
+DEF_ID_0(GCloudVoiceEngine, GetBGMFileTime)
+DEF_ID_0(GCloudVoiceEngine, GetBGMPlayTime)
+DEF_ID_0(GCloudVoiceEngine, GetRecordKaraokeTotalTime)
+DEF_ID_0(GCloudVoiceEngine, StopKaraokeRecording)
+DEF_ID_0(GCloudVoiceEngine, GetFileParam_data_time)
+DEF_ID_0(GCloudCoreRemoteConfig, updateConfig)
+DEF_ID_0(GCloudCoreRemoteConfig, getConfig)
+DEF_ID_0(GCloudUnityPlugin, Initialize)
+DEF_ID_0(GCloudUnityPlugin, ReportEvent)
+DEF_ID_0(GCloudUnityPlugin, SetGameObjectName)
+DEF_VOID_3I(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout)
+DEF_VOID_2I(GCloudVoiceEngine, QuitRoom_Scenes_timeout)
+DEF_VOID_2B(GCloudVoiceEngine, EnableMultiRoom)
+DEF_VOID_2B(GCloudVoiceEngine, EnableRoomMicrophone_enable)
+DEF_VOID_2B(GCloudVoiceEngine, EnableRoomSpeaker_enable)
+DEF_VOID_3I(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout)
+DEF_VOID_1(GCloudVoiceEngine, StartRecording)
+DEF_VOID_1(GCloudVoiceEngine, SetBGMPath)
+DEF_VOID_1(GCloudVoiceEngine, SetLogCallBack)
+DEF_VOID_2I(GCloudVoiceEngine, SetMicVolume)
+DEF_VOID_2I(GCloudVoiceEngine, SetSpeakerVolume)
+DEF_VOID_2I(GCloudVoiceEngine, SetBitRate)
+DEF_VOID_2I(GCloudVoiceEngine, SetDataFree)
+DEF_VOID_2I(GCloudVoiceEngine, SetReportBufferTime)
+DEF_VOID_2I(GCloudVoiceEngine, SetBGMPlayTime)
+DEF_VOID_2I(GCloudVoiceEngine, SetKaraokeVoiceVol)
+DEF_VOID_2I(GCloudVoiceEngine, SetKaraokeAccVol)
+DEF_VOID_2I(GCloudVoiceEngine, SetKaraokeVoiceDelay)
+DEF_VOID_2I(GCloudVoiceEngine, SeekTimeMsForPreview)
+DEF_VOID_2I(GCloudVoiceEngine, SeekTimeMsForAcc)
+DEF_VOID_2B(GCloudVoiceEngine, EnableLog)
+DEF_VOID_2B(GCloudVoiceEngine, EnableNativeBGMPlay)
+DEF_VOID_2B(GCloudVoiceEngine, EnableRecvMagicVoice)
+DEF_VOID_2B(GCloudVoiceEngine, EnableReportALL)
+DEF_VOID_2B(GCloudVoiceEngine, EnableReportALLAbroad)
+DEF_VOID_2B(GCloudVoiceEngine, EnableReportForAbroad)
+DEF_VOID_2B(GCloudVoiceEngine, EnableCivilFile)
+DEF_VOID_2B(GCloudVoiceEngine, EnableCivilVoice)
+DEF_VOID_2B(GCloudVoiceEngine, EnableEarBack)
+DEF_VOID_2B(GCloudVoiceEngine, EnableAccFilePlay)
 
-// --- Firebase / Ads SDK ---
-D_ID(FIRMessagingRmqManager, openDatabase)
-D_ID(FIRMessaging, retrieveFCMTokenForSenderID_completion)
-D_ID(FIRMessaging, deleteFCMTokenForSenderID_completion)
-D_ID(FIRMessaging, subscribeToTopic_completion)
-D_ID(FIRMessaging, unsubscribeFromTopic_completion)
-D_ID(FIRMessaging, setAPNSToken_withUserInfo)
-D_ID(FIRMessaging, APNSToken)
-D_ID(FBAdViewabilityValidator, checkViewability)
-D_ID(FBAdMonitor, startMonitoringAd)
-D_ID(FBAdViewabilityValidator, stopMonitoring)
-D_ID(FBAdMonitor, stopMonitoring)
-D_ID(FBAdEvent, logEvent_withParameters)
-D_ID(FBAdLogger, logMessage_withLevel)
+// --- Firebase / Ads ---
+DEF_ID_0(FIRMessagingRmqManager, openDatabase)
+DEF_ID_0(FIRMessaging, retrieveFCMTokenForSenderID_completion)
+DEF_ID_0(FIRMessaging, deleteFCMTokenForSenderID_completion)
+DEF_ID_0(FIRMessaging, subscribeToTopic_completion)
+DEF_ID_0(FIRMessaging, unsubscribeFromTopic_completion)
+DEF_ID_0(FIRMessaging, setAPNSToken_withUserInfo)
+DEF_ID_0(FIRMessaging, APNSToken)
+DEF_ID_0(FBAdViewabilityValidator, checkViewability)
+DEF_ID_0(FBAdMonitor, startMonitoringAd)
+DEF_ID_0(FBAdViewabilityValidator, stopMonitoring)
+DEF_ID_0(FBAdMonitor, stopMonitoring)
+DEF_ID_0(FBAdEvent, logEvent_withParameters)
+DEF_ID_0(FBAdLogger, logMessage_withLevel)
 
-// --- QQ SDK ---
-D_ID(QQApiInterface, sendReq_resultBlock)
-D_ID(QQApiInterface, sendThirdAppBindGroupReq_resultBlock)
-D_ID(QQApiInterface, sendThirdAppUnBindGroupReq_resultBlock)
-D_ID(QQApiInterface, sendThirdAppJoinGroupReq_resultBlock)
-D_ID(QQApiInterface, sendQueryQQGroupProInfo_resultBlock)
-D_ID(QQApiInterface, sendMessageToQQAuthWithReq)
-D_ID(QQApiInterface, sendMessageToQQAvatarWithReq)
-D_ID(QQApiInterface, sendMessageToFaceCollectionWithReq)
-D_ID(QQOpenApiUtility, cgiRequestGetSdkConfig)
-D_ID(TDataMasterApplication, handleOpenURL)
-D_ID(TDataMasterApplication, reportEventWithSrcID_eventName_AndEventKVArray)
-D_ID(TcApiTool, openUniversallinkIfNeed)
-D_ID(GTMSessionFetcher, setSystemCompletionHandler_forSessionIdentifier)
+// --- QQ ---
+DEF_ID_0(QQApiInterface, sendReq_resultBlock)
+DEF_ID_0(QQApiInterface, sendThirdAppBindGroupReq_resultBlock)
+DEF_ID_0(QQApiInterface, sendThirdAppUnBindGroupReq_resultBlock)
+DEF_ID_0(QQApiInterface, sendThirdAppJoinGroupReq_resultBlock)
+DEF_ID_0(QQApiInterface, sendQueryQQGroupProInfo_resultBlock)
+DEF_ID_0(QQApiInterface, sendMessageToQQAuthWithReq)
+DEF_ID_0(QQApiInterface, sendMessageToQQAvatarWithReq)
+DEF_ID_0(QQApiInterface, sendMessageToFaceCollectionWithReq)
+DEF_ID_0(QQOpenApiUtility, cgiRequestGetSdkConfig)
+DEF_ID_0(TDataMasterApplication, handleOpenURL)
+DEF_ID_0(TDataMasterApplication, reportEventWithSrcID_eventName_AndEventKVArray)
+DEF_ID_0(TcApiTool, openUniversallinkIfNeed)
+DEF_ID_0(GTMSessionFetcher, setSystemCompletionHandler_forSessionIdentifier)
 
 // --- IMSDK ---
-D_ID(IMSDKNoticeIMSDKManager, getImageCache_imagePath_imageHash_queue_completeHandle)
-D_ID(IMSDKNoticeIMSDKManager, imsdkCoreKitNoticeImageFileHash)
-D_ID(IMSDKStatAdjustManager, reportEvent_eventBody_isRealtime)
-D_ID(IMSDKStatAdjustManager, reportEvent_params_isRealtime)
-D_ID(IMSDKStatAdjustManager, reportPurchase_currentCode_expense_isRealTime)
-D_ID(IMSDKStatAdjustManager, reportRevenue_currencyCode_revenueValue_params_extraJson)
-D_ID(INTLWebViewManager, openURL_observerID_baseParams)
+DEF_ID_0(IMSDKNoticeIMSDKManager, getImageCache_imagePath_imageHash_queue_completeHandle)
+DEF_ID_0(IMSDKNoticeIMSDKManager, imsdkCoreKitNoticeImageFileHash)
+DEF_ID_0(IMSDKStatAdjustManager, reportEvent_eventBody_isRealtime)
+DEF_ID_0(IMSDKStatAdjustManager, reportEvent_params_isRealtime)
+DEF_ID_0(IMSDKStatAdjustManager, reportPurchase_currentCode_expense_isRealTime)
+DEF_ID_0(IMSDKStatAdjustManager, reportRevenue_currencyCode_revenueValue_params_extraJson)
+DEF_ID_0(INTLWebViewManager, openURL_observerID_baseParams)
 
 // --- APM ---
-D_ID(APMMonitor, handleEvent)
-D_ID(APMMonitor, startMonitoring)
-D_ID(APMDeviceInfoSupport, getBatteryState)
-D_ID(APMDeviceInfoSupport, getThermalState)
-D_ID(APMCollector, collectMetrics)
-D_ID(APMCollector, reportNow)
-D_ID(TApmSceneMarker, markLoadLevel)
-D_ID(TApmSceneMarker, markLevelFin)
-D_ID(TApmSceneMarker, postStepEvent)
-D_ID(TApmSceneMarker, postStreamEvent)
+DEF_ID_0(APMMonitor, handleEvent)
+DEF_ID_0(APMMonitor, startMonitoring)
+DEF_ID_0(APMDeviceInfoSupport, getBatteryState)
+DEF_ID_0(APMDeviceInfoSupport, getThermalState)
+DEF_ID_0(APMCollector, collectMetrics)
+DEF_ID_0(APMCollector, reportNow)
+DEF_ID_0(TApmSceneMarker, markLoadLevel)
+DEF_ID_0(TApmSceneMarker, markLevelFin)
+DEF_ID_0(TApmSceneMarker, postStepEvent)
+DEF_ID_0(TApmSceneMarker, postStreamEvent)
 
 // --- Misc ---
-D_ID(serviceCommunication, getValueForKeypath)
-D_ID(AudioDeviceMgr, GetAudioDeviceConnectState)
-D_ID(AudioDeviceMgr, UpdateDeviceState)
-D_ID(TikTokAuth, authorizeWithPermissions)
-D_ID(TikTokAuth, handleOpenURL)
-D_ID(VKAuth, authorizeWithPermissions)
-D_ID(VKAuth, logout)
-D_ID(SCSDKLoginClient, loginWithCompletion)
-D_ID(SCSDKLoginClient, logout)
+DEF_ID_0(serviceCommunication, getValueForKeypath)
+DEF_ID_0(AudioDeviceMgr, GetAudioDeviceConnectState)
+DEF_ID_0(AudioDeviceMgr, UpdateDeviceState)
+DEF_ID_0(TikTokAuth, authorizeWithPermissions)
+DEF_ID_0(TikTokAuth, handleOpenURL)
+DEF_ID_0(VKAuth, authorizeWithPermissions)
+DEF_ID_0(VKAuth, logout)
+DEF_ID_0(SCSDKLoginClient, loginWithCompletion)
+DEF_ID_0(SCSDKLoginClient, logout)
 
 // --- Advertising ---
-static NSString *SBXK_ASIdentifierManager_advertisingIdentifier(id s, SEL _cmd) {
-    (void)s; (void)_cmd; return @"00000000-0000-0000-0000-000000000000";
+static NSString *SBXK_ASIdentifierManager_advertisingIdentifier(id _s, SEL _c) {
+    (void)_s; (void)_c; return @"00000000-0000-0000-0000-000000000000";
 }
-static NSInteger SBXK_ATTrackingManager_trackingAuthorizationStatus(id s, SEL _cmd) {
-    (void)s; (void)_cmd; return 3;  // ATTrackingManagerAuthorizationStatusAuthorized
+static NSInteger SBXK_ATTrackingManager_trackingAuthorizationStatus(id _s, SEL _c) {
+    (void)_s; (void)_c; return 3;
 }
 
 #pragma mark =========================================================
-#pragma mark 4. HOOK TABLE — selectors بالنقطتين الحقيقية
+#pragma mark 4. HOOK TABLE — قبل المُثبِّت
 #pragma mark =========================================================
 
 static const sbxk_hook_t g_hooks[] = {
-    // ------- Detection -------
+    // Detection
     {"IntegrityChecker", "integrity_detect", (IMP)SBXK_IntegrityChecker_integrity_detect, "B"},
     {"IntegrityChecker", "MTML_INTEGRITY_DETECT", (IMP)SBXK_IntegrityChecker_MTML_INTEGRITY_DETECT, "B"},
     {"JailbreakDetector", "isJailbroken", (IMP)SBXK_JailbreakDetector_isJailbroken, "B"},
@@ -363,7 +349,7 @@ static const sbxk_hook_t g_hooks[] = {
     {"AReachability", "isConnectionRequired", (IMP)SBXK_AReachability_isConnectionRequired, "B"},
     {"GVGCloudVoiceExtension", "CheckDeviceMuteStat", (IMP)SBXK_GVGCloudVoiceExtension_CheckDeviceMuteStat, "B"},
 
-    // ------- GAD -------
+    // GAD — void callbacks
     {"GADAppOpenAd", "adDidDismissFullScreenContent:", (IMP)SBXK_GADAppOpenAd_adDidDismissFullScreenContent, "v"},
     {"GADAppOpenAd", "adWillDismissFullScreenContent:", (IMP)SBXK_GADAppOpenAd_adWillDismissFullScreenContent, "v"},
     {"GADAppOpenAd", "adDidRecordClick:", (IMP)SBXK_GADAppOpenAd_adDidRecordClick, "v"},
@@ -375,13 +361,13 @@ static const sbxk_hook_t g_hooks[] = {
     {"GADMobileAds", "initializationStatus", (IMP)SBXK_GADMobileAds_initializationStatus, "@"},
     {"GADAdNetworkResponseInfo", "adUnitMapping", (IMP)SBXK_GADAdNetworkResponseInfo_adUnitMapping, "@"},
 
-    // ------- Game -------
+    // Game
     {"WeaponProcessor", "CalculateDamage:distance:", (IMP)SBXK_WeaponProcessor_CalculateDamage, "@"},
     {"CharacterMovement", "IsSpeedExceeded", (IMP)SBXK_CharacterMovement_IsSpeedExceeded, "B"},
     {"BulletSimulator", "CheckWallCollision", (IMP)SBXK_BulletSimulator_CheckWallCollision, "@"},
     {"NetworkManager", "SendSecurityReport:", (IMP)SBXK_NetworkManager_SendSecurityReport, "v"},
 
-    // ------- GSDK -------
+    // GSDK
     {"GSDKCPU", "getSystemCPUCircle", (IMP)SBXK_GSDKCPU_getSystemCPUCircle, "@"},
     {"GSDKMemory", "getSystemAvailableMemory", (IMP)SBXK_GSDKMemory_getSystemAvailableMemory, "@"},
     {"GSDKInGameManager", "GSDKRealTimeDetect", (IMP)SBXK_GSDKInGameManager_GSDKRealTimeDetect, "@"},
@@ -423,7 +409,7 @@ static const sbxk_hook_t g_hooks[] = {
     {"SimplePing", "validatePingResponsePacket:sequenceNumber:", (IMP)SBXK_SimplePing_validatePingResponsePacket_sequenceNumber, "@"},
     {"SimplePing", "pingPacketWithType:payload:requiresChecksum:", (IMP)SBXK_SimplePing_pingPacketWithType_payload_requiresChecksum, "@"},
 
-    // ------- Voice -------
+    // Voice
     {"GVGCloudVoice", "openMic", (IMP)SBXK_GVGCloudVoice_openMic, "@"},
     {"GVGCloudVoice", "openSpeaker", (IMP)SBXK_GVGCloudVoice_openSpeaker, "@"},
     {"GVGCloudVoice", "setAppInfo:withKey:andOpenID:", (IMP)SBXK_GVGCloudVoice_setAppInfo_withKey_andOpenID, "v"},
@@ -489,7 +475,7 @@ static const sbxk_hook_t g_hooks[] = {
     {"GCloudUnityPlugin", "ReportEvent", (IMP)SBXK_GCloudUnityPlugin_ReportEvent, "@"},
     {"GCloudUnityPlugin", "SetGameObjectName:", (IMP)SBXK_GCloudUnityPlugin_SetGameObjectName, "@"},
 
-    // ------- Firebase / Ads SDK -------
+    // Firebase / Ads
     {"FIRMessagingRmqManager", "openDatabase", (IMP)SBXK_FIRMessagingRmqManager_openDatabase, "@"},
     {"FIRMessaging", "retrieveFCMTokenForSenderID:completion:", (IMP)SBXK_FIRMessaging_retrieveFCMTokenForSenderID_completion, "@"},
     {"FIRMessaging", "deleteFCMTokenForSenderID:completion:", (IMP)SBXK_FIRMessaging_deleteFCMTokenForSenderID_completion, "@"},
@@ -504,7 +490,7 @@ static const sbxk_hook_t g_hooks[] = {
     {"FBAdEvent", "logEvent:withParameters:", (IMP)SBXK_FBAdEvent_logEvent_withParameters, "@"},
     {"FBAdLogger", "logMessage:withLevel:", (IMP)SBXK_FBAdLogger_logMessage_withLevel, "@"},
 
-    // ------- QQ -------
+    // QQ
     {"QQApiInterface", "sendReq:resultBlock:", (IMP)SBXK_QQApiInterface_sendReq_resultBlock, "@"},
     {"QQApiInterface", "sendThirdAppBindGroupReq:resultBlock:", (IMP)SBXK_QQApiInterface_sendThirdAppBindGroupReq_resultBlock, "@"},
     {"QQApiInterface", "sendThirdAppUnBindGroupReq:resultBlock:", (IMP)SBXK_QQApiInterface_sendThirdAppUnBindGroupReq_resultBlock, "@"},
@@ -519,7 +505,7 @@ static const sbxk_hook_t g_hooks[] = {
     {"TcApiTool", "openUniversallinkIfNeed:", (IMP)SBXK_TcApiTool_openUniversallinkIfNeed, "@"},
     {"GTMSessionFetcher", "setSystemCompletionHandler:forSessionIdentifier:", (IMP)SBXK_GTMSessionFetcher_setSystemCompletionHandler_forSessionIdentifier, "@"},
 
-    // ------- IMSDK -------
+    // IMSDK
     {"IMSDKNoticeIMSDKManager", "getImageCache:imagePath:imageHash:queue:completeHandle:", (IMP)SBXK_IMSDKNoticeIMSDKManager_getImageCache_imagePath_imageHash_queue_completeHandle, "@"},
     {"IMSDKNoticeIMSDKManager", "imsdkCoreKitNoticeImageFileHash:", (IMP)SBXK_IMSDKNoticeIMSDKManager_imsdkCoreKitNoticeImageFileHash, "@"},
     {"IMSDKStatAdjustManager", "reportEvent:eventBody:isRealtime:", (IMP)SBXK_IMSDKStatAdjustManager_reportEvent_eventBody_isRealtime, "@"},
@@ -528,7 +514,7 @@ static const sbxk_hook_t g_hooks[] = {
     {"IMSDKStatAdjustManager", "reportRevenue:currencyCode:revenueValue:params:extraJson:", (IMP)SBXK_IMSDKStatAdjustManager_reportRevenue_currencyCode_revenueValue_params_extraJson, "@"},
     {"INTLWebViewManager", "openURL:observerID:baseParams:", (IMP)SBXK_INTLWebViewManager_openURL_observerID_baseParams, "@"},
 
-    // ------- APM -------
+    // APM
     {"APMMonitor", "handleEvent:", (IMP)SBXK_APMMonitor_handleEvent, "@"},
     {"APMMonitor", "startMonitoring:", (IMP)SBXK_APMMonitor_startMonitoring, "@"},
     {"APMDeviceInfoSupport", "getBatteryState", (IMP)SBXK_APMDeviceInfoSupport_getBatteryState, "@"},
@@ -540,7 +526,7 @@ static const sbxk_hook_t g_hooks[] = {
     {"TApmSceneMarker", "postStepEvent:", (IMP)SBXK_TApmSceneMarker_postStepEvent, "@"},
     {"TApmSceneMarker", "postStreamEvent:", (IMP)SBXK_TApmSceneMarker_postStreamEvent, "@"},
 
-    // ------- Misc -------
+    // Misc
     {"serviceCommunication", "getValueForKeypath", (IMP)SBXK_serviceCommunication_getValueForKeypath, "@"},
     {"AudioDeviceMgr", "GetAudioDeviceConnectState", (IMP)SBXK_AudioDeviceMgr_GetAudioDeviceConnectState, "@"},
     {"AudioDeviceMgr", "UpdateDeviceState:", (IMP)SBXK_AudioDeviceMgr_UpdateDeviceState, "@"},
@@ -551,16 +537,16 @@ static const sbxk_hook_t g_hooks[] = {
     {"SCSDKLoginClient", "loginWithCompletion:", (IMP)SBXK_SCSDKLoginClient_loginWithCompletion, "@"},
     {"SCSDKLoginClient", "logout", (IMP)SBXK_SCSDKLoginClient_logout, "@"},
 
-    // ------- Advertising -------
+    // Advertising
     {"ASIdentifierManager", "advertisingIdentifier", (IMP)SBXK_ASIdentifierManager_advertisingIdentifier, "@"},
     {"ATTrackingManager", "trackingAuthorizationStatus", (IMP)SBXK_ATTrackingManager_trackingAuthorizationStatus, "q"},
 };
 
 #pragma mark =========================================================
-#pragma mark 5. INSTALL DRIVER — type-checked, class + instance methods
+#pragma mark 5. INSTALL DRIVER
 #pragma mark =========================================================
 
-static const char *SBXK_FullReturnType(Class c, SEL s, BOOL *isClassMethod) {
+static const char *SBXK_ReturnTypeForMethod(Class c, SEL s, BOOL *isClassMethod) {
     Method m = class_getInstanceMethod(c, s);
     if (m) { if (isClassMethod) *isClassMethod = NO; }
     else {
@@ -568,69 +554,44 @@ static const char *SBXK_FullReturnType(Class c, SEL s, BOOL *isClassMethod) {
         if (m) { if (isClassMethod) *isClassMethod = YES; }
         else return NULL;
     }
-    // Use NSMethodSignature to get full return type
-    NSMethodSignature *sig = nil;
-    if (!*isClassMethod) sig = [c instanceMethodSignatureForSelector:s];
-    else {
-        Class meta = object_getClass(c);
-        sig = [meta instanceMethodSignatureForSelector:s];
-    }
-    if (!sig) {
-        // Fallback: first char
-        return method_getTypeEncoding(m);
-    }
-    return [sig methodReturnType];
+    Class sigHolder = *isClassMethod ? object_getClass(c) : c;
+    NSMethodSignature *sig = [sigHolder instanceMethodSignatureForSelector:s];
+    if (sig) return [sig methodReturnType];
+    return method_getTypeEncoding(m);
 }
 
 static void SBXK_InstallOneHook(const sbxk_hook_t *h) {
     Class c = objc_getClass(h->cls);
     if (!c) {
-        if (g_pendingClasses) {
-            // main-queue-only access
-            [g_pendingClasses addObject:[NSString stringWithUTF8String:h->cls]];
-        }
+        if (g_pendingClasses) [g_pendingClasses addObject:[NSString stringWithUTF8String:h->cls]];
         return;
     }
     SEL s = sel_registerName(h->sel);
-
     BOOL isClassMethod = NO;
-    const char *ret = SBXK_FullReturnType(c, s, &isClassMethod);
-    if (!ret) {
-        SBXK_LOG(@"skip -[%s %s] (method not found)", h->cls, h->sel);
-        return;
-    }
-
+    const char *ret = SBXK_ReturnTypeForMethod(c, s, &isClassMethod);
+    if (!ret) { SBXK_LOG(@"skip %s -%s (no method)", h->cls, h->sel); return; }
     if (strcmp(ret, h->expectedRet) != 0) {
-        SBXK_LOG(@"skip -[%s %s] (ret='%s', want='%s')",
-                 h->cls, h->sel, ret, h->expectedRet);
+        SBXK_LOG(@"skip %s -%s (ret='%s' want='%s')", h->cls, h->sel, ret, h->expectedRet);
         return;
     }
-
     Method m = isClassMethod ? class_getClassMethod(c, s) : class_getInstanceMethod(c, s);
-    if (!m) { SBXK_LOG(@"skip -[%s %s] (race)", h->cls, h->sel); return; }
-
+    if (!m) return;
     Class target = isClassMethod ? object_getClass(c) : c;
-    if (!class_replaceMethod(target, s, h->imp, method_getTypeEncoding(m))) {
-        SBXK_LOG(@"skip -[%s %s] (replace failed)", h->cls, h->sel);
-    }
+    class_replaceMethod(target, s, h->imp, method_getTypeEncoding(m));
 }
 
 static void SBXK_InstallAllSwizzles(void) {
-    // يجب أن يُستدعى على main queue
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ SBXK_InstallAllSwizzles(); });
         return;
     }
     size_t n = sizeof(g_hooks) / sizeof(g_hooks[0]);
-    size_t ok = 0, skipped = 0;
+    size_t missing = 0;
     for (size_t i = 0; i < n; i++) {
-        Class c = objc_getClass(g_hooks[i].cls);
-        if (!c) { skipped++; continue; }
+        if (!objc_getClass(g_hooks[i].cls)) { missing++; continue; }
         SBXK_InstallOneHook(&g_hooks[i]);
-        ok++;
     }
-    SBXK_LOG(@"install pass: %zu installed attempts, %zu classes missing, total=%zu",
-             ok, skipped, n);
+    SBXK_LOG(@"install pass: total=%zu missing_classes=%zu", n, missing);
 }
 
 #pragma mark =========================================================
@@ -652,8 +613,10 @@ static BOOL SBXK_NSFileManager_fileExistsAtPath_(id self, SEL _cmd, NSString *pa
         if ([path isEqualToString:p] || [path hasPrefix:p]) return NO;
     IMP orig = class_getMethodImplementation([NSFileManager class],
                                               @selector(SBXK_orig_fileExistsAtPath:));
-    if (orig) { BOOL (*fn)(id, SEL, NSString *) = (void *)orig;
-        return fn(self, @selector(SBXK_orig_fileExistsAtPath:), path); }
+    if (orig) {
+        BOOL (*fn)(id, SEL, NSString *) = (void *)orig;
+        return fn(self, @selector(SBXK_orig_fileExistsAtPath:), path);
+    }
     return NO;
 }
 static BOOL SBXK_NSFileManager_fileExistsAtPath_isDirectory_(id self, SEL _cmd, NSString *path, BOOL *isDir) {
@@ -661,8 +624,10 @@ static BOOL SBXK_NSFileManager_fileExistsAtPath_isDirectory_(id self, SEL _cmd, 
         if ([path isEqualToString:p] || [path hasPrefix:p]) { if (isDir) *isDir = NO; return NO; }
     IMP orig = class_getMethodImplementation([NSFileManager class],
                                               @selector(SBXK_orig_fileExistsAtPath:isDirectory:));
-    if (orig) { BOOL (*fn)(id, SEL, NSString *, BOOL *) = (void *)orig;
-        return fn(self, @selector(SBXK_orig_fileExistsAtPath:isDirectory:), path, isDir); }
+    if (orig) {
+        BOOL (*fn)(id, SEL, NSString *, BOOL *) = (void *)orig;
+        return fn(self, @selector(SBXK_orig_fileExistsAtPath:isDirectory:), path, isDir);
+    }
     return NO;
 }
 
@@ -683,7 +648,7 @@ static void SBXK_InstallFileManagerSwizzle(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 7. BANNER — عبر Notification (لا swizzle على didFinishLaunching)
+#pragma mark 7. BANNER — Notification-based
 #pragma mark =========================================================
 
 @interface SBXK_Banner : NSObject
@@ -692,7 +657,6 @@ static void SBXK_InstallFileManagerSwizzle(void) {
 @implementation SBXK_Banner
 
 + (void)installObserver {
-    // يُستدعى من constructor قبل main() — قبل أن يُطلق didFinishLaunching
     [[NSNotificationCenter defaultCenter]
         addObserver:self
            selector:@selector(onFinishLaunching:)
@@ -725,7 +689,7 @@ static void SBXK_InstallFileManagerSwizzle(void) {
 #pragma clang diagnostic pop
     }
     if (!w || !w.rootViewController) return;
-    if (w.rootViewController.presentedViewController) return;   // لا تعطّل present آخر
+    if (w.rootViewController.presentedViewController) return;
 
     UIAlertController *a = [UIAlertController
         alertControllerWithTitle:@"AMAR VIP 2026"
@@ -739,7 +703,7 @@ static void SBXK_InstallFileManagerSwizzle(void) {
 @end
 
 #pragma mark =========================================================
-#pragma mark 8. FILE CLEANUP (مع فحص الوجود)
+#pragma mark 8. FILE CLEANUP
 #pragma mark =========================================================
 
 static void SBXK_DeleteSensitiveFiles(void) {
@@ -766,7 +730,7 @@ static void SBXK_StartCleanupTimer(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 9. DYLD CALLBACK — os_unfair_lock
+#pragma mark 9. DYLD CALLBACK
 #pragma mark =========================================================
 
 static void sbxk_image_added_cb(const struct mach_header *mh, intptr_t slide) {
@@ -788,27 +752,20 @@ static void sbxk_image_added_cb(const struct mach_header *mh, intptr_t slide) {
 #pragma mark =========================================================
 
 static void SBXK_RunInstalls(void) {
-    SBXK_LOG(@"v6.1 install pass — start");
+    SBXK_LOG(@"v6.1.1 install pass — start");
     SBXK_InstallAllSwizzles();
     SBXK_InstallFileManagerSwizzle();
     SBXK_StartCleanupTimer();
-    SBXK_LOG(@"v6.1 install pass — done");
+    SBXK_LOG(@"v6.1.1 install pass — done");
 }
 
 __attribute__((constructor))
 static void SBXK_Bootstrap(void) {
     @autoreleasepool {
-        SBXK_LOG(@"v6.1 boot");
-
+        SBXK_LOG(@"v6.1.1 boot");
         g_pendingClasses = [NSMutableSet set];
-
-        // Observer للـ Banner يُثبّت الآن — قبل didFinishLaunching
         [SBXK_Banner installObserver];
-
-        // Retry queue عبر dyld
         _dyld_register_func_for_add_image(sbxk_image_added_cb);
-
-        // Hooks تُثبَّت بعد استقرار التطبيق
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool { SBXK_RunInstalls(); }
