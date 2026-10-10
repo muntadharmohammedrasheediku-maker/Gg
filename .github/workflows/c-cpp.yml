@@ -18,9 +18,7 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
       - name: List repo
-        run: |
-          echo "=== Repo root ==="
-          ls -la
+        run: ls -la
 
       - name: Download OpenSSL xcframework
         run: |
@@ -31,70 +29,21 @@ jobs:
             https://github.com/krzyzanowskim/OpenSSL/releases/download/3.3.2000/OpenSSL.xcframework.zip
           unzip -q openssl.zip
           rm -f openssl.zip
-          echo "=== Structure (depth 3) ==="
-          find OpenSSL.xcframework -maxdepth 3 -type d
 
-      - name: Auto-detect + prepare OpenSSL paths
+      - name: Prepare OpenSSL paths
         run: |
           set -Eeuo pipefail
           ROOT="$PWD/deps/OpenSSL.xcframework"
-
           IOS_FW=$(find "$ROOT" -maxdepth 3 -type d -name 'OpenSSL.framework' -path '*ios-arm64*' ! -path '*simulator*' | head -1)
-
-          if [ -z "$IOS_FW" ]; then
-            echo "=== no ios-arm64 framework, listing all ==="
-            find "$ROOT" -maxdepth 2 -type d
-            exit 1
-          fi
-          echo "Found: $IOS_FW"
-
+          [ -n "$IOS_FW" ] || { echo "no ios-arm64 framework"; find "$ROOT" -maxdepth 2 -type d; exit 1; }
           HEADERS_DIR="$IOS_FW/Headers"
           BINARY="$IOS_FW/OpenSSL"
-
-          if [ ! -d "$HEADERS_DIR" ]; then
-            echo "FATAL: no Headers dir"
-            ls -la "$IOS_FW"
-            exit 1
-          fi
-          if [ ! -f "$BINARY" ]; then
-            echo "FATAL: no binary"
-            ls -la "$IOS_FW"
-            exit 1
-          fi
-
-          if [ ! -f "$HEADERS_DIR/evp.h" ]; then
-            echo "FATAL: evp.h not found at $HEADERS_DIR"
-            ls "$HEADERS_DIR" | head
-            exit 1
-          fi
-          echo "evp.h found — framework style confirmed"
-
-          if [ ! -e "$HEADERS_DIR/openssl" ]; then
-            ln -s . "$HEADERS_DIR/openssl"
-            echo "Created symlink: openssl -> ."
-          fi
-
-          test -f "$HEADERS_DIR/openssl/evp.h" || { echo "symlink broken"; exit 1; }
-          echo "OK: $HEADERS_DIR/openssl/evp.h"
-
+          [ -f "$HEADERS_DIR/evp.h" ] || { echo "no evp.h"; exit 1; }
+          [ ! -e "$HEADERS_DIR/openssl" ] && ln -s . "$HEADERS_DIR/openssl"
           echo "OSSL_INC=$HEADERS_DIR" >> $GITHUB_ENV
           echo "OSSL_FW=$IOS_FW" >> $GITHUB_ENV
           echo "OSSL_BIN=$BINARY" >> $GITHUB_ENV
-
-          echo "=== Final paths ==="
-          echo "INC: $HEADERS_DIR"
-          echo "FW:  $IOS_FW"
-          echo "BIN: $BINARY"
           ls -la "$HEADERS_DIR/openssl/" | head -5
-          file "$BINARY"
-
-      - name: Verify required headers
-        run: |
-          set -Eeuo pipefail
-          for h in evp.h kdf.h core_names.h param_build.h rand.h crypto.h; do
-            test -f "$OSSL_INC/openssl/$h" || { echo "missing: $h"; exit 1; }
-          done
-          echo "All required headers present"
 
       - name: Compile defcrypto.o
         run: |
@@ -121,7 +70,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -x objective-c++ -std=c++20 -arch arm64 -isysroot "$SDK" \
+          clang -x objective-c -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
             -Wno-nullability-completeness \
             -Wno-deprecated-declarations \
@@ -134,7 +83,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -x objective-c++ -std=c++20 -arch arm64 -isysroot "$SDK" \
+          clang -x objective-c -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
             -Wno-nullability-completeness \
             -Wno-deprecated-declarations \
@@ -147,42 +96,27 @@ jobs:
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-
           clang++ -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -dynamiclib -O2 \
             -o ShadowXK.dylib \
-            defcrypto.o \
-            defcrypto_bridge.o \
-            ShadowBypassXK.o \
-            ShadowMonitorXK.o \
+            defcrypto.o defcrypto_bridge.o \
+            ShadowBypassXK.o ShadowMonitorXK.o \
             "$OSSL_BIN" \
-            -framework Foundation \
-            -framework UIKit \
-            -framework Security \
-            -framework AdSupport \
-            -lz
-
+            -framework Foundation -framework UIKit -framework Security \
+            -framework AdSupport -lz
           file ShadowXK.dylib
 
       - name: Verify
         run: |
           set -Eeuo pipefail
-          echo "=== File info ==="
           file ShadowXK.dylib
-          echo ""
-          echo "=== Linked libraries ==="
           otool -L ShadowXK.dylib
-          echo ""
-          echo "=== Bridge exports ==="
-          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || echo "(no exports — check visibility)"
-          echo ""
-          echo "=== Size ==="
+          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || true
           ls -lh ShadowXK.dylib
 
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: ShadowXK-unified
           path: ShadowXK.dylib
           if-no-files-found: error
-          retention-days: 30
