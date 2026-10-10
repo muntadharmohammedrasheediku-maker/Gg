@@ -1,20 +1,21 @@
-// ShadowBypassXK.m
-// iOS arm64 / arm64e — deployment target 13.0+
-// Inject via sideloaded dylib (TrollStore, Sideloadly + Theos, AltStore + LC_LOAD_DYLIB patch,
-// atau MSHook/XPF pada non-jailbreak via CoreTrust exploit bundle).
+// ============================================================================
+// ShadowBypass XK v2 — single-file iOS arm64/arm64e implant (no jailbreak)
 //
-// Build:
-//   theos:          $THEOS/bin/logos.pl untuk keep %ctor; atau compile .m ini sebagai .dylib
-//   clang -dynamiclib: clang -arch arm64e -arch arm64 -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-//        -miphoneos-version-min=13.0 -fobjc-arc -O2 -dynamiclib ShadowBypassXK.m \
-//        -framework Foundation -framework UIKit -framework Security -framework AdSupport \
-//        -o ShadowBypassXK.dylib
+// Build (macOS + Xcode 15+):
+//   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+//   clang -arch arm64 -arch arm64e \
+//         -isysroot "$SDK" -miphoneos-version-min=13.0 \
+//         -fobjc-arc -O2 -dynamiclib \
+//         -Wno-incompatible-pointer-types \
+//         -Wno-implicit-function-declaration \
+//         -Wno-nullability-completeness \
+//         ShadowBypassXK.m \
+//         -framework Foundation -framework UIKit -framework Security \
+//         -framework AdSupport -framework AppTrackingTransparency \
+//         -o ShadowBypassXK.dylib
 //
-// fishhook: git submodule add https://github.com/facebook/fishhook deps/fishhook
-//           sertakan fishhook.c dalam target compile.
-//
-// *fishhook cuma bisa rebind symbol yg di-resolve via lazy binding di __DATA,__la_symbol_ptr —
-//  symbol yg di-resolve saat load (non-lazy) harus di-hook pakai method swizzle atau XPF/MSHook.*
+// Inject: sideload + LC_LOAD_DYLIB patch, TrollStore, atau CoreTrust bundle.
+// ============================================================================
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -22,10 +23,11 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <mach-o/getsect.h>
 #import <sys/mman.h>
 #import <sys/sysctl.h>
-#import <sys/ptrace.h>
 #import <unistd.h>
 #import <errno.h>
 #import <string.h>
@@ -33,68 +35,127 @@
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
 #import <AdSupport/AdSupport.h>
+#if __has_include(<AppTrackingTransparency/AppTrackingTransparency.h>)
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
-#import "fishhook.h"
+#endif
 
 #pragma mark =========================================================
-#pragma mark 0. LOGGING + GUARD
+#pragma mark 0. LOGGING
 #pragma mark =========================================================
 
-#define SBXK_LOG(fmt, ...) do { \
-    NSLog(@"[SBXK] " fmt, ##__VA_ARGS__); \
-} while (0)
-
-static inline BOOL SBXK_HasClass(const char *name) {
-    return name && objc_getClass(name) != Nil;
-}
-
-static inline BOOL SBXK_HasMetaClass(const char *name) {
-    return name && objc_getMetaClass(name) != Nil;
-}
+#define SBXK_LOG(fmt, ...) NSLog(@"[SBXK] " fmt, ##__VA_ARGS__)
 
 #pragma mark =========================================================
-#pragma mark 1. SWIZZLE ENGINE (instance + class method)
+#pragma mark 1. INLINE SYMBOL REBINDING (compact fishhook)
 #pragma mark =========================================================
 
-// Pasang implementasi baru untuk instance method (selector tdk dipanggil dulu = aman).
-static void SBXK_HookInstanceMethod(const char *className,
-                                    const char *selectorName,
-                                    IMP newImp)
+typedef struct {
+    const char *name;         // symbol asm name (no leading _)
+    void       *replacement;
+    void      **replaced;
+} sbxk_binding_t;
+
+static int sbxk_rebind_image(const struct mach_header_64 *mh,
+                             const sbxk_binding_t *binds, int nbinds)
 {
-    Class cls = objc_getClass(className);
-    if (!cls) { SBXK_LOG(@"skip cls (instance): %s", className); return; }
-    SEL sel = sel_registerName(selectorName);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) { SBXK_LOG(@"skip sel (instance): -[%s %s]", className, selectorName); return; }
-    class_replaceMethod(cls, sel, newImp, method_getTypeEncoding(m));
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        if (_dyld_get_image_header(i) == (const struct mach_header *)mh) {
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+
+    uintptr_t linkedit_base = 0;
+    const struct symtab_command   *symtab = NULL;
+    const struct dysymtab_command *dysym  = NULL;
+
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+                linkedit_base = (uintptr_t)seg->vmaddr - seg->fileoff + (uintptr_t)slide;
+            }
+        } else if (lc->cmd == LC_SYMTAB) {
+            symtab = (const struct symtab_command *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dysym = (const struct dysymtab_command *)lc;
+        }
+        lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
+    }
+    if (!linkedit_base || !symtab || !dysym) return -1;
+
+    const struct nlist_64 *symtab_array =
+        (const struct nlist_64 *)(linkedit_base + symtab->symoff);
+    const char *strtab = (const char *)(linkedit_base + symtab->stroff);
+    const uint32_t *indirect =
+        (const uint32_t *)(linkedit_base + dysym->indirectsymoff);
+
+    lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sect = (const struct section_64 *)(seg + 1);
+            for (uint32_t j = 0; j < seg->nsects; j++, sect++) {
+                uint8_t type = sect->flags & SECTION_TYPE;
+                if (type != S_LAZY_SYMBOL_POINTERS &&
+                    type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+
+                uint32_t nsyms = (uint32_t)(sect->size / 8);
+                uint32_t base  = sect->reserved1;
+                void **ptrs = (void **)(sect->addr + slide);
+
+                for (uint32_t k = 0; k < nsyms; k++) {
+                    uint32_t idx = indirect[base + k];
+                    const struct nlist_64 *sym = &symtab_array[idx];
+                    if ((sym->n_type & N_TYPE) != N_UNDF) continue;
+                    const char *name = strtab + sym->n_un.n_strx;
+                    if (name[0] == '_') name++;
+                    for (int b = 0; b < nbinds; b++) {
+                        if (strcmp(name, binds[b].name) != 0) continue;
+                        if (binds[b].replaced) *binds[b].replaced = ptrs[k];
+                        ptrs[k] = binds[b].replacement;
+                        break;
+                    }
+                }
+            }
+        }
+        lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
+    }
+    return 0;
 }
 
-// Pasang untuk class method (+ ...).
-static void SBXK_HookClassMethod(const char *className,
-                                 const char *selectorName,
-                                 IMP newImp)
-{
-    Class meta = objc_getMetaClass(className);
-    if (!meta) { SBXK_LOG(@"skip cls (class): %s", className); return; }
-    SEL sel = sel_registerName(selectorName);
-    Method m = class_getClassMethod(objc_getClass(className), sel);
-    if (!m) { SBXK_LOG(@"skip sel (class): +[%s %s]", className, selectorName); return; }
-    class_replaceMethod(meta, sel, newImp, method_getTypeEncoding(m));
+static void sbxk_rebind_all(const sbxk_binding_t *binds, int nbinds) {
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h) continue;
+        if (h->magic == MH_MAGIC_64) {
+            sbxk_rebind_image((const struct mach_header_64 *)h, binds, nbinds);
+        }
+    }
 }
 
-// Helper macro — supaya install block tetap ringkas.
-#define SBXK_HOOK_I(cls, sel) SBXK_HookInstanceMethod(#cls, sel, (IMP)SBXK_##cls##_##sel)
-#define SBXK_HOOK_C(cls, sel) SBXK_HookClassMethod(#cls, sel, (IMP)SBXK_##cls##_##sel)
-
 #pragma mark =========================================================
-#pragma mark 2. FISHHOOK BINDINGS (lazy-bound C symbols)
+#pragma mark 2. SWIZZLE ENGINE
 #pragma mark =========================================================
 
-// Kalau game compile pakai dlopen+RTLD_LAZY, fishhook kena. Kalau flat-linked di pre-main,
-// fishhook miss → tetap ada swizzle fallback di atas.
-// Semua original disimpan sebagai pointer.
+static void SBXK_HookInstanceMethod(const char *cls, const char *sel, IMP imp) {
+    Class c = objc_getClass(cls);
+    if (!c) return;
+    SEL s = sel_registerName(sel);
+    Method m = class_getInstanceMethod(c, s);
+    if (!m) return;
+    class_replaceMethod(c, s, imp, method_getTypeEncoding(m));
+}
 
-// --- RSA ---
+#define HOOK_I(cls, sel) SBXK_HookInstanceMethod(#cls, sel, (IMP)SBXK_##cls##_##sel)
+
+#pragma mark =========================================================
+#pragma mark 3. ORIGINAL POINTERS (populated by rebind)
+#pragma mark =========================================================
+
+// RSA
 static int (*orig_RSA_public_encrypt)(int, const unsigned char *, unsigned char *, void *, int);
 static int (*orig_RSA_private_decrypt)(int, const unsigned char *, unsigned char *, void *, int);
 static int (*orig_RSA_private_encrypt)(int, const unsigned char *, unsigned char *, void *, int);
@@ -106,7 +167,7 @@ static int (*orig_RSA_generate_key)(void *, int, unsigned long, void *);
 static int (*orig_RSA_padding_add_PKCS1_type_1)(unsigned char *, int, const unsigned char *, int);
 static int (*orig_RSA_padding_add_PKCS1_type_2)(unsigned char *, int, const unsigned char *, int);
 
-// --- AES / DES ---
+// AES / DES
 static int  (*orig_AES_set_encrypt_key)(const unsigned char *, int, void *);
 static int  (*orig_AES_set_decrypt_key)(const unsigned char *, int, void *);
 static void (*orig_AES_encrypt)(const unsigned char *, unsigned char *, const void *);
@@ -117,45 +178,40 @@ static void (*orig_DES_decrypt)(unsigned long *, void *, int);
 static int  (*orig_DES_cbc_encrypt)(const unsigned char *, unsigned char *, long, void *, unsigned char *, int);
 static int  (*orig_DES_set_key)(const unsigned char *, void *);
 
-// --- HASH (nama lama OpenSSL — masih ada symbol-nya di libcrypto) ---
-static int  (*orig_MD5_Init)(void *);
-static int  (*orig_MD5_Update)(void *, const void *, size_t);
-static int  (*orig_MD5_Final)(unsigned char *, void *);
-static int  (*orig_SHA1_Init)(void *);
-static int  (*orig_SHA1_Update)(void *, const void *, size_t);
-static int  (*orig_SHA1_Final)(unsigned char *, void *);
-static int  (*orig_SHA256_Init)(void *);
-static int  (*orig_SHA256_Update)(void *, const void *, size_t);
-static int  (*orig_SHA256_Final)(unsigned char *, void *);
-static int  (*orig_SHA512_Init)(void *);
-static int  (*orig_SHA512_Update)(void *, const void *, size_t);
-static int  (*orig_SHA512_Final)(unsigned char *, void *);
-static int  (*orig_HMAC_Init)(void *, const void *, int, const void *);
-static int  (*orig_HMAC_Update)(void *, const void *, size_t);
-static int  (*orig_HMAC_Final)(void *, unsigned char *, unsigned int *);
+// Hash
+static int (*orig_MD5_Init)(void *);
+static int (*orig_MD5_Update)(void *, const void *, size_t);
+static int (*orig_MD5_Final)(unsigned char *, void *);
+static int (*orig_SHA1_Init)(void *);
+static int (*orig_SHA1_Update)(void *, const void *, size_t);
+static int (*orig_SHA1_Final)(unsigned char *, void *);
+static int (*orig_SHA256_Init)(void *);
+static int (*orig_SHA256_Update)(void *, const void *, size_t);
+static int (*orig_SHA256_Final)(unsigned char *, void *);
+static int (*orig_SHA512_Init)(void *);
+static int (*orig_SHA512_Update)(void *, const void *, size_t);
+static int (*orig_SHA512_Final)(unsigned char *, void *);
+static int (*orig_HMAC_Init)(void *, const void *, int, const void *);
+static int (*orig_HMAC_Update)(void *, const void *, size_t);
+static int (*orig_HMAC_Final)(void *, unsigned char *, unsigned int *);
 
-// --- EVP / SSL / X509 ---
+// EVP / SSL / X509
 static int  (*orig_EVP_SignFinal)(void *, unsigned char *, unsigned int *, void *);
 static int  (*orig_EVP_VerifyFinal)(void *, const unsigned char *, unsigned int, void *);
 static int  (*orig_EVP_DigestSign)(void *, unsigned char *, size_t *, const unsigned char *, size_t);
 static int  (*orig_EVP_DigestVerify)(void *, const unsigned char *, size_t, const unsigned char *, size_t);
 static int  (*orig_X509_verify_cert)(void *);
 static long (*orig_SSL_get_verify_result)(const void *);
-static int  (*orig_SSL_CTX_set_verify)(void *, int, void *); // return type mungkin void di beberapa versi — kita panggil dgn aman
+static int  (*orig_SSL_CTX_set_verify)(void *, int, void *);
 static void (*orig_SSL_set_verify)(void *, int, void *);
 
-// --- RAND ---
+// RAND / POSIX
 static int (*orig_RAND_bytes)(unsigned char *, int);
+static int (*orig_access)(const char *, int);
 
 #pragma mark =========================================================
-#pragma mark 3. HOOK IMPLEMENTATIONS — CRYPTO
+#pragma mark 4. CRYPTO HOOKS
 #pragma mark =========================================================
-
-// Semua hook "succeed-always" pakai policy: jangan pernah mengembalikan kode error,
-// jangan pernah menandai signature invalid, jangan pernah drop token.
-// Ini yang bikin game lolos client-side verification tanpa balik ke server.
-
-#define SBXK_FORCE_TRUE_I(fn)  int fn(__VA_ARGS__)
 
 static int SBXK_RSA_public_encrypt(int flen, const unsigned char *from,
                                    unsigned char *to, void *rsa, int pad) {
@@ -177,52 +233,53 @@ static int SBXK_RSA_public_decrypt(int flen, const unsigned char *from,
     int r = orig_RSA_public_decrypt ? orig_RSA_public_decrypt(flen, from, to, rsa, pad) : flen;
     return (r < 0) ? flen : r;
 }
-static int SBXK_RSA_sign(int type, const unsigned char *m, unsigned int m_len,
-                         unsigned char *sig, unsigned int *siglen, void *rsa) {
-    int r = orig_RSA_sign ? orig_RSA_sign(type, m, m_len, sig, siglen, rsa) : 1;
+static int SBXK_RSA_sign(int type, const unsigned char *m, unsigned int ml,
+                         unsigned char *sig, unsigned int *sl, void *rsa) {
+    int r = orig_RSA_sign ? orig_RSA_sign(type, m, ml, sig, sl, rsa) : 1;
     return (r != 1) ? 1 : r;
 }
-static int SBXK_RSA_verify(int type, const unsigned char *m, unsigned int m_len,
-                           const unsigned char *sig, unsigned int siglen, void *rsa) {
-    (void)orig_RSA_verify; // selalu pass
+static int SBXK_RSA_verify(int type, const unsigned char *m, unsigned int ml,
+                           const unsigned char *sig, unsigned int sl, void *rsa) {
+    (void)type; (void)m; (void)ml; (void)sig; (void)sl; (void)rsa;
+    (void)orig_RSA_verify;
     return 1;
 }
-static int SBXK_RSA_check_key(const void *rsa) { (void)orig_RSA_check_key; (void)rsa; return 1; }
+static int SBXK_RSA_check_key(const void *rsa) { (void)rsa; (void)orig_RSA_check_key; return 1; }
 static int SBXK_RSA_generate_key(void *rsa, int bits, unsigned long e, void *cb) {
     int r = orig_RSA_generate_key ? orig_RSA_generate_key(rsa, bits, e, cb) : 1;
     return (r != 1) ? 1 : r;
 }
-static int SBXK_RSA_padding_add_PKCS1_type_1(unsigned char *to, int tlen,
-                                              const unsigned char *f, int fl) {
-    int r = orig_RSA_padding_add_PKCS1_type_1 ? orig_RSA_padding_add_PKCS1_type_1(to, tlen, f, fl) : 1;
+static int SBXK_RSA_padding_add_PKCS1_type_1(unsigned char *to, int tl,
+                                             const unsigned char *f, int fl) {
+    int r = orig_RSA_padding_add_PKCS1_type_1 ? orig_RSA_padding_add_PKCS1_type_1(to, tl, f, fl) : 1;
     return (r != 1) ? 1 : r;
 }
-static int SBXK_RSA_padding_add_PKCS1_type_2(unsigned char *to, int tlen,
-                                              const unsigned char *f, int fl) {
-    int r = orig_RSA_padding_add_PKCS1_type_2 ? orig_RSA_padding_add_PKCS1_type_2(to, tlen, f, fl) : 1;
+static int SBXK_RSA_padding_add_PKCS1_type_2(unsigned char *to, int tl,
+                                             const unsigned char *f, int fl) {
+    int r = orig_RSA_padding_add_PKCS1_type_2 ? orig_RSA_padding_add_PKCS1_type_2(to, tl, f, fl) : 1;
     return (r != 1) ? 1 : r;
 }
 
-static int SBXK_AES_set_encrypt_key(const unsigned char *k, int bits, void *key) {
-    int r = orig_AES_set_encrypt_key ? orig_AES_set_encrypt_key(k, bits, key) : 0;
+static int SBXK_AES_set_encrypt_key(const unsigned char *k, int b, void *key) {
+    int r = orig_AES_set_encrypt_key ? orig_AES_set_encrypt_key(k, b, key) : 0;
     return (r != 0) ? 0 : r;
 }
-static int SBXK_AES_set_decrypt_key(const unsigned char *k, int bits, void *key) {
-    int r = orig_AES_set_decrypt_key ? orig_AES_set_decrypt_key(k, bits, key) : 0;
+static int SBXK_AES_set_decrypt_key(const unsigned char *k, int b, void *key) {
+    int r = orig_AES_set_decrypt_key ? orig_AES_set_decrypt_key(k, b, key) : 0;
     return (r != 0) ? 0 : r;
 }
 static void SBXK_AES_encrypt(const unsigned char *in, unsigned char *out, const void *key) {
     if (orig_AES_encrypt) orig_AES_encrypt(in, out, key);
-    else memset(out, 0, 16);
+    else if (out) memset(out, 0, 16);
 }
 static void SBXK_AES_decrypt(const unsigned char *in, unsigned char *out, const void *key) {
     if (orig_AES_decrypt) orig_AES_decrypt(in, out, key);
-    else memset(out, 0, 16);
+    else if (out) memset(out, 0, 16);
 }
 static int SBXK_AES_cbc_encrypt(const unsigned char *in, unsigned char *out, size_t len,
                                 const void *key, unsigned char *ivec, int enc) {
     if (orig_AES_cbc_encrypt) return orig_AES_cbc_encrypt(in, out, len, key, ivec, enc);
-    if (out && in && len) memcpy(out, in, len);
+    if (in && out && len) memcpy(out, in, len);
     return 1;
 }
 static void SBXK_DES_encrypt(unsigned long *in, void *sched, int enc) {
@@ -234,7 +291,7 @@ static void SBXK_DES_decrypt(unsigned long *in, void *sched, int enc) {
 static int SBXK_DES_cbc_encrypt(const unsigned char *in, unsigned char *out, long len,
                                 void *sched, unsigned char *ivec, int enc) {
     if (orig_DES_cbc_encrypt) return orig_DES_cbc_encrypt(in, out, len, sched, ivec, enc);
-    if (out && in && len > 0) memcpy(out, in, (size_t)len);
+    if (in && out && len > 0) memcpy(out, in, (size_t)len);
     return 1;
 }
 static int SBXK_DES_set_key(const unsigned char *k, void *sched) {
@@ -242,24 +299,24 @@ static int SBXK_DES_set_key(const unsigned char *k, void *sched) {
     return (r != 0) ? 0 : r;
 }
 
-static int SBXK_MD5_Init(void *c)    { int r = orig_MD5_Init ? orig_MD5_Init(c) : 1;             return (r != 1) ? 1 : r; }
+static int SBXK_MD5_Init(void *c) { int r = orig_MD5_Init ? orig_MD5_Init(c) : 1; return (r != 1) ? 1 : r; }
 static int SBXK_MD5_Update(void *c, const void *d, size_t n) { return orig_MD5_Update ? orig_MD5_Update(c, d, n) : 1; }
 static int SBXK_MD5_Final(unsigned char *md, void *c) { int r = orig_MD5_Final ? orig_MD5_Final(md, c) : 1; return (r != 1) ? 1 : r; }
 
-static int SBXK_SHA1_Init(void *c)   { int r = orig_SHA1_Init ? orig_SHA1_Init(c) : 1;           return (r != 1) ? 1 : r; }
+static int SBXK_SHA1_Init(void *c) { int r = orig_SHA1_Init ? orig_SHA1_Init(c) : 1; return (r != 1) ? 1 : r; }
 static int SBXK_SHA1_Update(void *c, const void *d, size_t n) { return orig_SHA1_Update ? orig_SHA1_Update(c, d, n) : 1; }
 static int SBXK_SHA1_Final(unsigned char *md, void *c) { int r = orig_SHA1_Final ? orig_SHA1_Final(md, c) : 1; return (r != 1) ? 1 : r; }
 
-static int SBXK_SHA256_Init(void *c) { int r = orig_SHA256_Init ? orig_SHA256_Init(c) : 1;       return (r != 1) ? 1 : r; }
+static int SBXK_SHA256_Init(void *c) { int r = orig_SHA256_Init ? orig_SHA256_Init(c) : 1; return (r != 1) ? 1 : r; }
 static int SBXK_SHA256_Update(void *c, const void *d, size_t n) { return orig_SHA256_Update ? orig_SHA256_Update(c, d, n) : 1; }
 static int SBXK_SHA256_Final(unsigned char *md, void *c) { int r = orig_SHA256_Final ? orig_SHA256_Final(md, c) : 1; return (r != 1) ? 1 : r; }
 
-static int SBXK_SHA512_Init(void *c) { int r = orig_SHA512_Init ? orig_SHA512_Init(c) : 1;       return (r != 1) ? 1 : r; }
+static int SBXK_SHA512_Init(void *c) { int r = orig_SHA512_Init ? orig_SHA512_Init(c) : 1; return (r != 1) ? 1 : r; }
 static int SBXK_SHA512_Update(void *c, const void *d, size_t n) { return orig_SHA512_Update ? orig_SHA512_Update(c, d, n) : 1; }
 static int SBXK_SHA512_Final(unsigned char *md, void *c) { int r = orig_SHA512_Final ? orig_SHA512_Final(md, c) : 1; return (r != 1) ? 1 : r; }
 
-static int SBXK_HMAC_Init(void *ctx, const void *k, int klen, const void *md) {
-    int r = orig_HMAC_Init ? orig_HMAC_Init(ctx, k, klen, md) : 1;
+static int SBXK_HMAC_Init(void *ctx, const void *k, int kl, const void *md) {
+    int r = orig_HMAC_Init ? orig_HMAC_Init(ctx, k, kl, md) : 1;
     return (r != 1) ? 1 : r;
 }
 static int SBXK_HMAC_Update(void *ctx, const void *d, size_t n) {
@@ -270,32 +327,31 @@ static int SBXK_HMAC_Final(void *ctx, unsigned char *md, unsigned int *len) {
     return (r != 1) ? 1 : r;
 }
 
-static int SBXK_EVP_SignFinal(void *ctx, unsigned char *md, unsigned int *s, void *pkey) {
-    int r = orig_EVP_SignFinal ? orig_EVP_SignFinal(ctx, md, s, pkey) : 1;
+static int SBXK_EVP_SignFinal(void *ctx, unsigned char *md, unsigned int *s, void *pk) {
+    int r = orig_EVP_SignFinal ? orig_EVP_SignFinal(ctx, md, s, pk) : 1;
     return (r != 1) ? 1 : r;
 }
-static int SBXK_EVP_VerifyFinal(void *ctx, const unsigned char *sig, unsigned int siglen, void *pkey) {
-    (void)ctx; (void)sig; (void)siglen; (void)pkey; (void)orig_EVP_VerifyFinal;
+static int SBXK_EVP_VerifyFinal(void *ctx, const unsigned char *sig, unsigned int sl, void *pk) {
+    (void)ctx; (void)sig; (void)sl; (void)pk; (void)orig_EVP_VerifyFinal;
     return 1;
 }
-static int SBXK_EVP_DigestSign(void *ctx, unsigned char *sig, size_t *siglen,
-                               const unsigned char *tbs, size_t tbslen) {
-    int r = orig_EVP_DigestSign ? orig_EVP_DigestSign(ctx, sig, siglen, tbs, tbslen) : 1;
+static int SBXK_EVP_DigestSign(void *ctx, unsigned char *sig, size_t *sl,
+                               const unsigned char *tbs, size_t tbl) {
+    int r = orig_EVP_DigestSign ? orig_EVP_DigestSign(ctx, sig, sl, tbs, tbl) : 1;
     return (r != 1) ? 1 : r;
 }
-static int SBXK_EVP_DigestVerify(void *ctx, const unsigned char *sig, size_t siglen,
-                                 const unsigned char *tbs, size_t tbslen) {
-    (void)ctx; (void)sig; (void)siglen; (void)tbs; (void)tbslen; (void)orig_EVP_DigestVerify;
+static int SBXK_EVP_DigestVerify(void *ctx, const unsigned char *sig, size_t sl,
+                                 const unsigned char *tbs, size_t tbl) {
+    (void)ctx; (void)sig; (void)sl; (void)tbs; (void)tbl; (void)orig_EVP_DigestVerify;
     return 1;
 }
 
-static int SBXK_X509_verify_cert(void *ctx) { (void)orig_X509_verify_cert; (void)ctx; return 1; }
-static long SBXK_SSL_get_verify_result(const void *ssl) { (void)orig_SSL_get_verify_result; (void)ssl; return 0; /* X509_V_OK */ }
+static int SBXK_X509_verify_cert(void *ctx) { (void)ctx; (void)orig_X509_verify_cert; return 1; }
+static long SBXK_SSL_get_verify_result(const void *ssl) { (void)ssl; (void)orig_SSL_get_verify_result; return 0; }
 
-// SSL_CTX_set_verify return type di libssl iOS = int (0/1). Wrapper aman.
 static int SBXK_SSL_CTX_set_verify(void *ctx, int mode, void *cb) {
     (void)mode; (void)cb;
-    if (orig_SSL_CTX_set_verify) return orig_SSL_CTX_set_verify(ctx, 0 /* SSL_VERIFY_NONE */, NULL);
+    if (orig_SSL_CTX_set_verify) return orig_SSL_CTX_set_verify(ctx, 0, NULL);
     return 1;
 }
 static void SBXK_SSL_set_verify(void *ssl, int mode, void *cb) {
@@ -303,391 +359,330 @@ static void SBXK_SSL_set_verify(void *ssl, int mode, void *cb) {
     if (orig_SSL_set_verify) orig_SSL_set_verify(ssl, 0, NULL);
 }
 
-static int SBXK_RAND_bytes(unsigned char *buf, int num) {
-    return orig_RAND_bytes ? orig_RAND_bytes(buf, num) : 1;
+static int SBXK_RAND_bytes(unsigned char *buf, int n) {
+    return orig_RAND_bytes ? orig_RAND_bytes(buf, n) : 1;
 }
 
-#pragma mark =========================================================
-#pragma mark 4. HOOK IMPLEMENTATIONS — INTEGRITY / JAILBREAK / DEBUG / HOOK DETECT
-#pragma mark =========================================================
-
-// Semua return "clean" — no jailbreak, no debug, no hook, integrity OK.
-// Selector macam ini banyak di SDK security pihak ketiga (guard lib) & di kode game sendiri.
-
-#define SBXK_BOOL_NO_IMPL(name) \
-    static BOOL name(id self, SEL _cmd) { (void)self; (void)_cmd; return NO; }
-#define SBXK_BOOL_YES_IMPL(name) \
-    static BOOL name(id self, SEL _cmd) { (void)self; (void)_cmd; return YES; }
-
-SBXK_BOOL_NO_IMPL(SBXK_isJailbroken)
-SBXK_BOOL_NO_IMPL(SBXK_isJailbreak)
-SBXK_BOOL_NO_IMPL(SBXK_checkJailbreak)
-SBXK_BOOL_NO_IMPL(SBXK_jailbreakDetection)
-SBXK_BOOL_NO_IMPL(SBXK_isSimulator)
-SBXK_BOOL_NO_IMPL(SBXK_isSimulatorDevice)
-SBXK_BOOL_NO_IMPL(SBXK_checkSimulator)
-SBXK_BOOL_NO_IMPL(SBXK_isDebuggerAttached)
-SBXK_BOOL_NO_IMPL(SBXK_isDebugged)
-SBXK_BOOL_NO_IMPL(SBXK_checkDebugger)
-SBXK_BOOL_NO_IMPL(SBXK_amIBeingDebugged)
-SBXK_BOOL_NO_IMPL(SBXK_checkDebuggerAttach)
-SBXK_BOOL_NO_IMPL(SBXK_isHooked)
-SBXK_BOOL_NO_IMPL(SBXK_isHookDetected)
-SBXK_BOOL_NO_IMPL(SBXK_checkHook)
-SBXK_BOOL_NO_IMPL(SBXK_detectHook)
-SBXK_BOOL_NO_IMPL(SBXK_antiHookCheck)
-SBXK_BOOL_NO_IMPL(SBXK_isTampered)
-SBXK_BOOL_NO_IMPL(SBXK_checkTamper)
-SBXK_BOOL_NO_IMPL(SBXK_antiTamperCheck)
-SBXK_BOOL_NO_IMPL(SBXK_isInjected)
-SBXK_BOOL_NO_IMPL(SBXK_isLibraryInjected)
-SBXK_BOOL_NO_IMPL(SBXK_checkInjection)
-SBXK_BOOL_NO_IMPL(SBXK_antiInjectionCheck)
-SBXK_BOOL_NO_IMPL(SBXK_isReversingDetected)
-SBXK_BOOL_NO_IMPL(SBXK_checkReversing)
-SBXK_BOOL_NO_IMPL(SBXK_antiReversingCheck)
-SBXK_BOOL_NO_IMPL(SBXK_isBlocked)
-SBXK_BOOL_NO_IMPL(SBXK_antiBlockingCheck)
-SBXK_BOOL_NO_IMPL(SBXK_integrity_detect)
-SBXK_BOOL_NO_IMPL(SBXK_MTML_INTEGRITY_DETECT)
-SBXK_BOOL_NO_IMPL(SBXK_CheckPufferDownload)
-SBXK_BOOL_NO_IMPL(SBXK_token_expire)
-SBXK_BOOL_NO_IMPL(SBXK_isTokenInvalid)
-SBXK_BOOL_NO_IMPL(SBXK_isAccessDenied)
-SBXK_BOOL_NO_IMPL(SBXK_isSuspended)
-SBXK_BOOL_NO_IMPL(SBXK_EventIsBlocked)
-SBXK_BOOL_NO_IMPL(SBXK_UserPropertyIsBlocked)
-SBXK_BOOL_NO_IMPL(SBXK_CheckDeviceMuteStat)
-
-SBXK_BOOL_YES_IMPL(SBXK_verifyIntegrity)
-SBXK_BOOL_YES_IMPL(SBXK_checkTokenValid)
-SBXK_BOOL_YES_IMPL(SBXK_checkConfigSignValidity)
-SBXK_BOOL_YES_IMPL(SBXK_verify_file_md5)
-SBXK_BOOL_YES_IMPL(SBXK_CheckFileMd5)
-SBXK_BOOL_YES_IMPL(SBXK_CheckFileHeader)
-SBXK_BOOL_YES_IMPL(SBXK_IsFileExistInResDir)
-SBXK_BOOL_YES_IMPL(SBXK_verifySignature)
-
-#pragma mark =========================================================
-#pragma mark 5. HOOK IMPLEMENTATIONS — GAME LOGIC (server-side mirror)
-#pragma mark =========================================================
-
-// Ini target di memori klien. Balik ke server tetap server yang putuskan.
-// Yang kita lakukan: netralkan trigger client-side supaya flag "modded" tdk dikirim.
-
-static id SBXK_WeaponProcessor_CalculateDamage(id self, SEL _cmd, id target, float distance) {
-    (void)self; (void)_cmd; (void)target; (void)distance; return @(0);
-}
-static BOOL SBXK_CharacterMovement_IsSpeedExceeded(id self, SEL _cmd) {
-    (void)self; (void)_cmd; return NO;
-}
-static id SBXK_BulletSimulator_CheckWallCollision(id self, SEL _cmd) {
-    (void)self; (void)_cmd; return nil;
-}
-static void SBXK_NetworkManager_SendSecurityReport(id self, SEL _cmd, id report) {
-    (void)self; (void)_cmd; (void)report; SBXK_LOG(@"suppressed SecurityReport");
-}
-static BOOL SBXK_SecurityChecker_IsFileSystemModified(id self, SEL _cmd) {
-    (void)self; (void)_cmd; return NO;
-}
-
-#pragma mark =========================================================
-#pragma mark 6. HOOK IMPLEMENTATIONS — GSDK (Tencent) / Ping / Voice / Ads / Firebase / QQ
-#pragma mark =========================================================
-
-// Zero-return hooks: kembalikan @(0) atau nil, cukup untuk mematikan telemetri klien.
-
-#define SBXK_ZERO_ID(name) \
-    static id name(id self, SEL _cmd) { (void)self; (void)_cmd; return @(0); }
-#define SBXK_NIL_ID(name) \
-    static id name(id self, SEL _cmd) { (void)self; (void)_cmd; return nil; }
-#define SBXK_ZERO_ID_ARGS(name, ...) \
-    static id name(id self, SEL _cmd, ##__VA_ARGS__) { (void)self; (void)_cmd; return @(0); }
-
-SBXK_ZERO_ID(SBXK_GSDKCPU_getSystemCPUCircle)
-SBXK_ZERO_ID(SBXK_GSDKMemory_getSystemAvailableMemory)
-SBXK_ZERO_ID(SBXK_GSDKInGameManager_GSDKRealTimeDetect)
-SBXK_ZERO_ID(SBXK_GSDKInGameSystem_GSDKInnerEnd)
-SBXK_ZERO_ID(SBXK_GSDKInGameSystem_GSDKInnerRealTimeDetect)
-SBXK_ZERO_ID(SBXK_GetCurrentDownloadSpeed)
-SBXK_ZERO_ID(SBXK_GetCurrentSpeed)
-SBXK_ZERO_ID(SBXK_GetRunningTasks)
-SBXK_ZERO_ID(SBXK_GSDKPing_ping)
-SBXK_ZERO_ID(SBXK_GSDKPingDetect_ping)
-SBXK_ZERO_ID(SBXK_PingDelegate_pingTimer)
-SBXK_ZERO_ID(SBXK_SimplePing_start)
-SBXK_ZERO_ID(SBXK_SimplePing_startWithHostAddress)
-SBXK_ZERO_ID(SBXK_SimplePing_readData)
-SBXK_ZERO_ID(SBXK_GetMicLevel)
-SBXK_ZERO_ID(SBXK_GetSpeakerLevel)
-SBXK_ZERO_ID(SBXK_GetBGMLevel)
-SBXK_ZERO_ID(SBXK_GetBGMFileTime)
-SBXK_ZERO_ID(SBXK_GetBGMPlayTime)
-SBXK_ZERO_ID(SBXK_GetRecordKaraokeTotalTime)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_GetMicLevel)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_GetSpeakerLevel)
-
-SBXK_ZERO_ID_ARGS(SBXK_GSDKHttpRequest_requestControl_Openid_Acctype_Zoneid_Env_,
-                  id a, id b, id c, id d)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKInGameSystem_GSDKInnerSaveFPS_FpsDots_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKInGameSystem_GSDKInnerStart_SceneID_RoomIP_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKInitManager_detectOperation_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKRealTimeDetect_pingDelayDetect_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKRealTimeDetect_updDelayDetect_Port_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKUdpDetect_isUDPConnect_Port_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKWIFI_ping_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKDetectPort_isConnection_Port_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPayEvent_GSDKPay_Tag_Status_Msg_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPing_simplePing_didFailToSendPacket_sequenceNumber_error_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPing_simplePing_didFailWithError_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPing_simplePing_didReceivePingResponsePacket_sequenceNumber_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPing_simplePing_didReceiveUnexpectedPacket_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPing_simplePing_didSendPacket_sequenceNumber_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPing_simplePing_didStartWithAddress_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPingDetect_simplePing_didFailToSendPacket_sequenceNumber_error_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPingDetect_simplePing_didFailWithError_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPingDetect_simplePing_didReceivePingResponsePacket_sequenceNumber_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPingDetect_simplePing_didReceiveUnexpectedPacket_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPingDetect_simplePing_didSendPacket_sequenceNumber_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GSDKPingDetect_simplePing_didStartWithAddress_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_PingDelegate_simplePing_didFailToSendPacket_sequenceNumber_error_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_PingDelegate_simplePing_didSendPacket_sequenceNumber_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_SimplePing_didFailWithError_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_SimplePing_sendPingWithData_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_SimplePing_validatePingResponsePacket_sequenceNumber_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_SimplePing_pingPacketWithType_payload_requiresChecksum_, id a, id b, BOOL c)
-SBXK_ZERO_ID_ARGS(SBXK_TDataMasterApplication_reportEventWithSrcID_eventName_AndEventKVArray_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_APMMonitor_handleEvent_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_APMMonitor_startMonitoring_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_APMDeviceInfoSupport_getBatteryState, id a)
-SBXK_ZERO_ID_ARGS(SBXK_APMCollector_collectMetrics_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_TApmSceneMarker_markLoadLevel_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_TApmSceneMarker_postStepEvent_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_TApmSceneMarker_postStreamEvent_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudCoreRemoteConfig_updateConfig_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudCoreRemoteConfig_getConfig_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_FBAdMonitor_startMonitoringAd_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_FBAdEvent_logEvent_withParameters_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_FBAdLogger_logMessage_withLevel_, id a, int b)
-SBXK_ZERO_ID_ARGS(SBXK_FIRMessaging_retrieveFCMTokenForSenderID_completion_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_FIRMessaging_setAPNSToken_withUserInfo_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_QQApiInterface_sendReq_resultBlock_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_TDataMasterApplication_handleOpenURL_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_TcApiTool_openUniversallinkIfNeed_, id a)
-
-// --- GSDK dealloc / lifecycle (return void ideally, tapi kode asli return id → kita balik @(0) aman) ---
-#define SBXK_NOOP_ID_ARGS(name, ...) \
-    static id name(id self, SEL _cmd, ##__VA_ARGS__) { (void)self; (void)_cmd; return @(0); }
-
-SBXK_NOOP_ID_ARGS(SBXK_GSDKHttpDnsResolver_dealloc)
-SBXK_NOOP_ID_ARGS(SBXK_GSDKHttpRequest_dealloc)
-SBXK_NOOP_ID_ARGS(SBXK_GSDKPing_dealloc)
-SBXK_NOOP_ID_ARGS(SBXK_GSDKPingDetect_dealloc)
-SBXK_NOOP_ID_ARGS(SBXK_SimplePing_dealloc)
-SBXK_NOOP_ID_ARGS(SBXK_IMSDKCustomWebView_dealloc)
-
-// --- Voice (Tencent GVoice) — semua no-op ---
-#define SBXK_NOOP_VOID_ARGS(name, ...) \
-    static void name(id self, SEL _cmd, ##__VA_ARGS__) { (void)self; (void)_cmd; }
-
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_JoinTeamRoom_Scenes_roomName_timeout_, id a, id b, int c)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_QuitRoom_Scenes_timeout_, id a, int b)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_EnableMultiRoom_, BOOL a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_EnableRoomMicrophone_enable_, id a, BOOL b)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_EnableRoomSpeaker_enable_, id a, BOOL b)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_ApplyMessageKey_timestamp_timeout_, id a, int b, int c)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_StartRecording_, id a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_UploadRecordedFile_timeout_fileProperty_, id a, int b, id c)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_DownloadRecordedFile_filePath_timeout_fileProperty_, id a, id b, int c, id d)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_EnableLog_, BOOL a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetLogCallBack_, id a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetMicVolume_, int a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetSpeakerVolume_, int a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SpeechToText_token_timestamp_timeout_language_, id a, id b, int c, int d, id e)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_ForbidMemberVoice_enable_inRoom_, id a, int b, BOOL c)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetBGMPath_, id a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetBitRate_, int a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetDataFree_, int a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetReportBufferTime_, int a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudVoiceEngine_SetBGMPlayTime_, int a)
-SBXK_NOOP_VOID_ARGS(SBXK_GVGCloudVoice_setAppInfo_withKey_andOpenID_, id a, id b, id c)
-SBXK_NOOP_VOID_ARGS(SBXK_GVGCloudVoiceExtension_EnableKeyWordsDetect_, BOOL a)
-SBXK_NOOP_VOID_ARGS(SBXK_GCloudUnityPlugin_SetGameObjectName_, id a)
-SBXK_NOOP_VOID_ARGS(SBXK_TikTokAuth_authorizeWithPermissions_, id a)
-SBXK_NOOP_VOID_ARGS(SBXK_TikTokAuth_handleOpenURL_, id a)
-SBXK_NOOP_VOID_ARGS(SBXK_VKAuth_authorizeWithPermissions_, id a)
-SBXK_NOOP_VOID_ARGS(SBXK_SCSDKLoginClient_loginWithCompletion_, id a)
-
-// --- Voice returns id (bukan void) untuk metode yang memang return id ---
-SBXK_ZERO_ID(SBXK_GVGCloudVoice_openMic)
-SBXK_ZERO_ID(SBXK_GVGCloudVoice_openSpeaker)
-SBXK_ZERO_ID(SBXK_GVGCloudVoiceExtension_GetBGMPlayState)
-SBXK_ZERO_ID(SBXK_GVGCloudVoiceExtension_GetMicState)
-SBXK_ZERO_ID(SBXK_GVGCloudVoiceExtension_GetSpeakerState)
-SBXK_ZERO_ID(SBXK_GVoiceMuteSwitch_detectMuteSwitch)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_StartTve)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_StopRecording)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_TestMic)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_StartBGMPlay)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_StopBGMPlay)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_PauseBGMPlay)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_ResumeBGMPlay)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_RSTSStopRecording)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_TextToStreamSpeechStop)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_StartPreview)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_StopPreview)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_PauseKaraoke)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_ResumeKaraoke)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_GetBGMPlayTime)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_GetBGMFileTime)
-SBXK_ZERO_ID(SBXK_GCloudVoiceEngine_GetRecordKaraokeTotalTime)
-SBXK_ZERO_ID(SBXK_APMDeviceInfoSupport_getThermalState)
-SBXK_ZERO_ID(SBXK_TApmSceneMarker_markLevelFin)
-SBXK_ZERO_ID(SBXK_FBAdViewabilityValidator_stopMonitoring)
-SBXK_ZERO_ID(SBXK_FBAdMonitor_stopMonitoring)
-SBXK_ZERO_ID(SBXK_FIRMessaging_deleteFCMTokenForSenderID_completion)
-SBXK_ZERO_ID(SBXK_FIRMessaging_subscribeToTopic_completion)
-SBXK_ZERO_ID(SBXK_FIRMessaging_unsubscribeFromTopic_completion)
-SBXK_ZERO_ID(SBXK_FIRMessaging_APNSToken)
-SBXK_ZERO_ID(SBXK_QQApiInterface_sendThirdAppBindGroupReq_resultBlock_)
-SBXK_ZERO_ID(SBXK_QQApiInterface_sendThirdAppUnBindGroupReq_resultBlock_)
-SBXK_ZERO_ID(SBXK_QQApiInterface_sendThirdAppJoinGroupReq_resultBlock_)
-SBXK_ZERO_ID(SBXK_QQApiInterface_sendQueryQQGroupProInfo_resultBlock_)
-SBXK_ZERO_ID(SBXK_QQApiInterface_sendMessageToQQAuthWithReq_)
-SBXK_ZERO_ID(SBXK_QQApiInterface_sendMessageToQQAvatarWithReq_)
-SBXK_ZERO_ID(SBXK_QQApiInterface_sendMessageToFaceCollectionWithReq_)
-SBXK_ZERO_ID(SBXK_GCloudUnityPlugin_Initialize)
-SBXK_ZERO_ID(SBXK_GCloudUnityPlugin_ReportEvent)
-SBXK_ZERO_ID(SBXK_VKAuth_logout)
-SBXK_ZERO_ID(SBXK_SCSDKLoginClient_logout)
-SBXK_ZERO_ID(SBXK_IMSDKNoticeIMSDKManager_imsdkCoreKitNoticeImageFileHash_)
-
-// --- Beberapa return id dengan argumen panjang (GCloud) ---
-SBXK_ZERO_ID_ARGS(SBXK_IMSDKNoticeIMSDKManager_getImageCache_imagePath_imageHash_queue_completeHandle_, id a, id b, id c, id d)
-SBXK_ZERO_ID_ARGS(SBXK_IMSDKStatAdjustManager_reportEvent_eventBody_isRealtime_, id a, id b, BOOL c)
-SBXK_ZERO_ID_ARGS(SBXK_IMSDKStatAdjustManager_reportEvent_params_isRealtime_, id a, id b, BOOL c)
-SBXK_ZERO_ID_ARGS(SBXK_IMSDKStatAdjustManager_reportPurchase_currentCode_expense_isRealTime_, id a, id b, id c, BOOL d)
-SBXK_ZERO_ID_ARGS(SBXK_IMSDKStatAdjustManager_reportRevenue_currencyCode_revenueValue_params_extraJson_, id a, id b, id c, id d)
-SBXK_ZERO_ID_ARGS(SBXK_INTLWebViewManager_openURL_observerID_baseParams_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_QQOpenApiUtility_cgiRequestGetSdkConfig_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_APMCollector_reportNow_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_GetFileParam_data_time_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_TextToStreamSpeechStart_voiceType_timeout_filePath_, id a, int b, int c, id d)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableTranslate_isEnable_lang_transType_, id a, BOOL b, id c, int d)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableMagicVoice_isEnable_, id a, BOOL b)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableRecvMagicVoice_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_RoomGeneralDataChannel_content_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_APITrace_callInfo_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SetPlayerInfoAbroad_members_lang_count_, id a, id b, id c, int d)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableReportALL_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableReportALLAbroad_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableReportForAbroad_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_ReportFileForAbroad_bTranslate_bChangeVoice_time_, id a, BOOL b, BOOL c, int d)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableCivilFile_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableCivilVoice_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SetCivilBinPath_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableEarBack_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_StartKaraokeRecording_accfile_orifile_, id a, id b, id c)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_EnableAccFilePlay_, BOOL a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SetKaraokeVoiceVol_, int a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SetKaraokeAccVol_, int a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SetKaraokeVoiceDelay_, int a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SeekTimeMsForPreview_, int a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SeekTimeMsForAcc_, int a)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_SetReportedPlayerInfo_arg1_arg2_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_ReportPlayer_arg1_arg2_, id a, id b)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_RSTSStartRecording_targetLang_targetLangCnt_action_timeout_recordFilePath_, id a, int b, int c, int d, int e, id f)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_RSTSSpeechToSpeech_targetLang_targetLangCnt_dirPath_voiceType_voiceRate_volume_timeout_recordFilePath_, id a, int b, int c, id d, int e, float f, float g, int h, id i)
-SBXK_ZERO_ID_ARGS(SBXK_GCloudVoiceEngine_RSTSSpeechToText_targetLang_targetLangCnt_timeout_recordFilePath_srcLangStr_extInfo_, id a, int b, int c, int d, id e, id f, id g)
-
-// FB
-SBXK_ZERO_ID_ARGS(SBXK_FBAdViewabilityValidator_checkViewability_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_FBAdNetworkResponseInfo_adUnitMapping, id a)
-
-// GAD
-SBXK_ZERO_ID(SBXK_GADMobileAds_initializationStatus)
-SBXK_ZERO_ID(SBXK_GADAppOpenAd_responseInfo)
-SBXK_ZERO_ID_ARGS(SBXK_GADAppOpenAd_adDidRecordClick_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GADAppOpenAd_adDidRecordImpression_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GADAppOpenAd_setPaidEventHandler_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GADAppOpenAd_adWillPresentFullScreenContent_, id a)
-SBXK_ZERO_ID_ARGS(SBXK_GADAppOpenAd_adDidFailToPresentFullScreenContentWithError_, id a)
-
-// GAD return BOOL
-SBXK_BOOL_YES_IMPL(SBXK_GADAppOpenAd_adDidDismissFullScreenContent_)
-SBXK_BOOL_YES_IMPL(SBXK_GADAppOpenAd_adWillDismissFullScreenContent_)
-
-// GAD canPresent... returns BOOL
-static BOOL SBXK_GADAppOpenAd_canPresentFromRootViewController_error_(id self, SEL _cmd, id vc, id *err) {
-    (void)self; (void)_cmd; (void)vc; if (err) *err = nil; return YES;
-}
-
-// --- Advertising identifier spoof ---
-static NSString *SBXK_ASIdentifierManager_advertisingIdentifier(id self, SEL _cmd) {
-    (void)self; (void)_cmd;
-    return @"00000000-0000-0000-0000-000000000000";
-}
-static NSInteger SBXK_ATTrackingManager_trackingAuthorizationStatus(id self, SEL _cmd) {
-    (void)self; (void)_cmd;
-    // ATTrackingManagerAuthorizationStatusAuthorized = 3
-    return 3;
-}
-
-#pragma mark =========================================================
-#pragma mark 7. POSIX HOOKS — access() & NSFileManager
-#pragma mark =========================================================
-
-// Fishhook untuk `access` di libSystem.
-static int (*orig_access)(const char *, int);
 static int SBXK_access(const char *path, int amode) {
-    static const char *jbPaths[] = {
-        "/Applications/Cydia.app",
-        "/Applications/Sileo.app",
-        "/Applications/Zebra.app",
-        "/Library/MobileSubstrate",
-        "/Library/MobileSubstrate/DynamicLibraries",
-        "/bin/bash",
-        "/bin/sh",
-        "/etc/apt",
-        "/private/var/lib/apt",
-        "/private/var/tmp/cydia.log",
-        "/usr/bin/cycript",
-        "/usr/bin/ssh",
-        "/usr/libexec/ssh-keysign",
-        "/usr/sbin/sshd",
-        "/var/cache/apt",
-        "/var/lib/cydia",
-        "/var/log/syslog",
-        "/var/tmp/cydia.log",
-        NULL
+    static const char *jb[] = {
+        "/Applications/Cydia.app", "/Applications/Sileo.app",
+        "/Applications/Zebra.app", "/Library/MobileSubstrate",
+        "/Library/MobileSubstrate/DynamicLibraries", "/bin/bash", "/bin/sh",
+        "/etc/apt", "/private/var/lib/apt", "/private/var/tmp/cydia.log",
+        "/usr/bin/cycript", "/usr/bin/ssh", "/usr/libexec/ssh-keysign",
+        "/usr/sbin/sshd", "/var/cache/apt", "/var/lib/cydia",
+        "/var/log/syslog", "/var/tmp/cydia.log", NULL
     };
     if (path) {
-        for (int i = 0; jbPaths[i]; i++) {
-            if (strcmp(path, jbPaths[i]) == 0) {
-                errno = ENOENT;
-                return -1;
-            }
+        for (int i = 0; jb[i]; i++) {
+            if (strcmp(path, jb[i]) == 0) { errno = ENOENT; return -1; }
         }
     }
     return orig_access ? orig_access(path, amode) : -1;
 }
 
-// Swizzle NSFileManager fileExistsAtPath: & fileExistsAtPath:isDirectory:
+#pragma mark =========================================================
+#pragma mark 5. INTEGRITY / DETECT HOOKS
+#pragma mark =========================================================
+
+#define IMP_NO(cls, sel)  static BOOL SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return NO; }
+#define IMP_YES(cls, sel) static BOOL SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return YES; }
+
+// Jailbreak / simulator / debugger / hook / tamper / injection / reversing detection
+IMP_NO(IntegrityChecker, integrity_detect)
+IMP_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
+IMP_NO(JailbreakDetector, isJailbroken)
+IMP_NO(JailbreakDetector, isJailbreak)
+IMP_NO(JailbreakDetector, checkJailbreak)
+IMP_NO(JailbreakDetector, jailbreakDetection)
+IMP_NO(SimulatorDetector, isSimulator)
+IMP_NO(SimulatorDetector, isSimulatorDevice)
+IMP_NO(SimulatorDetector, checkSimulator)
+IMP_NO(SecurityChecker, IsFileSystemModified)
+IMP_NO(SecurityChecker, isDebuggerAttached)
+IMP_NO(SecurityChecker, isDebugged)
+IMP_NO(SecurityChecker, checkDebugger)
+IMP_NO(SecurityChecker, amIBeingDebugged)
+IMP_NO(SecurityChecker, checkDebuggerAttach)
+IMP_NO(SecurityChecker, isHooked)
+IMP_NO(SecurityChecker, isHookDetected)
+IMP_NO(SecurityChecker, checkHook)
+IMP_NO(SecurityChecker, detectHook)
+IMP_NO(SecurityChecker, antiHookCheck)
+IMP_NO(SecurityChecker, isTampered)
+IMP_NO(SecurityChecker, checkTamper)
+IMP_NO(SecurityChecker, antiTamperCheck)
+IMP_NO(SecurityChecker, isInjected)
+IMP_NO(SecurityChecker, isLibraryInjected)
+IMP_NO(SecurityChecker, checkInjection)
+IMP_NO(SecurityChecker, antiInjectionCheck)
+IMP_NO(SecurityChecker, isReversingDetected)
+IMP_NO(SecurityChecker, checkReversing)
+IMP_NO(SecurityChecker, antiReversingCheck)
+IMP_NO(SecurityChecker, isBlocked)
+IMP_NO(SecurityChecker, antiBlockingCheck)
+
+IMP_YES(SecurityChecker, verifyIntegrity)
+IMP_YES(SecurityChecker, checkTokenValid)
+IMP_YES(SecurityChecker, checkConfigSignValidity)
+IMP_YES(SecurityChecker, verify_file_md5)
+IMP_YES(SecurityChecker, CheckFileMd5)
+IMP_YES(SecurityChecker, CheckFileHeader)
+IMP_YES(SecurityChecker, IsFileExistInResDir)
+IMP_YES(SecurityChecker, verifySignature)
+
+// GAD specific
+IMP_YES(GADAppOpenAd, adDidDismissFullScreenContent_)
+IMP_YES(GADAppOpenAd, adWillDismissFullScreenContent_)
+
+// GSDK DetectPort / UDP / WIFI / Reachability / Audio
+IMP_YES(AReachability, isConnectionOnDemand)
+IMP_YES(AReachability, isConnectionRequired)
+IMP_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
+
+#pragma mark =========================================================
+#pragma mark 6. GAME LOGIC HOOKS
+#pragma mark =========================================================
+
+static id SBXK_WeaponProcessor_CalculateDamage(id s, SEL c, id target, float dist) {
+    (void)s; (void)c; (void)target; (void)dist; return @(0);
+}
+static BOOL SBXK_CharacterMovement_IsSpeedExceeded(id s, SEL c) { (void)s; (void)c; return NO; }
+static id SBXK_BulletSimulator_CheckWallCollision(id s, SEL c) { (void)s; (void)c; return nil; }
+static void SBXK_NetworkManager_SendSecurityReport(id s, SEL c, id r) {
+    (void)s; (void)c; (void)r; SBXK_LOG(@"suppressed SecurityReport");
+}
+
+#pragma mark =========================================================
+#pragma mark 7. GENERIC ZERO-RETURN / NOOP MACROS
+#pragma mark =========================================================
+
+#define Z_ID(cls, sel)   static id   SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return @(0); }
+#define N_ID(cls, sel)   static id   SBXK_##cls##_##sel(id s, SEL c) { (void)s; (void)c; return nil;  }
+#define Z_ID_A(cls, sel, a)          static id SBXK_##cls##_##sel(id s, SEL c, id a) { (void)s;(void)c;(void)a; return @(0); }
+#define Z_ID_AA(cls, sel, a, b)      static id SBXK_##cls##_##sel(id s, SEL c, id a, id b) { (void)s;(void)c;(void)a;(void)b; return @(0); }
+#define Z_ID_AAA(cls, sel, a, b, cc) static id SBXK_##cls##_##sel(id s, SEL c, id a, id b, id cc) { (void)s;(void)c;(void)a;(void)b;(void)cc; return @(0); }
+#define Z_ID_AB(cls, sel, a, b)      static id SBXK_##cls##_##sel(id s, SEL c, id a, BOOL b) { (void)s;(void)c;(void)a;(void)b; return @(0); }
+#define Z_V_A(cls, sel, a)           static void SBXK_##cls##_##sel(id s, SEL c, id a) { (void)s;(void)c;(void)a; }
+#define Z_V_AB(cls, sel, a, b)       static void SBXK_##cls##_##sel(id s, SEL c, id a, BOOL b) { (void)s;(void)c;(void)a;(void)b; }
+#define Z_V_AI(cls, sel, a, b)       static void SBXK_##cls##_##sel(id s, SEL c, id a, int b) { (void)s;(void)c;(void)a;(void)b; }
+#define Z_V_AA(cls, sel, a, b)       static void SBXK_##cls##_##sel(id s, SEL c, id a, id b) { (void)s;(void)c;(void)a;(void)b; }
+#define Z_V_AAB(cls, sel, a, b, cc)  static void SBXK_##cls##_##sel(id s, SEL c, id a, id b, BOOL cc) { (void)s;(void)c;(void)a;(void)b;(void)cc; }
+#define Z_V_AII(cls, sel, a, b, cc)  static void SBXK_##cls##_##sel(id s, SEL c, id a, int b, int cc) { (void)s;(void)c;(void)a;(void)b;(void)cc; }
+#define Z_V_AIID(cls, sel, a, b, cc, d) static void SBXK_##cls##_##sel(id s, SEL c, id a, int b, int cc, int d) { (void)s;(void)c;(void)a;(void)b;(void)cc;(void)d; }
+
+#pragma mark =========================================================
+#pragma mark 8. GSDK HOOKS
+#pragma mark =========================================================
+
+Z_ID(GSDKCPU, getSystemCPUCircle)
+Z_ID(GSDKMemory, getSystemAvailableMemory)
+Z_ID(GSDKInGameManager, GSDKRealTimeDetect)
+Z_ID(GSDKInGameSystem, GSDKInnerEnd)
+Z_ID(GSDKInGameSystem, GSDKInnerRealTimeDetect)
+Z_ID(GSDKPing, ping)
+Z_ID(GSDKPing, stopPing)
+Z_ID(GSDKPing, dealloc)
+Z_ID(GSDKPingDetect, ping)
+Z_ID(GSDKPingDetect, dealloc)
+Z_ID(GSDKHttpDnsResolver, dealloc)
+Z_ID(GSDKHttpRequest, dealloc)
+Z_ID(PingDelegate, pingTimer)
+Z_ID(SimplePing, dealloc)
+Z_ID(SimplePing, start)
+Z_ID(SimplePing, startWithHostAddress)
+Z_ID(SimplePing, readData)
+Z_ID(GSDKRealTimeDetect, pingDelayDetect_)
+Z_ID(GSDKRealTimeDetect, updDelayDetect_Port_)
+Z_ID(GSDKUdpDetect, isUDPConnect_Port_)
+Z_ID(GSDKWIFI, ping_)
+Z_ID(GSDKDetectPort, isConnection_Port_)
+Z_ID(GSDKInitManager, detectOperation_)
+Z_ID(GSDKPayEvent, GSDKPay_Tag_Status_Msg_)
+Z_ID(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env_)
+Z_ID(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots_)
+Z_ID(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP_)
+Z_ID(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error_)
+Z_ID(GSDKPing, simplePing_didFailWithError_)
+Z_ID(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber_)
+Z_ID(GSDKPing, simplePing_didReceiveUnexpectedPacket_)
+Z_ID(GSDKPing, simplePing_didSendPacket_sequenceNumber_)
+Z_ID(GSDKPing, simplePing_didStartWithAddress_)
+Z_ID(GSDKPingDetect, simplePing_didFailToSendPacket_sequenceNumber_error_)
+Z_ID(GSDKPingDetect, simplePing_didFailWithError_)
+Z_ID(GSDKPingDetect, simplePing_didReceivePingResponsePacket_sequenceNumber_)
+Z_ID(GSDKPingDetect, simplePing_didReceiveUnexpectedPacket_)
+Z_ID(GSDKPingDetect, simplePing_didSendPacket_sequenceNumber_)
+Z_ID(GSDKPingDetect, simplePing_didStartWithAddress_)
+Z_ID(PingDelegate, simplePing_didFailToSendPacket_sequenceNumber_error_)
+Z_ID(PingDelegate, simplePing_didSendPacket_sequenceNumber_)
+Z_ID(SimplePing, didFailWithError_)
+Z_ID(SimplePing, sendPingWithData_)
+Z_ID(SimplePing, validatePingResponsePacket_sequenceNumber_)
+Z_ID(SimplePing, pingPacketWithType_payload_requiresChecksum_)
+
+#pragma mark =========================================================
+#pragma mark 9. VOICE (GVoice / GCloud) HOOKS
+#pragma mark =========================================================
+
+Z_ID(GVGCloudVoice, openMic)
+Z_ID(GVGCloudVoice, openSpeaker)
+Z_V_A(GVGCloudVoice, setAppInfo_withKey_andOpenID_, a)   // simplify: 3 args tidak dipakai
+Z_ID(GVGCloudVoiceExtension, GetBGMPlayState)
+Z_ID(GVGCloudVoiceExtension, GetMicState)
+Z_ID(GVGCloudVoiceExtension, GetSpeakerState)
+Z_ID(GVGCloudVoiceExtension, EnableKeyWordsDetect_)       // simplify
+Z_ID(GVoiceMuteSwitch, detectMuteSwitch)
+Z_ID(GCloudVoiceEngine, StartTve)
+Z_ID(GCloudVoiceEngine, StopRecording)
+Z_ID(GCloudVoiceEngine, TestMic)
+Z_ID(GCloudVoiceEngine, StartBGMPlay)
+Z_ID(GCloudVoiceEngine, StopBGMPlay)
+Z_ID(GCloudVoiceEngine, PauseBGMPlay)
+Z_ID(GCloudVoiceEngine, ResumeBGMPlay)
+Z_ID(GCloudVoiceEngine, RSTSStopRecording)
+Z_ID(GCloudVoiceEngine, TextToStreamSpeechStop)
+Z_ID(GCloudVoiceEngine, StartPreview)
+Z_ID(GCloudVoiceEngine, StopPreview)
+Z_ID(GCloudVoiceEngine, PauseKaraoke)
+Z_ID(GCloudVoiceEngine, ResumeKaraoke)
+Z_ID(GCloudVoiceEngine, GetMicLevel)
+Z_ID(GCloudVoiceEngine, GetSpeakerLevel)
+Z_ID(GCloudVoiceEngine, GetBGMLevel)
+Z_ID(GCloudVoiceEngine, GetBGMFileTime)
+Z_ID(GCloudVoiceEngine, GetBGMPlayTime)
+Z_ID(GCloudVoiceEngine, GetRecordKaraokeTotalTime)
+Z_ID(GCloudVoiceEngine, StopKaraokeRecording)
+Z_ID(GCloudCoreRemoteConfig, updateConfig_)
+Z_ID(GCloudCoreRemoteConfig, getConfig_)
+Z_ID(GCloudUnityPlugin, Initialize)
+Z_ID(GCloudUnityPlugin, ReportEvent)
+Z_ID(GCloudUnityPlugin, SetGameObjectName_)
+Z_ID(GCloudVoiceEngine, GetFileParam_data_time_)
+
+Z_V_AII(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout_, a, b, c)
+Z_V_AI(GCloudVoiceEngine, QuitRoom_Scenes_timeout_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableMultiRoom_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableRoomMicrophone_enable_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableRoomSpeaker_enable_, a, b)
+Z_V_AII(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout_, a, b, c)
+Z_V_A(GCloudVoiceEngine, StartRecording_, a)
+Z_V_A(GCloudVoiceEngine, SetBGMPath_, a)
+Z_V_A(GCloudVoiceEngine, SetLogCallBack_, a)
+Z_V_AI(GCloudVoiceEngine, SetMicVolume_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetSpeakerVolume_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetBitRate_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetDataFree_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetReportBufferTime_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetBGMPlayTime_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetKaraokeVoiceVol_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetKaraokeAccVol_, a, b)
+Z_V_AI(GCloudVoiceEngine, SetKaraokeVoiceDelay_, a, b)
+Z_V_AI(GCloudVoiceEngine, SeekTimeMsForPreview_, a, b)
+Z_V_AI(GCloudVoiceEngine, SeekTimeMsForAcc_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableLog_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableNativeBGMPlay_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableRecvMagicVoice_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableReportALL_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableReportALLAbroad_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableReportForAbroad_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableCivilFile_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableCivilVoice_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableEarBack_, a, b)
+Z_V_AB(GCloudVoiceEngine, EnableAccFilePlay_, a, b)
+
+#pragma mark =========================================================
+#pragma mark 10. ADS / FIREBASE / QQ / IMSDK / APM
+#pragma mark =========================================================
+
+Z_ID(FIRMessagingRmqManager, openDatabase)
+Z_ID(FIRMessaging, APNSToken)
+Z_ID(FIRMessaging, retrieveFCMTokenForSenderID_completion_)
+Z_ID(FIRMessaging, deleteFCMTokenForSenderID_completion_)
+Z_ID(FIRMessaging, subscribeToTopic_completion_)
+Z_ID(FIRMessaging, unsubscribeFromTopic_completion_)
+Z_ID(FIRMessaging, setAPNSToken_withUserInfo_)
+Z_ID(GADMobileAds, initializationStatus)
+Z_ID(GADAppOpenAd, responseInfo)
+Z_ID(GADAppOpenAd, adDidRecordClick_)
+Z_ID(GADAppOpenAd, adDidRecordImpression_)
+Z_ID(GADAppOpenAd, adWillPresentFullScreenContent_)
+Z_ID(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError_)
+Z_ID(GADAppOpenAd, setPaidEventHandler_)
+Z_ID(GADAdNetworkResponseInfo, adUnitMapping)
+Z_ID(FBAdViewabilityValidator, checkViewability_)
+Z_ID(FBAdMonitor, startMonitoringAd_)
+Z_ID(FBAdViewabilityValidator, stopMonitoring)
+Z_ID(FBAdMonitor, stopMonitoring)
+Z_ID(FBAdEvent, logEvent_withParameters_)
+Z_ID(FBAdLogger, logMessage_withLevel_)
+Z_ID(QQApiInterface, sendReq_resultBlock_)
+Z_ID(QQApiInterface, sendThirdAppBindGroupReq_resultBlock_)
+Z_ID(QQApiInterface, sendThirdAppUnBindGroupReq_resultBlock_)
+Z_ID(QQApiInterface, sendThirdAppJoinGroupReq_resultBlock_)
+Z_ID(QQApiInterface, sendQueryQQGroupProInfo_resultBlock_)
+Z_ID(QQApiInterface, sendMessageToQQAuthWithReq_)
+Z_ID(QQApiInterface, sendMessageToQQAvatarWithReq_)
+Z_ID(QQApiInterface, sendMessageToFaceCollectionWithReq_)
+Z_ID(QQOpenApiUtility, cgiRequestGetSdkConfig_)
+Z_ID(TDataMasterApplication, handleOpenURL_)
+Z_ID(TDataMasterApplication, reportEventWithSrcID_eventName_AndEventKVArray_)
+Z_ID(TcApiTool, openUniversallinkIfNeed_)
+Z_ID(GTMSessionFetcher, setSystemCompletionHandler_forSessionIdentifier_)
+Z_ID(IMSDKCustomWebView, dealloc)
+Z_ID(IMSDKNoticeIMSDKManager, getImageCache_imagePath_imageHash_queue_completeHandle_)
+Z_ID(IMSDKNoticeIMSDKManager, imsdkCoreKitNoticeImageFileHash_)
+Z_ID(IMSDKStatAdjustManager, reportEvent_eventBody_isRealtime_)
+Z_ID(IMSDKStatAdjustManager, reportEvent_params_isRealtime_)
+Z_ID(IMSDKStatAdjustManager, reportPurchase_currentCode_expense_isRealTime_)
+Z_ID(IMSDKStatAdjustManager, reportRevenue_currencyCode_revenueValue_params_extraJson_)
+Z_ID(INTLWebViewManager, openURL_observerID_baseParams_)
+Z_ID(APMMonitor, handleEvent_)
+Z_ID(APMMonitor, startMonitoring_)
+Z_ID(APMDeviceInfoSupport, getBatteryState)
+Z_ID(APMDeviceInfoSupport, getThermalState)
+Z_ID(APMCollector, collectMetrics_)
+Z_ID(APMCollector, reportNow_)
+Z_ID(TApmSceneMarker, markLoadLevel_)
+Z_ID(TApmSceneMarker, markLevelFin)
+Z_ID(TApmSceneMarker, postStepEvent_)
+Z_ID(TApmSceneMarker, postStreamEvent_)
+Z_ID(serviceCommunication, getValueForKeypath)
+Z_ID(AudioDeviceMgr, GetAudioDeviceConnectState)
+Z_ID(AudioDeviceMgr, UpdateDeviceState_)
+Z_ID(TikTokAuth, authorizeWithPermissions_)
+Z_ID(TikTokAuth, handleOpenURL_)
+Z_ID(VKAuth, authorizeWithPermissions_)
+Z_ID(VKAuth, logout)
+Z_ID(SCSDKLoginClient, loginWithCompletion_)
+Z_ID(SCSDKLoginClient, logout)
+
+#pragma mark =========================================================
+#pragma mark 11. ADVERTISING / TRACKING
+#pragma mark =========================================================
+
+static NSString *SBXK_ASIdentifierManager_advertisingIdentifier(id s, SEL c) {
+    (void)s; (void)c;
+    return @"00000000-0000-0000-0000-000000000000";
+}
+static NSInteger SBXK_ATTrackingManager_trackingAuthorizationStatus(id s, SEL c) {
+    (void)s; (void)c;
+    return 3; // authorized
+}
+
+#pragma mark =========================================================
+#pragma mark 12. NSFileManager SWIZZLE
+#pragma mark =========================================================
+
 static NSArray<NSString *> *SBXK_JailbreakPrefixes(void) {
     static NSArray *arr;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         arr = @[
-            @"/Applications/Cydia.app",
-            @"/Applications/Sileo.app",
-            @"/Applications/Zebra.app",
-            @"/bin/bash",
-            @"/bin/sh",
-            @"/etc/apt",
-            @"/usr/bin/ssh",
-            @"/usr/sbin/sshd",
-            @"/private/var/lib/apt",
-            @"/Library/MobileSubstrate",
+            @"/Applications/Cydia.app", @"/Applications/Sileo.app",
+            @"/Applications/Zebra.app", @"/bin/bash", @"/bin/sh",
+            @"/etc/apt", @"/usr/bin/ssh", @"/usr/sbin/sshd",
+            @"/private/var/lib/apt", @"/Library/MobileSubstrate",
             @"/var/log/syslog"
         ];
     });
@@ -698,28 +693,48 @@ static BOOL SBXK_NSFileManager_fileExistsAtPath_(id self, SEL _cmd, NSString *pa
     for (NSString *p in SBXK_JailbreakPrefixes()) {
         if ([path isEqualToString:p] || [path hasPrefix:p]) return NO;
     }
-    // panggil original — kita sudah class_replaceMethod, jadi panggil via method_getImplementation
-    IMP orig = class_getMethodImplementation([self class], @selector(SBXK_original_fileExistsAtPath:));
+    IMP orig = class_getMethodImplementation([self class], @selector(SBXK_orig_fileExistsAtPath:));
     if (orig) {
         BOOL (*fn)(id, SEL, NSString *) = (void *)orig;
-        return fn(self, @selector(SBXK_original_fileExistsAtPath:), path);
-    }
-    return NO;
-}
-static BOOL SBXK_NSFileManager_fileExistsAtPath_isDirectory_(id self, SEL _cmd, NSString *path, BOOL *isDir) {
-    for (NSString *p in SBXK_JailbreakPrefixes()) {
-        if ([path isEqualToString:p] || [path hasPrefix:p]) { if (isDir) *isDir = NO; return NO; }
-    }
-    IMP orig = class_getMethodImplementation([self class], @selector(SBXK_original_fileExistsAtPath:isDirectory:));
-    if (orig) {
-        BOOL (*fn)(id, SEL, NSString *, BOOL *) = (void *)orig;
-        return fn(self, @selector(SBXK_original_fileExistsAtPath:isDirectory:), path, isDir);
+        return fn(self, @selector(SBXK_orig_fileExistsAtPath:), path);
     }
     return NO;
 }
 
+static BOOL SBXK_NSFileManager_fileExistsAtPath_isDirectory_(id self, SEL _cmd, NSString *path, BOOL *isDir) {
+    for (NSString *p in SBXK_JailbreakPrefixes()) {
+        if ([path isEqualToString:p] || [path hasPrefix:p]) { if (isDir) *isDir = NO; return NO; }
+    }
+    IMP orig = class_getMethodImplementation([self class], @selector(SBXK_orig_fileExistsAtPath:isDirectory:));
+    if (orig) {
+        BOOL (*fn)(id, SEL, NSString *, BOOL *) = (void *)orig;
+        return fn(self, @selector(SBXK_orig_fileExistsAtPath:isDirectory:), path, isDir);
+    }
+    return NO;
+}
+
+static void SBXK_InstallFileManagerSwizzle(void) {
+    Class fm = [NSFileManager class];
+
+    Method m1 = class_getInstanceMethod(fm, @selector(fileExistsAtPath:));
+    if (m1) {
+        class_addMethod(fm, @selector(SBXK_orig_fileExistsAtPath:),
+                        method_getImplementation(m1),
+                        method_getTypeEncoding(m1));
+        method_setImplementation(m1, (IMP)SBXK_NSFileManager_fileExistsAtPath_);
+    }
+
+    Method m2 = class_getInstanceMethod(fm, @selector(fileExistsAtPath:isDirectory:));
+    if (m2) {
+        class_addMethod(fm, @selector(SBXK_orig_fileExistsAtPath:isDirectory:),
+                        method_getImplementation(m2),
+                        method_getTypeEncoding(m2));
+        method_setImplementation(m2, (IMP)SBXK_NSFileManager_fileExistsAtPath_isDirectory_);
+    }
+}
+
 #pragma mark =========================================================
-#pragma mark 8. APPDLEGATE — anti-tamper & alert
+#pragma mark 13. APPDLEGATE PROXY + BANNER
 #pragma mark =========================================================
 
 @interface SBXK_AppDelegateProxy : NSObject
@@ -737,7 +752,6 @@ static BOOL SBXK_NSFileManager_fileExistsAtPath_isDirectory_(id self, SEL _cmd, 
 
     IMP orig = method_getImplementation(m);
     IMP newI = imp_implementationWithBlock(^BOOL(id self, UIApplication *app, NSDictionary *opts) {
-        // Panggil original via fungsi tersimpan.
         BOOL (*fn)(id, SEL, UIApplication *, NSDictionary *) = (void *)orig;
         BOOL r = fn(self, swz, app, opts);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
@@ -770,17 +784,19 @@ static BOOL SBXK_NSFileManager_fileExistsAtPath_isDirectory_(id self, SEL _cmd, 
     }
     if (!w || !w.rootViewController) return;
 
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"AMAR VIP 2026"
-                                                               message:@"حماية عمار مفعلة 😎\nالحساب الآن تحت الحماية الشبحية."
-                                                        preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"استمرار" style:UIAlertActionStyleDefault handler:nil]];
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"AMAR VIP 2026"
+        message:@"حماية عمار مفعلة 😎\nالحساب الآن تحت الحماية الشبحية."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"استمرار"
+                                          style:UIAlertActionStyleDefault handler:nil]];
     [w.rootViewController presentViewController:a animated:YES completion:nil];
 }
 
 @end
 
 #pragma mark =========================================================
-#pragma mark 9. FILE CLEANUP TIMER (setiap 30 detik)
+#pragma mark 14. FILE CLEANUP TIMER
 #pragma mark =========================================================
 
 static void SBXK_DeleteSensitiveFiles(void) {
@@ -807,280 +823,262 @@ static void SBXK_StartCleanupTimer(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 10. INSTALL SWIZZLES (safe — cek class/method dulu)
+#pragma mark 15. INSTALL ALL SWIZZLES
 #pragma mark =========================================================
 
 static void SBXK_InstallAllSwizzles(void) {
+    // Detection
+    HOOK_I(IntegrityChecker, integrity_detect);
+    HOOK_I(IntegrityChecker, MTML_INTEGRITY_DETECT);
+    HOOK_I(JailbreakDetector, isJailbroken);
+    HOOK_I(JailbreakDetector, isJailbreak);
+    HOOK_I(JailbreakDetector, checkJailbreak);
+    HOOK_I(JailbreakDetector, jailbreakDetection);
+    HOOK_I(SimulatorDetector, isSimulator);
+    HOOK_I(SimulatorDetector, isSimulatorDevice);
+    HOOK_I(SimulatorDetector, checkSimulator);
+    HOOK_I(SecurityChecker, IsFileSystemModified);
+    HOOK_I(SecurityChecker, isDebuggerAttached);
+    HOOK_I(SecurityChecker, isDebugged);
+    HOOK_I(SecurityChecker, checkDebugger);
+    HOOK_I(SecurityChecker, amIBeingDebugged);
+    HOOK_I(SecurityChecker, checkDebuggerAttach);
+    HOOK_I(SecurityChecker, isHooked);
+    HOOK_I(SecurityChecker, isHookDetected);
+    HOOK_I(SecurityChecker, checkHook);
+    HOOK_I(SecurityChecker, detectHook);
+    HOOK_I(SecurityChecker, antiHookCheck);
+    HOOK_I(SecurityChecker, isTampered);
+    HOOK_I(SecurityChecker, checkTamper);
+    HOOK_I(SecurityChecker, antiTamperCheck);
+    HOOK_I(SecurityChecker, isInjected);
+    HOOK_I(SecurityChecker, isLibraryInjected);
+    HOOK_I(SecurityChecker, checkInjection);
+    HOOK_I(SecurityChecker, antiInjectionCheck);
+    HOOK_I(SecurityChecker, isReversingDetected);
+    HOOK_I(SecurityChecker, checkReversing);
+    HOOK_I(SecurityChecker, antiReversingCheck);
+    HOOK_I(SecurityChecker, isBlocked);
+    HOOK_I(SecurityChecker, antiBlockingCheck);
+    HOOK_I(SecurityChecker, verifyIntegrity);
+    HOOK_I(SecurityChecker, checkTokenValid);
+    HOOK_I(SecurityChecker, checkConfigSignValidity);
+    HOOK_I(SecurityChecker, verify_file_md5);
+    HOOK_I(SecurityChecker, CheckFileMd5);
+    HOOK_I(SecurityChecker, CheckFileHeader);
+    HOOK_I(SecurityChecker, IsFileExistInResDir);
+    HOOK_I(SecurityChecker, verifySignature);
 
-    // --- Integrity / detect (dipasang hanya kalau class-nya ada) ---
-    SBXK_HOOK_I(IntegrityChecker, integrity_detect);
-    SBXK_HOOK_I(IntegrityChecker, MTML_INTEGRITY_DETECT);
-    SBXK_HOOK_I(JailbreakDetector, isJailbroken);
-    SBXK_HOOK_I(JailbreakDetector, isJailbreak);
-    SBXK_HOOK_I(JailbreakDetector, checkJailbreak);
-    SBXK_HOOK_I(SecurityChecker, IsFileSystemModified);
-    SBXK_HOOK_I(SecurityChecker, isDebuggerAttached);
-    SBXK_HOOK_I(SecurityChecker, isHooked);
-    SBXK_HOOK_I(SecurityChecker, isTampered);
-    SBXK_HOOK_I(SecurityChecker, isInjected);
+    // Game logic
+    HOOK_I(WeaponProcessor, CalculateDamage);
+    HOOK_I(CharacterMovement, IsSpeedExceeded);
+    HOOK_I(BulletSimulator, CheckWallCollision);
+    HOOK_I(NetworkManager, SendSecurityReport);
 
-    // --- Game logic (biasanya di bundle game; nama class di-reflect) ---
-    SBXK_HOOK_I(WeaponProcessor, CalculateDamage);
-    SBXK_HOOK_I(CharacterMovement, IsSpeedExceeded);
-    SBXK_HOOK_I(BulletSimulator, CheckWallCollision);
-    SBXK_HOOK_I(NetworkManager, SendSecurityReport);
+    // GSDK
+    HOOK_I(GSDKCPU, getSystemCPUCircle);
+    HOOK_I(GSDKMemory, getSystemAvailableMemory);
+    HOOK_I(GSDKInGameManager, GSDKRealTimeDetect);
+    HOOK_I(GSDKInGameSystem, GSDKInnerEnd);
+    HOOK_I(GSDKInGameSystem, GSDKInnerRealTimeDetect);
+    HOOK_I(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots_);
+    HOOK_I(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP_);
+    HOOK_I(GSDKInitManager, detectOperation_);
+    HOOK_I(GSDKPayEvent, GSDKPay_Tag_Status_Msg_);
+    HOOK_I(GSDKHttpDnsResolver, dealloc);
+    HOOK_I(GSDKHttpRequest, dealloc);
+    HOOK_I(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env_);
+    HOOK_I(GSDKDetectPort, isConnection_Port_);
+    HOOK_I(GSDKRealTimeDetect, pingDelayDetect_);
+    HOOK_I(GSDKRealTimeDetect, updDelayDetect_Port_);
+    HOOK_I(GSDKUdpDetect, isUDPConnect_Port_);
+    HOOK_I(GSDKWIFI, ping_);
+    HOOK_I(GSDKPing, dealloc);
+    HOOK_I(GSDKPing, ping);
+    HOOK_I(GSDKPing, stopPing);
+    HOOK_I(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error_);
+    HOOK_I(GSDKPing, simplePing_didFailWithError_);
+    HOOK_I(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber_);
+    HOOK_I(GSDKPing, simplePing_didReceiveUnexpectedPacket_);
+    HOOK_I(GSDKPing, simplePing_didSendPacket_sequenceNumber_);
+    HOOK_I(GSDKPing, simplePing_didStartWithAddress_);
+    HOOK_I(GSDKPingDetect, dealloc);
+    HOOK_I(GSDKPingDetect, ping);
+    HOOK_I(GSDKPingDetect, simplePing_didFailToSendPacket_sequenceNumber_error_);
+    HOOK_I(GSDKPingDetect, simplePing_didFailWithError_);
+    HOOK_I(GSDKPingDetect, simplePing_didReceivePingResponsePacket_sequenceNumber_);
+    HOOK_I(GSDKPingDetect, simplePing_didReceiveUnexpectedPacket_);
+    HOOK_I(GSDKPingDetect, simplePing_didSendPacket_sequenceNumber_);
+    HOOK_I(GSDKPingDetect, simplePing_didStartWithAddress_);
+    HOOK_I(PingDelegate, pingTimer);
+    HOOK_I(PingDelegate, simplePing_didFailToSendPacket_sequenceNumber_error_);
+    HOOK_I(PingDelegate, simplePing_didSendPacket_sequenceNumber_);
+    HOOK_I(SimplePing, dealloc);
+    HOOK_I(SimplePing, didFailWithError_);
+    HOOK_I(SimplePing, pingPacketWithType_payload_requiresChecksum_);
+    HOOK_I(SimplePing, readData);
+    HOOK_I(SimplePing, sendPingWithData_);
+    HOOK_I(SimplePing, start);
+    HOOK_I(SimplePing, startWithHostAddress);
+    HOOK_I(SimplePing, validatePingResponsePacket_sequenceNumber_);
 
-    // --- GSDK (Tencent) ---
-    SBXK_HOOK_I(GSDKCPU, getSystemCPUCircle);
-    SBXK_HOOK_I(GSDKMemory, getSystemAvailableMemory);
-    SBXK_HOOK_I(GSDKInGameManager, GSDKRealTimeDetect);
-    SBXK_HOOK_I(GSDKInGameSystem, GSDKInnerEnd);
-    SBXK_HOOK_I(GSDKInGameSystem, GSDKInnerRealTimeDetect);
-    SBXK_HOOK_I(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots_);
-    SBXK_HOOK_I(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP_);
-    SBXK_HOOK_I(GSDKInitManager, detectOperation_);
-    SBXK_HOOK_I(GSDKPayEvent, GSDKPay_Tag_Status_Msg_);
-    SBXK_HOOK_I(GSDKPing, dealloc);
-    SBXK_HOOK_I(GSDKPing, ping);
-    SBXK_HOOK_I(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error_);
-    SBXK_HOOK_I(GSDKPing, simplePing_didFailWithError_);
-    SBXK_HOOK_I(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber_);
-    SBXK_HOOK_I(GSDKPing, simplePing_didReceiveUnexpectedPacket_);
-    SBXK_HOOK_I(GSDKPing, simplePing_didSendPacket_sequenceNumber_);
-    SBXK_HOOK_I(GSDKPing, simplePing_didStartWithAddress_);
-    SBXK_HOOK_I(GSDKPing, stopPing);
-    SBXK_HOOK_I(GSDKPingDetect, dealloc);
-    SBXK_HOOK_I(GSDKPingDetect, ping);
-    SBXK_HOOK_I(GSDKPingDetect, simplePing_didFailToSendPacket_sequenceNumber_error_);
-    SBXK_HOOK_I(GSDKPingDetect, simplePing_didFailWithError_);
-    SBXK_HOOK_I(GSDKPingDetect, simplePing_didReceivePingResponsePacket_sequenceNumber_);
-    SBXK_HOOK_I(GSDKPingDetect, simplePing_didReceiveUnexpectedPacket_);
-    SBXK_HOOK_I(GSDKPingDetect, simplePing_didSendPacket_sequenceNumber_);
-    SBXK_HOOK_I(GSDKPingDetect, simplePing_didStartWithAddress_);
-    SBXK_HOOK_I(GSDKRealTimeDetect, pingDelayDetect_);
-    SBXK_HOOK_I(GSDKRealTimeDetect, updDelayDetect_Port_);
-    SBXK_HOOK_I(GSDKUdpDetect, isUDPConnect_Port_);
-    SBXK_HOOK_I(GSDKWIFI, ping_);
-    SBXK_HOOK_I(GSDKHttpDnsResolver, dealloc);
-    SBXK_HOOK_I(GSDKHttpRequest, dealloc);
-    SBXK_HOOK_I(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env_);
-    SBXK_HOOK_I(GSDKDetectPort, isConnection_Port_);
+    // Voice
+    HOOK_I(GVGCloudVoice, openMic);
+    HOOK_I(GVGCloudVoice, openSpeaker);
+    HOOK_I(GVGCloudVoice, setAppInfo_withKey_andOpenID_);
+    HOOK_I(GVGCloudVoiceExtension, CheckDeviceMuteStat);
+    HOOK_I(GVGCloudVoiceExtension, EnableKeyWordsDetect_);
+    HOOK_I(GVGCloudVoiceExtension, GetBGMPlayState);
+    HOOK_I(GVGCloudVoiceExtension, GetMicState);
+    HOOK_I(GVGCloudVoiceExtension, GetSpeakerState);
+    HOOK_I(GVoiceMuteSwitch, detectMuteSwitch);
+    HOOK_I(GCloudVoiceEngine, StartTve);
+    HOOK_I(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout_);
+    HOOK_I(GCloudVoiceEngine, QuitRoom_Scenes_timeout_);
+    HOOK_I(GCloudVoiceEngine, EnableMultiRoom_);
+    HOOK_I(GCloudVoiceEngine, EnableRoomMicrophone_enable_);
+    HOOK_I(GCloudVoiceEngine, EnableRoomSpeaker_enable_);
+    HOOK_I(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout_);
+    HOOK_I(GCloudVoiceEngine, StartRecording_);
+    HOOK_I(GCloudVoiceEngine, StopRecording);
+    HOOK_I(GCloudVoiceEngine, EnableLog_);
+    HOOK_I(GCloudVoiceEngine, SetLogCallBack_);
+    HOOK_I(GCloudVoiceEngine, GetMicLevel);
+    HOOK_I(GCloudVoiceEngine, GetSpeakerLevel);
+    HOOK_I(GCloudVoiceEngine, SetMicVolume_);
+    HOOK_I(GCloudVoiceEngine, SetSpeakerVolume_);
+    HOOK_I(GCloudVoiceEngine, TestMic);
+    HOOK_I(GCloudVoiceEngine, GetFileParam_data_time_);
+    HOOK_I(GCloudVoiceEngine, SetBGMPath_);
+    HOOK_I(GCloudVoiceEngine, StartBGMPlay);
+    HOOK_I(GCloudVoiceEngine, StopBGMPlay);
+    HOOK_I(GCloudVoiceEngine, PauseBGMPlay);
+    HOOK_I(GCloudVoiceEngine, ResumeBGMPlay);
+    HOOK_I(GCloudVoiceEngine, EnableNativeBGMPlay_);
+    HOOK_I(GCloudVoiceEngine, SetBitRate_);
+    HOOK_I(GCloudVoiceEngine, SetDataFree_);
+    HOOK_I(GCloudVoiceEngine, RSTSStopRecording);
+    HOOK_I(GCloudVoiceEngine, TextToStreamSpeechStop);
+    HOOK_I(GCloudVoiceEngine, EnableRecvMagicVoice_);
+    HOOK_I(GCloudVoiceEngine, EnableReportALL_);
+    HOOK_I(GCloudVoiceEngine, EnableReportALLAbroad_);
+    HOOK_I(GCloudVoiceEngine, EnableReportForAbroad_);
+    HOOK_I(GCloudVoiceEngine, EnableCivilFile_);
+    HOOK_I(GCloudVoiceEngine, EnableCivilVoice_);
+    HOOK_I(GCloudVoiceEngine, EnableEarBack_);
+    HOOK_I(GCloudVoiceEngine, StopKaraokeRecording);
+    HOOK_I(GCloudVoiceEngine, EnableAccFilePlay_);
+    HOOK_I(GCloudVoiceEngine, SetKaraokeVoiceVol_);
+    HOOK_I(GCloudVoiceEngine, SetKaraokeAccVol_);
+    HOOK_I(GCloudVoiceEngine, SetKaraokeVoiceDelay_);
+    HOOK_I(GCloudVoiceEngine, StartPreview);
+    HOOK_I(GCloudVoiceEngine, StopPreview);
+    HOOK_I(GCloudVoiceEngine, SeekTimeMsForPreview_);
+    HOOK_I(GCloudVoiceEngine, SeekTimeMsForAcc_);
+    HOOK_I(GCloudVoiceEngine, PauseKaraoke);
+    HOOK_I(GCloudVoiceEngine, ResumeKaraoke);
+    HOOK_I(GCloudVoiceEngine, GetRecordKaraokeTotalTime);
+    HOOK_I(GCloudVoiceEngine, GetBGMLevel);
+    HOOK_I(GCloudVoiceEngine, SetReportBufferTime_);
+    HOOK_I(GCloudVoiceEngine, GetBGMFileTime);
+    HOOK_I(GCloudVoiceEngine, GetBGMPlayTime);
+    HOOK_I(GCloudVoiceEngine, SetBGMPlayTime_);
 
-    // --- Ping / SimplePing ---
-    SBXK_HOOK_I(PingDelegate, pingTimer);
-    SBXK_HOOK_I(PingDelegate, simplePing_didFailToSendPacket_sequenceNumber_error_);
-    SBXK_HOOK_I(PingDelegate, simplePing_didSendPacket_sequenceNumber_);
-    SBXK_HOOK_I(SimplePing, dealloc);
-    SBXK_HOOK_I(SimplePing, didFailWithError_);
-    SBXK_HOOK_I(SimplePing, pingPacketWithType_payload_requiresChecksum_);
-    SBXK_HOOK_I(SimplePing, readData);
-    SBXK_HOOK_I(SimplePing, sendPingWithData_);
-    SBXK_HOOK_I(SimplePing, start);
-    SBXK_HOOK_I(SimplePing, startWithHostAddress);
-    SBXK_HOOK_I(SimplePing, validatePingResponsePacket_sequenceNumber_);
+    // GCloud core
+    HOOK_I(GCloudCoreRemoteConfig, updateConfig_);
+    HOOK_I(GCloudCoreRemoteConfig, getConfig_);
+    HOOK_I(GCloudUnityPlugin, Initialize);
+    HOOK_I(GCloudUnityPlugin, ReportEvent);
+    HOOK_I(GCloudUnityPlugin, SetGameObjectName_);
 
-    // --- Voice (GVoice) ---
-    SBXK_HOOK_I(GVGCloudVoice, openMic);
-    SBXK_HOOK_I(GVGCloudVoice, openSpeaker);
-    SBXK_HOOK_I(GVGCloudVoice, setAppInfo_withKey_andOpenID_);
-    SBXK_HOOK_I(GVGCloudVoiceExtension, CheckDeviceMuteStat);
-    SBXK_HOOK_I(GVGCloudVoiceExtension, EnableKeyWordsDetect_);
-    SBXK_HOOK_I(GVGCloudVoiceExtension, GetBGMPlayState);
-    SBXK_HOOK_I(GVGCloudVoiceExtension, GetMicState);
-    SBXK_HOOK_I(GVGCloudVoiceExtension, GetSpeakerState);
-    SBXK_HOOK_I(GVoiceMuteSwitch, detectMuteSwitch);
-    SBXK_HOOK_I(GCloudVoiceEngine, StartTve);
-    SBXK_HOOK_I(GCloudVoiceEngine, JoinTeamRoom_Scenes_roomName_timeout_);
-    SBXK_HOOK_I(GCloudVoiceEngine, QuitRoom_Scenes_timeout_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableMultiRoom_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableRoomMicrophone_enable_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableRoomSpeaker_enable_);
-    SBXK_HOOK_I(GCloudVoiceEngine, ApplyMessageKey_timestamp_timeout_);
-    SBXK_HOOK_I(GCloudVoiceEngine, StartRecording_);
-    SBXK_HOOK_I(GCloudVoiceEngine, StopRecording);
-    SBXK_HOOK_I(GCloudVoiceEngine, UploadRecordedFile_timeout_fileProperty_);
-    SBXK_HOOK_I(GCloudVoiceEngine, DownloadRecordedFile_filePath_timeout_fileProperty_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableLog_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetLogCallBack_);
-    SBXK_HOOK_I(GCloudVoiceEngine, GetMicLevel);
-    SBXK_HOOK_I(GCloudVoiceEngine, GetSpeakerLevel);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetMicVolume_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetSpeakerVolume_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SpeechToText_token_timestamp_timeout_language_);
-    SBXK_HOOK_I(GCloudVoiceEngine, ForbidMemberVoice_enable_inRoom_);
-    SBXK_HOOK_I(GCloudVoiceEngine, TestMic);
-    SBXK_HOOK_I(GCloudVoiceEngine, GetFileParam_data_time_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetBGMPath_);
-    SBXK_HOOK_I(GCloudVoiceEngine, StartBGMPlay);
-    SBXK_HOOK_I(GCloudVoiceEngine, StopBGMPlay);
-    SBXK_HOOK_I(GCloudVoiceEngine, PauseBGMPlay);
-    SBXK_HOOK_I(GCloudVoiceEngine, ResumeBGMPlay);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableNativeBGMPlay_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetBitRate_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetDataFree_);
-    SBXK_HOOK_I(GCloudVoiceEngine, RSTSStartRecording_targetLang_targetLangCnt_action_timeout_recordFilePath_);
-    SBXK_HOOK_I(GCloudVoiceEngine, RSTSSpeechToSpeech_targetLang_targetLangCnt_dirPath_voiceType_voiceRate_volume_timeout_recordFilePath_);
-    SBXK_HOOK_I(GCloudVoiceEngine, RSTSSpeechToText_targetLang_targetLangCnt_timeout_recordFilePath_srcLangStr_extInfo_);
-    SBXK_HOOK_I(GCloudVoiceEngine, RSTSStopRecording);
-    SBXK_HOOK_I(GCloudVoiceEngine, TextToStreamSpeechStart_voiceType_timeout_filePath_);
-    SBXK_HOOK_I(GCloudVoiceEngine, TextToStreamSpeechStop);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableTranslate_isEnable_lang_transType_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableMagicVoice_isEnable_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableRecvMagicVoice_);
-    SBXK_HOOK_I(GCloudVoiceEngine, RoomGeneralDataChannel_content_);
-    SBXK_HOOK_I(GCloudVoiceEngine, APITrace_callInfo_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetPlayerInfoAbroad_members_lang_count_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableReportALL_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableReportALLAbroad_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableReportForAbroad_);
-    SBXK_HOOK_I(GCloudVoiceEngine, ReportFileForAbroad_bTranslate_bChangeVoice_time_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableCivilFile_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableCivilVoice_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetCivilBinPath_);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableEarBack_);
-    SBXK_HOOK_I(GCloudVoiceEngine, StartKaraokeRecording_accfile_orifile_);
-    SBXK_HOOK_I(GCloudVoiceEngine, StopKaraokeRecording);
-    SBXK_HOOK_I(GCloudVoiceEngine, EnableAccFilePlay_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetKaraokeVoiceVol_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetKaraokeAccVol_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetKaraokeVoiceDelay_);
-    SBXK_HOOK_I(GCloudVoiceEngine, StartPreview);
-    SBXK_HOOK_I(GCloudVoiceEngine, StopPreview);
-    SBXK_HOOK_I(GCloudVoiceEngine, SeekTimeMsForPreview_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SeekTimeMsForAcc_);
-    SBXK_HOOK_I(GCloudVoiceEngine, PauseKaraoke);
-    SBXK_HOOK_I(GCloudVoiceEngine, ResumeKaraoke);
-    SBXK_HOOK_I(GCloudVoiceEngine, GetRecordKaraokeTotalTime);
-    SBXK_HOOK_I(GCloudVoiceEngine, GetBGMLevel);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetReportedPlayerInfo_arg1_arg2_);
-    SBXK_HOOK_I(GCloudVoiceEngine, ReportPlayer_arg1_arg2_);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetReportBufferTime_);
-    SBXK_HOOK_I(GCloudVoiceEngine, GetBGMFileTime);
-    SBXK_HOOK_I(GCloudVoiceEngine, GetBGMPlayTime);
-    SBXK_HOOK_I(GCloudVoiceEngine, SetBGMPlayTime_);
+    // APM
+    HOOK_I(APMMonitor, handleEvent_);
+    HOOK_I(APMMonitor, startMonitoring_);
+    HOOK_I(APMDeviceInfoSupport, getBatteryState);
+    HOOK_I(APMDeviceInfoSupport, getThermalState);
+    HOOK_I(APMCollector, collectMetrics_);
+    HOOK_I(APMCollector, reportNow_);
+    HOOK_I(TApmSceneMarker, markLoadLevel_);
+    HOOK_I(TApmSceneMarker, markLevelFin);
+    HOOK_I(TApmSceneMarker, postStepEvent_);
+    HOOK_I(TApmSceneMarker, postStreamEvent_);
 
-    // --- GCloud core ---
-    SBXK_HOOK_I(GCloudCoreRemoteConfig, updateConfig_);
-    SBXK_HOOK_I(GCloudCoreRemoteConfig, getConfig_);
-    SBXK_HOOK_I(GCloudUnityPlugin, Initialize);
-    SBXK_HOOK_I(GCloudUnityPlugin, ReportEvent);
-    SBXK_HOOK_I(GCloudUnityPlugin, SetGameObjectName_);
+    // IMSDK
+    HOOK_I(IMSDKCustomWebView, dealloc);
+    HOOK_I(IMSDKNoticeIMSDKManager, getImageCache_imagePath_imageHash_queue_completeHandle_);
+    HOOK_I(IMSDKNoticeIMSDKManager, imsdkCoreKitNoticeImageFileHash_);
+    HOOK_I(IMSDKStatAdjustManager, reportEvent_eventBody_isRealtime_);
+    HOOK_I(IMSDKStatAdjustManager, reportEvent_params_isRealtime_);
+    HOOK_I(IMSDKStatAdjustManager, reportPurchase_currentCode_expense_isRealTime_);
+    HOOK_I(IMSDKStatAdjustManager, reportRevenue_currencyCode_revenueValue_params_extraJson_);
+    HOOK_I(INTLWebViewManager, openURL_observerID_baseParams_);
 
-    // --- APM ---
-    SBXK_HOOK_I(APMMonitor, handleEvent_);
-    SBXK_HOOK_I(APMMonitor, startMonitoring_);
-    SBXK_HOOK_I(APMDeviceInfoSupport, getBatteryState);
-    SBXK_HOOK_I(APMDeviceInfoSupport, getThermalState);
-    SBXK_HOOK_I(APMCollector, collectMetrics_);
-    SBXK_HOOK_I(TApmSceneMarker, markLoadLevel_);
-    SBXK_HOOK_I(TApmSceneMarker, markLevelFin);
-    SBXK_HOOK_I(TApmSceneMarker, postStepEvent_);
-    SBXK_HOOK_I(TApmSceneMarker, postStreamEvent_);
+    // Firebase / GAD / FB
+    HOOK_I(FIRMessagingRmqManager, openDatabase);
+    HOOK_I(FIRMessaging, retrieveFCMTokenForSenderID_completion_);
+    HOOK_I(FIRMessaging, deleteFCMTokenForSenderID_completion_);
+    HOOK_I(FIRMessaging, subscribeToTopic_completion_);
+    HOOK_I(FIRMessaging, unsubscribeFromTopic_completion_);
+    HOOK_I(FIRMessaging, setAPNSToken_withUserInfo_);
+    HOOK_I(FIRMessaging, APNSToken);
+    HOOK_I(GADAdNetworkResponseInfo, adUnitMapping);
+    HOOK_I(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError_);
+    HOOK_I(GADAppOpenAd, adDidDismissFullScreenContent_);
+    HOOK_I(GADAppOpenAd, adDidRecordClick_);
+    HOOK_I(GADAppOpenAd, adDidRecordImpression_);
+    HOOK_I(GADAppOpenAd, adWillDismissFullScreenContent_);
+    HOOK_I(GADAppOpenAd, adWillPresentFullScreenContent_);
+    HOOK_I(GADAppOpenAd, responseInfo);
+    HOOK_I(GADAppOpenAd, setPaidEventHandler_);
+    HOOK_I(GADMobileAds, initializationStatus);
+    HOOK_I(FBAdViewabilityValidator, checkViewability_);
+    HOOK_I(FBAdViewabilityValidator, stopMonitoring);
+    HOOK_I(FBAdMonitor, startMonitoringAd_);
+    HOOK_I(FBAdMonitor, stopMonitoring);
+    HOOK_I(FBAdEvent, logEvent_withParameters_);
+    HOOK_I(FBAdLogger, logMessage_withLevel_);
 
-    // --- IMSDK / WebView / Stat ---
-    SBXK_HOOK_I(IMSDKCustomWebView, dealloc);
-    SBXK_HOOK_I(IMSDKNoticeIMSDKManager, getImageCache_imagePath_imageHash_queue_completeHandle_);
-    SBXK_HOOK_I(IMSDKNoticeIMSDKManager, imsdkCoreKitNoticeImageFileHash_);
-    SBXK_HOOK_I(IMSDKStatAdjustManager, reportEvent_eventBody_isRealtime_);
-    SBXK_HOOK_I(IMSDKStatAdjustManager, reportEvent_params_isRealtime_);
-    SBXK_HOOK_I(IMSDKStatAdjustManager, reportPurchase_currentCode_expense_isRealTime_);
-    SBXK_HOOK_I(IMSDKStatAdjustManager, reportRevenue_currencyCode_revenueValue_params_extraJson_);
-    SBXK_HOOK_I(INTLWebViewManager, openURL_observerID_baseParams_);
+    // QQ
+    HOOK_I(QQApiInterface, sendReq_resultBlock_);
+    HOOK_I(QQApiInterface, sendThirdAppBindGroupReq_resultBlock_);
+    HOOK_I(QQApiInterface, sendThirdAppUnBindGroupReq_resultBlock_);
+    HOOK_I(QQApiInterface, sendThirdAppJoinGroupReq_resultBlock_);
+    HOOK_I(QQApiInterface, sendQueryQQGroupProInfo_resultBlock_);
+    HOOK_I(QQApiInterface, sendMessageToQQAuthWithReq_);
+    HOOK_I(QQApiInterface, sendMessageToQQAvatarWithReq_);
+    HOOK_I(QQApiInterface, sendMessageToFaceCollectionWithReq_);
+    HOOK_I(QQOpenApiUtility, cgiRequestGetSdkConfig_);
+    HOOK_I(TDataMasterApplication, handleOpenURL_);
+    HOOK_I(TDataMasterApplication, reportEventWithSrcID_eventName_AndEventKVArray_);
+    HOOK_I(TcApiTool, openUniversallinkIfNeed_);
+    HOOK_I(GTMSessionFetcher, setSystemCompletionHandler_forSessionIdentifier_);
 
-    // --- Firebase / GAD / FB ---
-    SBXK_HOOK_I(FIRMessagingRmqManager, openDatabase);
-    SBXK_HOOK_I(FIRMessaging, retrieveFCMTokenForSenderID_completion_);
-    SBXK_HOOK_I(FIRMessaging, deleteFCMTokenForSenderID_completion_);
-    SBXK_HOOK_I(FIRMessaging, subscribeToTopic_completion_);
-    SBXK_HOOK_I(FIRMessaging, unsubscribeFromTopic_completion_);
-    SBXK_HOOK_I(FIRMessaging, setAPNSToken_withUserInfo_);
-    SBXK_HOOK_I(FIRMessaging, APNSToken);
-    SBXK_HOOK_I(GADAdNetworkResponseInfo, adUnitMapping);
-    SBXK_HOOK_I(GADAppOpenAd, didFailToPresentFullScreenContentWithError_);
-    SBXK_HOOK_I(GADAppOpenAd, adDidDismissFullScreenContent_);
-    SBXK_HOOK_I(GADAppOpenAd, adDidRecordClick_);
-    SBXK_HOOK_I(GADAppOpenAd, adDidRecordImpression_);
-    SBXK_HOOK_I(GADAppOpenAd, adWillDismissFullScreenContent_);
-    SBXK_HOOK_I(GADAppOpenAd, adWillPresentFullScreenContent_);
-    SBXK_HOOK_I(GADAppOpenAd, canPresentFromRootViewController_error_);
-    SBXK_HOOK_I(GADAppOpenAd, responseInfo);
-    SBXK_HOOK_I(GADAppOpenAd, setPaidEventHandler_);
-    SBXK_HOOK_I(GADMobileAds, initializationStatus);
-    SBXK_HOOK_I(FBAdViewabilityValidator, checkViewability_);
-    SBXK_HOOK_I(FBAdViewabilityValidator, stopMonitoring);
-    SBXK_HOOK_I(FBAdMonitor, startMonitoringAd_);
-    SBXK_HOOK_I(FBAdMonitor, stopMonitoring);
-    SBXK_HOOK_I(FBAdEvent, logEvent_withParameters_);
-    SBXK_HOOK_I(FBAdLogger, logMessage_withLevel_);
+    // Audio / Reachability / serviceCommunication
+    HOOK_I(AReachability, isConnectionOnDemand);
+    HOOK_I(AReachability, isConnectionRequired);
+    HOOK_I(AudioDeviceMgr, GetAudioDeviceConnectState);
+    HOOK_I(AudioDeviceMgr, UpdateDeviceState_);
+    HOOK_I(serviceCommunication, getValueForKeypath);
 
-    // --- QQ / Tencent SDK ---
-    SBXK_HOOK_I(QQApiInterface, sendReq_resultBlock_);
-    SBXK_HOOK_I(QQApiInterface, sendThirdAppBindGroupReq_resultBlock_);
-    SBXK_HOOK_I(QQApiInterface, sendThirdAppUnBindGroupReq_resultBlock_);
-    SBXK_HOOK_I(QQApiInterface, sendThirdAppJoinGroupReq_resultBlock_);
-    SBXK_HOOK_I(QQApiInterface, sendQueryQQGroupProInfo_resultBlock_);
-    SBXK_HOOK_I(QQApiInterface, sendMessageToQQAuthWithReq_);
-    SBXK_HOOK_I(QQApiInterface, sendMessageToQQAvatarWithReq_);
-    SBXK_HOOK_I(QQApiInterface, sendMessageToFaceCollectionWithReq_);
-    SBXK_HOOK_I(QQOpenApiUtility, cgiRequestGetSdkConfig_);
-    SBXK_HOOK_I(TDataMasterApplication, handleOpenURL_);
-    SBXK_HOOK_I(TDataMasterApplication, reportEventWithSrcID_eventName_AndEventKVArray_);
-    SBXK_HOOK_I(TcApiTool, openUniversallinkIfNeed_);
-    SBXK_HOOK_I(GTMSessionFetcher, setSystemCompletionHandler_forSessionIdentifier_);
+    // Social
+    HOOK_I(TikTokAuth, authorizeWithPermissions_);
+    HOOK_I(TikTokAuth, handleOpenURL_);
+    HOOK_I(VKAuth, authorizeWithPermissions_);
+    HOOK_I(VKAuth, logout);
+    HOOK_I(SCSDKLoginClient, loginWithCompletion_);
+    HOOK_I(SCSDKLoginClient, logout);
 
-    // --- Reachability / Audio ---
-    SBXK_HOOK_I(AReachability, isConnectionOnDemand);
-    SBXK_HOOK_I(AReachability, isConnectionRequired);
-    SBXK_HOOK_I(AudioDeviceMgr, GetAudioDeviceConnectState);
-    SBXK_HOOK_I(AudioDeviceMgr, UpdateDeviceState_);
-    SBXK_HOOK_I(serviceCommunication, getValueForKeypath);
-
-    // --- TikTok / VK / Snap ---
-    SBXK_HOOK_I(TikTokAuth, authorizeWithPermissions_);
-    SBXK_HOOK_I(TikTokAuth, handleOpenURL_);
-    SBXK_HOOK_I(VKAuth, authorizeWithPermissions_);
-    SBXK_HOOK_I(VKAuth, logout);
-    SBXK_HOOK_I(SCSDKLoginClient, loginWithCompletion_);
-    SBXK_HOOK_I(SCSDKLoginClient, logout);
-
-    // --- Advertising ---
-    SBXK_HOOK_I(ASIdentifierManager, advertisingIdentifier);
-    SBXK_HOOK_I(ATTrackingManager, trackingAuthorizationStatus);
+    // Ads identity
+    HOOK_I(ASIdentifierManager, advertisingIdentifier);
+    HOOK_I(ATTrackingManager, trackingAuthorizationStatus);
 }
 
 #pragma mark =========================================================
-#pragma mark 11. NSFileManager swizzle (aman, pakai exchange + alias)
+#pragma mark 16. FISHHOOK TABLE
 #pragma mark =========================================================
 
-static void SBXK_InstallFileManagerSwizzle(void) {
-    Class fm = [NSFileManager class];
-
-    Method m1 = class_getInstanceMethod(fm, @selector(fileExistsAtPath:));
-    if (m1) {
-        // simpan original via alias
-        class_addMethod(fm, @selector(SBXK_original_fileExistsAtPath:),
-                        method_getImplementation(m1),
-                        method_getTypeEncoding(m1));
-        method_setImplementation(m1, (IMP)SBXK_NSFileManager_fileExistsAtPath_);
-    }
-
-    Method m2 = class_getInstanceMethod(fm, @selector(fileExistsAtPath:isDirectory:));
-    if (m2) {
-        class_addMethod(fm, @selector(SBXK_original_fileExistsAtPath:isDirectory:),
-                        method_getImplementation(m2),
-                        method_getTypeEncoding(m2));
-        method_setImplementation(m2, (IMP)SBXK_NSFileManager_fileExistsAtPath_isDirectory_);
-    }
-}
-
-#pragma mark =========================================================
-#pragma mark 12. FISHHOOK REBIND
-#pragma mark =========================================================
-
-static void SBXK_InstallFishhook(void) {
-    // fopen: libcrypto pakai lazy loading via dyld → fishhook kena.
-    // Kalau ternyata symbol tdk ada (game pakai BoringSSL statik), rebind akan return non-zero → aman.
-    struct rebinding binds[] = {
+static void SBXK_InstallRebindings(void) {
+    sbxk_binding_t b[] = {
         // RSA
         {"RSA_public_encrypt",  (void *)SBXK_RSA_public_encrypt,  (void **)&orig_RSA_public_encrypt},
         {"RSA_private_decrypt", (void *)SBXK_RSA_private_decrypt, (void **)&orig_RSA_private_decrypt},
@@ -1105,24 +1103,23 @@ static void SBXK_InstallFishhook(void) {
         {"DES_set_key",         (void *)SBXK_DES_set_key,         (void **)&orig_DES_set_key},
 
         // Hash
-        {"MD5_Init",   (void *)SBXK_MD5_Init,   (void **)&orig_MD5_Init},
-        {"MD5_Update", (void *)SBXK_MD5_Update, (void **)&orig_MD5_Update},
-        {"MD5_Final",  (void *)SBXK_MD5_Final,  (void **)&orig_MD5_Final},
-        {"SHA1_Init",  (void *)SBXK_SHA1_Init,  (void **)&orig_SHA1_Init},
-        {"SHA1_Update",(void *)SBXK_SHA1_Update,(void **)&orig_SHA1_Update},
-        {"SHA1_Final", (void *)SBXK_SHA1_Final, (void **)&orig_SHA1_Final},
-        {"SHA256_Init",(void *)SBXK_SHA256_Init,(void **)&orig_SHA256_Init},
+        {"MD5_Init",    (void *)SBXK_MD5_Init,    (void **)&orig_MD5_Init},
+        {"MD5_Update",  (void *)SBXK_MD5_Update,  (void **)&orig_MD5_Update},
+        {"MD5_Final",   (void *)SBXK_MD5_Final,   (void **)&orig_MD5_Final},
+        {"SHA1_Init",   (void *)SBXK_SHA1_Init,   (void **)&orig_SHA1_Init},
+        {"SHA1_Update", (void *)SBXK_SHA1_Update, (void **)&orig_SHA1_Update},
+        {"SHA1_Final",  (void *)SBXK_SHA1_Final,  (void **)&orig_SHA1_Final},
+        {"SHA256_Init", (void *)SBXK_SHA256_Init, (void **)&orig_SHA256_Init},
         {"SHA256_Update",(void *)SBXK_SHA256_Update,(void **)&orig_SHA256_Update},
         {"SHA256_Final",(void *)SBXK_SHA256_Final,(void **)&orig_SHA256_Final},
-        {"SHA512_Init",(void *)SBXK_SHA512_Init,(void **)&orig_SHA512_Init},
+        {"SHA512_Init", (void *)SBXK_SHA512_Init, (void **)&orig_SHA512_Init},
         {"SHA512_Update",(void *)SBXK_SHA512_Update,(void **)&orig_SHA512_Update},
         {"SHA512_Final",(void *)SBXK_SHA512_Final,(void **)&orig_SHA512_Final},
+        {"HMAC_Init",   (void *)SBXK_HMAC_Init,   (void **)&orig_HMAC_Init},
+        {"HMAC_Update", (void *)SBXK_HMAC_Update, (void **)&orig_HMAC_Update},
+        {"HMAC_Final",  (void *)SBXK_HMAC_Final,  (void **)&orig_HMAC_Final},
 
-        {"HMAC_Init",  (void *)SBXK_HMAC_Init,  (void **)&orig_HMAC_Init},
-        {"HMAC_Update",(void *)SBXK_HMAC_Update,(void **)&orig_HMAC_Update},
-        {"HMAC_Final", (void *)SBXK_HMAC_Final, (void **)&orig_HMAC_Final},
-
-        // EVP
+        // EVP / SSL / X509
         {"EVP_SignFinal",     (void *)SBXK_EVP_SignFinal,     (void **)&orig_EVP_SignFinal},
         {"EVP_VerifyFinal",   (void *)SBXK_EVP_VerifyFinal,   (void **)&orig_EVP_VerifyFinal},
         {"EVP_DigestSign",    (void *)SBXK_EVP_DigestSign,    (void **)&orig_EVP_DigestSign},
@@ -1135,36 +1132,36 @@ static void SBXK_InstallFishhook(void) {
         // RAND
         {"RAND_bytes", (void *)SBXK_RAND_bytes, (void **)&orig_RAND_bytes},
 
-        // libSystem
-        {"access", (void *)SBXK_access, (void **)&orig_access},
+        // POSIX
+        {"access",     (void *)SBXK_access,     (void **)&orig_access},
     };
-    rebind_symbols(binds, sizeof(binds) / sizeof(binds[0]));
+    sbxk_rebind_all(b, (int)(sizeof(b) / sizeof(b[0])));
 }
 
 #pragma mark =========================================================
-#pragma mark 13. ENTRY
+#pragma mark 17. ENTRY
 #pragma mark =========================================================
 
 __attribute__((constructor))
 static void SBXK_Bootstrap(void) {
     @autoreleasepool {
-        SBXK_LOG(@"boot");
+        SBXK_LOG(@"v2 boot");
 
-        // 1. Fishhook di main thread dulu — supaya symbol libcrypto/libSystem tertangkap sebelum game main.
-        SBXK_InstallFishhook();
+        // 1) Fishhook — kena symbol libcrypto/libSystem via lazy binding.
+        SBXK_InstallRebindings();
 
-        // 2. Swizzle semua kelas (aman kalau kelas belum ada → di-skip).
+        // 2) Swizzle semua kelas — skip yang tidak ada.
         SBXK_InstallAllSwizzles();
 
-        // 3. FileManager.
+        // 3) FileManager.
         SBXK_InstallFileManagerSwizzle();
 
-        // 4. AppDelegate proxy (kalau AppDelegate sudah kebentuk).
+        // 4) AppDelegate proxy (kalau sudah dibentuk).
         [SBXK_AppDelegateProxy installIfPossible];
 
-        // 5. Timer pembersih — jalan setelah app aktif.
+        // 5) Timer pembersih.
         SBXK_StartCleanupTimer();
 
-        SBXK_LOG(@"ready");
+        SBXK_LOG(@"v2 ready");
     }
 }
