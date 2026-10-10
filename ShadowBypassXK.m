@@ -1,11 +1,20 @@
 // ============================================================================
-// ShadowBypass XK v7.5 — iOS 14+, arm64
-// Build (GitHub Actions macOS runner):
+// ShadowBypass XK v7.7 — iOS 14+, arm64
+// Full integrated single-file build.
+//
+//   v7.6 core  : detection NO, lifecycle no-op, id pass-through
+//   v7.7 ext   : TssInfo / AntiDataProxy / MRPCS / CheckSymbol / Alert gates
+//
+// قاعدة pass-through id:
+//   DEF_ID_Pn → يستدعي الأصل ويرجّع النتيجة كما هي.
+//   لا يصنع كائنًا جديدًا → لا unrecognized selector.
+//
+// البناء:
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 //   clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=14.0 \
 //         -fobjc-arc -fblocks -O2 -dynamiclib -Wno-nullability-completeness \
-//         ShadowBypassXK.m -framework Foundation -framework UIKit \
-//         -framework Security -framework AdSupport \
+//         ShadowBypassXK.m \
+//         -framework Foundation -framework UIKit -framework Security -framework AdSupport \
 //         -o ShadowBypassXK.dylib
 // ============================================================================
 
@@ -68,9 +77,7 @@ static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
         SBXK_WLIT(fd, "\n=== SBXK CRASH ===\n");
         SBXK_WLIT(fd, "signal="); sbxk_wdec(fd, sig); SBXK_WLIT(fd, "\n");
         SBXK_WLIT(fd, "phase=");  sbxk_wdec(fd, atomic_load(&g_phase)); SBXK_WLIT(fd, "\n");
-        if (info) {
-            SBXK_WLIT(fd, "si_addr="); sbxk_whex(fd, info->si_addr); SBXK_WLIT(fd, "\n");
-        }
+        if (info) { SBXK_WLIT(fd, "si_addr="); sbxk_whex(fd, info->si_addr); SBXK_WLIT(fd, "\n"); }
         SBXK_WLIT(fd, "=== END CRASH ===\n");
     }
 }
@@ -109,7 +116,6 @@ static void SBXK_InstallCrashHandlers(void) {
     if (g_crash_path[0] == 0) return;
     int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     atomic_store(&g_crash_fd, fd);
-
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = sbxk_on_signal;
@@ -208,13 +214,9 @@ static BOOL SBXK_SwizzleFull(const char *clsName, const char *selName,
     g_orig[key] = [NSValue valueWithPointer:orig];
 
     @try {
-        if (own) {
+        if (own) class_replaceMethod(target, s, replacement, enc);
+        else if (!class_addMethod(target, s, replacement, enc))
             class_replaceMethod(target, s, replacement, enc);
-        } else {
-            if (!class_addMethod(target, s, replacement, enc)) {
-                class_replaceMethod(target, s, replacement, enc);
-            }
-        }
         [g_done addObject:key];
     } @catch (NSException *e) {
         NSLog(@"[SBXK-diag] exception: %s %s: %@", clsName, selName, e);
@@ -231,24 +233,55 @@ static IMP SBXK_Original(const char *cls, const char *sel) {
 }
 
 #pragma mark =========================================================
-#pragma mark 5. IMP MACROS — كلها معرّفة، بلا استخدامات ناقصة
+#pragma mark 5. IMP MACROS
 #pragma mark =========================================================
 
+// BOOL — no args
 #define DEF_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return NO; }
 #define DEF_YES(cls, name) static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return YES; }
 
+// void — 1..2 args
 #define DEF_V1(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; }
 #define DEF_V2(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; }
-#define DEF_V3(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3; }
 
-#define DEF_V1B(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, BOOL _b) { (void)_s;(void)_c;(void)_a1;(void)_b; }
-#define DEF_V1I(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, int _i) { (void)_s;(void)_c;(void)_a1;(void)_i; }
+// id — PASS-THROUGH
+#define DEF_ID_P0(cls, name)  \
+    static id SBXK_##cls##_##name(id _s, SEL _c) { \
+        IMP orig = SBXK_Original(#cls, #name); \
+        if (!orig) return nil; \
+        id (*fn)(id, SEL) = (void *)orig; \
+        return fn(_s, _c); \
+    }
+
+#define DEF_ID_P1(cls, name)  \
+    static id SBXK_##cls##_##name(id _s, SEL _c, id _a1) { \
+        IMP orig = SBXK_Original(#cls, #name); \
+        if (!orig) return nil; \
+        id (*fn)(id, SEL, id) = (void *)orig; \
+        return fn(_s, _c, _a1); \
+    }
+
+#define DEF_ID_P2(cls, name)  \
+    static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { \
+        IMP orig = SBXK_Original(#cls, #name); \
+        if (!orig) return nil; \
+        id (*fn)(id, SEL, id, id) = (void *)orig; \
+        return fn(_s, _c, _a1, _a2); \
+    }
+
+#define DEF_ID_P3(cls, name)  \
+    static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { \
+        IMP orig = SBXK_Original(#cls, #name); \
+        if (!orig) return nil; \
+        id (*fn)(id, SEL, id, id, id) = (void *)orig; \
+        return fn(_s, _c, _a1, _a2, _a3); \
+    }
 
 #pragma mark =========================================================
-#pragma mark 6. IMP DEFINITIONS
+#pragma mark 6. BASE IMPs — BOOL
 #pragma mark =========================================================
 
-// ─── Detection — Force NO ───
+// Detection NO
 DEF_NO(IntegrityChecker,  integrity_detect)
 DEF_NO(IntegrityChecker,  MTML_INTEGRITY_DETECT)
 DEF_NO(JailbreakDetector, isJailbroken)
@@ -289,7 +322,7 @@ DEF_NO(SecurityChecker,   isCydiaInstalled)
 DEF_NO(SecurityChecker,   hasSuspiciousFiles)
 DEF_NO(SecurityChecker,   isEnvironmentClean)
 
-// ─── Detection — Force YES ───
+// Detection YES
 DEF_YES(SecurityChecker, verifyIntegrity)
 DEF_YES(SecurityChecker, checkTokenValid)
 DEF_YES(SecurityChecker, isEnvironmentSafe)
@@ -298,7 +331,10 @@ DEF_YES(AReachability,   isConnectionOnDemand)
 DEF_YES(AReachability,   isConnectionRequired)
 DEF_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
 
-// ─── GAD — void(id) ───
+#pragma mark =========================================================
+#pragma mark 7. BASE IMPs — VOID
+#pragma mark =========================================================
+
 DEF_V1(GADAppOpenAd, adDidDismissFullScreenContent)
 DEF_V1(GADAppOpenAd, adWillDismissFullScreenContent)
 DEF_V1(GADAppOpenAd, adDidRecordClick)
@@ -308,70 +344,743 @@ DEF_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
 DEF_V1(GADAppOpenAd, setPaidEventHandler)
 DEF_V1(GADAppOpenAd, adDidRecordUserInteraction)
 
-// ─── GSDK — void(id) ───
-DEF_V1(GSDKPing, ping)
-DEF_V1(GSDKPing, stopPing)
-DEF_V1(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error)
-DEF_V1(GSDKPing, simplePing_didFailWithError)
-DEF_V1(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber)
-DEF_V1(GSDKPing, simplePing_didReceiveUnexpectedPacket)
-DEF_V1(GSDKPing, simplePing_didSendPacket_sequenceNumber)
-DEF_V1(GSDKPing, simplePing_didStartWithAddress)
-DEF_V1(GSDKInGameManager, GSDKRealTimeDetect)
-DEF_V1(GSDKInGameSystem,  GSDKInnerRealTimeDetect)
-DEF_V1(GSDKHttpRequest,   requestControl_Openid_Acctype_Zoneid_Env)
-DEF_V1(GSDKInitManager,   detectOperation)
-DEF_V1(GSDKRealTimeDetect, pingDelayDetect)
-DEF_V1(GSDKRealTimeDetect, updDelayDetect_Port)
-DEF_V1(GSDKUdpDetect,     isUDPConnect_Port)
-DEF_V1(GSDKWIFI,          ping)
-DEF_V1(GSDKDetectPort,    isConnection_Port)
-
-// ─── GCloud — نقتصر على void(id) فقط ───
-DEF_V1(GCloudVoiceEngine, StopRecording)
-DEF_V1(GCloudVoiceEngine, StartBGMPlay)
-DEF_V1(GCloudVoiceEngine, StopBGMPlay)
-DEF_V1(GCloudVoiceEngine, PauseBGMPlay)
-DEF_V1(GCloudVoiceEngine, ResumeBGMPlay)
-DEF_V1(GCloudVoiceEngine, RSTSStopRecording)
-DEF_V1(GCloudVoiceEngine, TextToStreamSpeechStop)
-DEF_V1(GCloudVoiceEngine, StartRecording)
-DEF_V1(GCloudVoiceEngine, SetBGMPath)
-DEF_V1(GCloudVoiceEngine, SetLogCallBack)
-
-// ─── Ads / Firebase / APM — void(id) ───
 DEF_V1(NetworkManager, SendSecurityReport)
-DEF_V1(FBAdMonitor,    startMonitoringAd)
-DEF_V1(FBAdEvent,      logEvent_withParameters)
-DEF_V1(FBAdLogger,     logMessage_withLevel)
-DEF_V1(FIRMessaging,   retrieveFCMTokenForSenderID_completion)
-DEF_V1(FIRMessaging,   deleteFCMTokenForSenderID_completion)
-DEF_V1(FIRMessaging,   subscribeToTopic_completion)
-DEF_V1(FIRMessaging,   unsubscribeFromTopic_completion)
-DEF_V1(FIRMessaging,   setAPNSToken_withUserInfo)
-DEF_V1(APMMonitor,     handleEvent)
-DEF_V1(APMMonitor,     startMonitoring)
-DEF_V1(APMCollector,   collectMetrics)
-DEF_V1(TApmSceneMarker, markLoadLevel)
-DEF_V1(TApmSceneMarker, postStepEvent)
-DEF_V1(TApmSceneMarker, postStreamEvent)
-DEF_V1(TDataMasterApplication, handleOpenURL)
-DEF_V1(TcApiTool,      openUniversallinkIfNeed)
-DEF_V1(TikTokAuth,     authorizeWithPermissions)
-DEF_V1(TikTokAuth,     handleOpenURL)
-DEF_V1(VKAuth,         authorizeWithPermissions)
-DEF_V1(SCSDKLoginClient, loginWithCompletion)
 
 #pragma mark =========================================================
-#pragma mark 7. REGISTRATION
+#pragma mark 8. BASE IMPs — ID pass-through
+#pragma mark =========================================================
+
+// ───── GSDK (0 arg) ─────
+DEF_ID_P0(GSDKCPU,               getSystemCPUCircle)
+DEF_ID_P0(GSDKMemory,            getSystemAvailableMemory)
+DEF_ID_P0(GSDKInGameManager,     GSDKRealTimeDetect)
+DEF_ID_P0(GSDKInGameSystem,      GSDKInnerEnd)
+DEF_ID_P0(GSDKInGameSystem,      GSDKInnerRealTimeDetect)
+DEF_ID_P0(GSDKPing,              ping)
+DEF_ID_P0(GSDKPing,              stopPing)
+DEF_ID_P0(GSDKPingDetect,        ping)
+DEF_ID_P0(PingDelegate,          pingTimer)
+DEF_ID_P0(SimplePing,            start)
+DEF_ID_P0(SimplePing,            startWithHostAddress)
+DEF_ID_P0(SimplePing,            readData)
+DEF_ID_P0(GSDKRealTimeDetect,    pingDelayDetect)
+DEF_ID_P0(GSDKRealTimeDetect,    updDelayDetect_Port)
+DEF_ID_P0(GSDKUdpDetect,         isUDPConnect_Port)
+DEF_ID_P0(GSDKWIFI,              ping)
+DEF_ID_P0(GSDKDetectPort,        isConnection_Port)
+DEF_ID_P0(GSDKInitManager,       detectOperation)
+DEF_ID_P0(GSDKPayEvent,          GSDKPay_Tag_Status_Msg)
+DEF_ID_P0(GSDKHttpRequest,       requestControl_Openid_Acctype_Zoneid_Env)
+
+// ───── GSDK (1 arg) ─────
+DEF_ID_P1(SimplePing,            sendPingWithData)
+DEF_ID_P1(SimplePing,            didFailWithError)
+DEF_ID_P1(FBAdViewabilityValidator, checkViewability)
+DEF_ID_P1(TApmSceneMarker,       postStepEvent)
+DEF_ID_P1(TApmSceneMarker,       postStreamEvent)
+DEF_ID_P1(APMCollector,          collectMetrics)
+DEF_ID_P1(APMCollector,          reportNow)
+DEF_ID_P1(AudioDeviceMgr,        UpdateDeviceState)
+
+// ───── GSDK (2 arg) ─────
+DEF_ID_P2(SimplePing,            validatePingResponsePacket_sequenceNumber)
+DEF_ID_P2(FIRMessaging,          retrieveFCMTokenForSenderID_completion)
+DEF_ID_P2(FIRMessaging,          deleteFCMTokenForSenderID_completion)
+DEF_ID_P2(FIRMessaging,          subscribeToTopic_completion)
+DEF_ID_P2(FIRMessaging,          unsubscribeFromTopic_completion)
+DEF_ID_P2(FIRMessaging,          setAPNSToken_withUserInfo)
+DEF_ID_P2(GSDKInGameSystem,      GSDKInnerSaveFPS_FpsDots)
+
+// ───── GSDK (3 arg) ─────
+DEF_ID_P3(SimplePing,            pingPacketWithType_payload_requiresChecksum)
+DEF_ID_P3(GSDKInGameSystem,      GSDKInnerStart_SceneID_RoomIP)
+
+// ───── Voice (0 arg) ─────
+DEF_ID_P0(GVGCloudVoice,           openMic)
+DEF_ID_P0(GVGCloudVoice,           openSpeaker)
+DEF_ID_P0(GVGCloudVoiceExtension,  GetBGMPlayState)
+DEF_ID_P0(GVGCloudVoiceExtension,  GetMicState)
+DEF_ID_P0(GVGCloudVoiceExtension,  GetSpeakerState)
+DEF_ID_P0(GVoiceMuteSwitch,        detectMuteSwitch)
+DEF_ID_P0(GCloudVoiceEngine,       StartTve)
+DEF_ID_P0(GCloudVoiceEngine,       TestMic)
+DEF_ID_P0(GCloudVoiceEngine,       GetMicLevel)
+DEF_ID_P0(GCloudVoiceEngine,       GetSpeakerLevel)
+DEF_ID_P0(GCloudVoiceEngine,       GetBGMLevel)
+DEF_ID_P0(GCloudVoiceEngine,       GetBGMFileTime)
+DEF_ID_P0(GCloudVoiceEngine,       GetBGMPlayTime)
+DEF_ID_P0(GCloudVoiceEngine,       GetRecordKaraokeTotalTime)
+DEF_ID_P0(GCloudVoiceEngine,       StartPreview)
+DEF_ID_P0(GCloudVoiceEngine,       StopPreview)
+DEF_ID_P0(GCloudVoiceEngine,       PauseKaraoke)
+DEF_ID_P0(GCloudVoiceEngine,       ResumeKaraoke)
+DEF_ID_P0(GCloudVoiceEngine,       RSTSStopRecording)
+DEF_ID_P0(GCloudVoiceEngine,       TextToStreamSpeechStop)
+DEF_ID_P0(GCloudVoiceEngine,       StopKaraokeRecording)
+DEF_ID_P0(GCloudCoreRemoteConfig,  getConfig)
+DEF_ID_P0(GCloudUnityPlugin,       Initialize)
+DEF_ID_P0(GCloudUnityPlugin,       ReportEvent)
+
+// ───── Voice (1 arg) ─────
+DEF_ID_P1(GCloudVoiceEngine,       StartRecording)
+DEF_ID_P1(GCloudVoiceEngine,       StopRecording)
+DEF_ID_P1(GCloudVoiceEngine,       StartBGMPlay)
+DEF_ID_P1(GCloudVoiceEngine,       StopBGMPlay)
+DEF_ID_P1(GCloudVoiceEngine,       PauseBGMPlay)
+DEF_ID_P1(GCloudVoiceEngine,       ResumeBGMPlay)
+DEF_ID_P1(GCloudVoiceEngine,       SetBGMPath)
+DEF_ID_P1(GCloudVoiceEngine,       SetLogCallBack)
+DEF_ID_P1(GCloudCoreRemoteConfig,  updateConfig)
+DEF_ID_P1(GCloudUnityPlugin,       SetGameObjectName)
+
+// ───── Voice (2 arg) ─────
+DEF_ID_P2(GCloudVoiceEngine,       QuitRoom_Scenes_timeout)
+
+// ───── Firebase / Ads ─────
+DEF_ID_P0(FIRMessagingRmqManager,  openDatabase)
+DEF_ID_P0(FIRMessaging,            APNSToken)
+DEF_ID_P0(GADAppOpenAd,            responseInfo)
+DEF_ID_P0(GADMobileAds,            initializationStatus)
+DEF_ID_P0(GADAdNetworkResponseInfo, adUnitMapping)
+DEF_ID_P0(FBAdViewabilityValidator, stopMonitoring)
+DEF_ID_P0(FBAdMonitor,             stopMonitoring)
+
+// ───── APM ─────
+DEF_ID_P0(APMDeviceInfoSupport,    getBatteryState)
+DEF_ID_P0(APMDeviceInfoSupport,    getThermalState)
+DEF_ID_P0(TApmSceneMarker,         markLevelFin)
+
+// ───── Misc ─────
+DEF_ID_P0(serviceCommunication,    getValueForKeypath)
+DEF_ID_P0(AudioDeviceMgr,          GetAudioDeviceConnectState)
+DEF_ID_P0(VKAuth,                  logout)
+DEF_ID_P0(SCSDKLoginClient,        logout)
+
+#pragma mark =========================================================
+#pragma mark 9. EXTENDED IMPs — BOOL NO (v7.7)
+#pragma mark =========================================================
+
+// ─── AntiDataProxy ───
+DEF_NO (AntiDataProxy, checkIntegrity)
+DEF_NO (AntiDataProxy, isIntegrityOK)
+DEF_NO (AntiDataProxy, verifyData)
+DEF_NO (AntiDataProxy, isDataValid)
+DEF_NO (AntiDataProxy, isModified)
+DEF_NO (AntiDataProxy, isCheat)
+DEF_NO (AntiDataProxy, isSuspicious)
+DEF_NO (AntiDataProxy, antiCheatCheck)
+DEF_NO (AntiDataProxy, securityCheck)
+DEF_NO (AntiDataProxy, hasRisk)
+DEF_NO (AntiDataProxy, detectRisk)
+DEF_NO (AntiDataProxy, isRiskDetected)
+
+// ─── TssInfoReceiver ───
+DEF_NO (TssInfoReceiver, isRooted)
+DEF_NO (TssInfoReceiver, isRootedDevice)
+DEF_NO (TssInfoReceiver, isJailbroken)
+DEF_NO (TssInfoReceiver, isJailbreakDevice)
+DEF_NO (TssInfoReceiver, isEmulator)
+DEF_NO (TssInfoReceiver, isEmulatorDevice)
+DEF_NO (TssInfoReceiver, isSimulator)
+DEF_NO (TssInfoReceiver, isDebuggerAttached)
+DEF_NO (TssInfoReceiver, isDebugged)
+DEF_NO (TssInfoReceiver, isModified)
+DEF_NO (TssInfoReceiver, isTampered)
+DEF_NO (TssInfoReceiver, isInjected)
+DEF_NO (TssInfoReceiver, isHooked)
+DEF_NO (TssInfoReceiver, hasCheat)
+DEF_NO (TssInfoReceiver, hasCheatTool)
+DEF_NO (TssInfoReceiver, hasSuspiciousFiles)
+DEF_NO (TssInfoReceiver, hasRisk)
+DEF_NO (TssInfoReceiver, checkEnvironment)
+DEF_NO (TssInfoReceiver, checkSecurity)
+DEF_NO (TssInfoReceiver, checkCheat)
+DEF_NO (TssInfoReceiver, detectCheat)
+DEF_NO (TssInfoReceiver, detectRisk)
+DEF_NO (TssInfoReceiver, detectEnvironment)
+DEF_NO (TssInfoReceiver, isCheating)
+DEF_NO (TssInfoReceiver, isCheatDetected)
+DEF_NO (TssInfoReceiver, isSuspicious)
+DEF_NO (TssInfoReceiver, antiCheatCheck)
+DEF_NO (TssInfoReceiver, securityCheck)
+DEF_NO (TssInfoReceiver, shouldReport)
+DEF_NO (TssInfoReceiver, shouldBlock)
+DEF_NO (TssInfoReceiver, needReport)
+DEF_NO (TssInfoReceiver, needBlock)
+DEF_NO (TssInfoReceiver, isBlocked)
+DEF_NO (TssInfoReceiver, isBanned)
+
+// ─── CheckSymbolSource ───
+DEF_NO (CheckSymbolSource, CheckSymbol)
+DEF_NO (CheckSymbolSource, checkSymbol)
+DEF_NO (CheckSymbolSource, checkSymbolSource)
+DEF_NO (CheckSymbolSource, isSymbolValid)
+DEF_NO (CheckSymbolSource, isSymbolOK)
+DEF_NO (CheckSymbolSource, verifySymbol)
+DEF_NO (CheckSymbolSource, verifySymbols)
+DEF_NO (CheckSymbolSource, isSourceSafe)
+DEF_NO (CheckSymbolSource, checkSource)
+
+// ─── MRPCS thread gates ───
+DEF_NO (CFastScanThread, isRunning)
+DEF_NO (CFastScanThread, shouldScan)
+DEF_NO (CFastScanThread, hasResult)
+DEF_NO (CScanThread,     isRunning)
+DEF_NO (CScanThread,     shouldScan)
+DEF_NO (CScanThread,     hasResult)
+DEF_NO (CSendThread,     isRunning)
+DEF_NO (CSendThread,     shouldSend)
+DEF_NO (CSendThread,     hasData)
+DEF_NO (CMrpcsMonitor,   isRunning)
+DEF_NO (CMrpcsMonitor,   shouldReport)
+DEF_NO (CMrpcsMgrE,      isReady)
+DEF_NO (CMrpcsMgrE,      shouldReport)
+DEF_NO (CPointDataMgr,   shouldReport)
+DEF_NO (CPointDataMgr,   hasData)
+DEF_NO (CPointGlobalMgr, shouldReport)
+DEF_NO (CPointGlobalMgr, hasData)
+DEF_NO (CMrpcsLFUpdater, shouldUpdate)
+DEF_NO (CMrpcsLFUpdater, hasUpdate)
+
+#pragma mark =========================================================
+#pragma mark 10. EXTENDED IMPs — BOOL YES (v7.7)
+#pragma mark =========================================================
+
+DEF_YES(TssInfoReceiver, isSafe)
+DEF_YES(TssInfoReceiver, isClean)
+DEF_YES(TssInfoReceiver, isEnvironmentClean)
+DEF_YES(TssInfoReceiver, isEnvironmentSafe)
+DEF_YES(TssInfoReceiver, verifyIntegrity)
+DEF_YES(TssInfoReceiver, verifySignature)
+DEF_YES(TssInfoReceiver, checkTokenValid)
+
+DEF_YES(AntiDataProxy,  isValid)
+DEF_YES(AntiDataProxy,  isSafe)
+DEF_YES(AntiDataProxy,  isClean)
+DEF_YES(AntiDataProxy,  verifyIntegrity)
+DEF_YES(AntiDataProxy,  verifySignature)
+DEF_YES(AntiDataProxy,  shouldPass)
+DEF_YES(AntiDataProxy,  allowReport)
+
+DEF_YES(CheckSymbolSource, isSourceOK)
+DEF_YES(CheckSymbolSource, sourceIsValid)
+
+#pragma mark =========================================================
+#pragma mark 11. EXTENDED IMPs — VOID no-op (v7.7)
+#pragma mark =========================================================
+
+// ─── TssInfoReceiver lifecycle ───
+DEF_V1(TssInfoReceiver, start)
+DEF_V1(TssInfoReceiver, stop)
+DEF_V1(TssInfoReceiver, run)
+DEF_V1(TssInfoReceiver, onReceiveData)
+DEF_V1(TssInfoReceiver, onRecvData)
+DEF_V1(TssInfoReceiver, report)
+DEF_V1(TssInfoReceiver, sendReport)
+DEF_V1(TssInfoReceiver, uploadReport)
+DEF_V1(TssInfoReceiver, submitReport)
+DEF_V1(TssInfoReceiver, reportRoot)
+DEF_V1(TssInfoReceiver, reportEmu)
+DEF_V1(TssInfoReceiver, reportDebugger)
+DEF_V1(TssInfoReceiver, reportCheat)
+DEF_V1(TssInfoReceiver, reportAlert)
+DEF_V1(TssInfoReceiver, sendAlert)
+DEF_V1(TssInfoReceiver, blockGame)
+DEF_V1(TssInfoReceiver, blockPlayer)
+DEF_V1(TssInfoReceiver, kickPlayer)
+
+// ─── AntiDataProxy lifecycle ───
+DEF_V1(AntiDataProxy, sendData)
+DEF_V1(AntiDataProxy, report)
+DEF_V1(AntiDataProxy, submit)
+DEF_V1(AntiDataProxy, upload)
+DEF_V1(AntiDataProxy, dispatch)
+DEF_V1(AntiDataProxy, flush)
+
+// ─── MRPCS lifecycle ───
+DEF_V1(CFastScanThread,    start)
+DEF_V1(CFastScanThread,    run)
+DEF_V1(CFastScanThread,    execute)
+DEF_V1(CFastScanThread,    scan)
+DEF_V1(CFastScanThread,    doScan)
+DEF_V1(CFastScanThread,    report)
+DEF_V1(CFastScanThread,    sendReport)
+DEF_V1(CScanThread,        start)
+DEF_V1(CScanThread,        run)
+DEF_V1(CScanThread,        execute)
+DEF_V1(CScanThread,        scan)
+DEF_V1(CScanThread,        doScan)
+DEF_V1(CScanThread,        report)
+DEF_V1(CScanThread,        sendReport)
+DEF_V1(CSendThread,        start)
+DEF_V1(CSendThread,        run)
+DEF_V1(CSendThread,        execute)
+DEF_V1(CSendThread,        send)
+DEF_V1(CSendThread,        doSend)
+DEF_V1(CSendThread,        report)
+DEF_V1(CMrpcsMonitor,      start)
+DEF_V1(CMrpcsMonitor,      stop)
+DEF_V1(CMrpcsMonitor,      run)
+DEF_V1(CMrpcsMonitor,      execute)
+DEF_V1(CMrpcsMonitor,      report)
+DEF_V1(CMrpcsMonitor,      sendReport)
+DEF_V1(CMrpcsMgrE,         sendScanResult)
+DEF_V1(CMrpcsMgrE,         reportResult)
+DEF_V1(CMrpcsMgrE,         sendReport)
+DEF_V1(CMrpcsMgrE,         report)
+DEF_V1(CMrpcsMgrE,         upload)
+DEF_V1(CPointDataMgr,      report)
+DEF_V1(CPointDataMgr,      sendData)
+DEF_V1(CPointDataMgr,      uploadData)
+DEF_V1(CPointDataMgr,      dispatch)
+DEF_V1(CPointGlobalMgr,    report)
+DEF_V1(CPointGlobalMgr,    sendReport)
+DEF_V1(CPointGlobalMgr,    upload)
+DEF_V1(CMrpcsLFUpdater,    update)
+DEF_V1(CMrpcsLFUpdater,    start)
+DEF_V1(CMrpcsLFUpdater,    run)
+DEF_V1(CMrpcsLFUpdater,    check)
+DEF_V1(CMrpcsLFUpdater,    report)
+
+// ─── NetworkManager alert reporters ───
+DEF_V1(NetworkManager, sendRootAlert)
+DEF_V1(NetworkManager, sendEmuAlert)
+DEF_V1(NetworkManager, sendDebuggerAlert)
+DEF_V1(NetworkManager, sendCheatAlert)
+DEF_V1(NetworkManager, send9010Alert)
+DEF_V1(NetworkManager, send9014Alert)
+DEF_V1(NetworkManager, send9005Alert)
+DEF_V1(NetworkManager, sendShellReport)
+DEF_V1(NetworkManager, sendCheckState)
+
+// ─── AceMsgBoxImp ───
+DEF_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn)
+DEF_V1(AceMsgBoxImp, dismiss)
+DEF_V1(AceMsgBoxImp, show)
+
+#pragma mark =========================================================
+#pragma mark 12. EXTENDED IMPs — ID pass-through (v7.7)
+#pragma mark =========================================================
+
+// ─── TssInfoReceiver ───
+DEF_ID_P0(TssInfoReceiver, currentState)
+DEF_ID_P0(TssInfoReceiver, getState)
+DEF_ID_P0(TssInfoReceiver, getStatus)
+DEF_ID_P0(TssInfoReceiver, getReport)
+DEF_ID_P0(TssInfoReceiver, getResult)
+DEF_ID_P0(TssInfoReceiver, getData)
+DEF_ID_P0(TssInfoReceiver, getInfo)
+DEF_ID_P0(TssInfoReceiver, getRiskInfo)
+DEF_ID_P0(TssInfoReceiver, getCheatInfo)
+DEF_ID_P0(TssInfoReceiver, getEnvInfo)
+DEF_ID_P0(TssInfoReceiver, getConfig)
+DEF_ID_P1(TssInfoReceiver, updateState)
+DEF_ID_P1(TssInfoReceiver, setState)
+DEF_ID_P1(TssInfoReceiver, handleData)
+DEF_ID_P1(TssInfoReceiver, handleMessage)
+DEF_ID_P1(TssInfoReceiver, processData)
+DEF_ID_P1(TssInfoReceiver, onMessage)
+DEF_ID_P1(TssInfoReceiver, onCommand)
+
+// ─── AntiDataProxy ───
+DEF_ID_P0(AntiDataProxy, getData)
+DEF_ID_P0(AntiDataProxy, getPayload)
+DEF_ID_P0(AntiDataProxy, getHeader)
+DEF_ID_P0(AntiDataProxy, getBody)
+DEF_ID_P0(AntiDataProxy, getResponse)
+DEF_ID_P0(AntiDataProxy, getConfig)
+DEF_ID_P0(AntiDataProxy, getState)
+DEF_ID_P0(AntiDataProxy, getStatus)
+DEF_ID_P1(AntiDataProxy, setData)
+DEF_ID_P1(AntiDataProxy, setPayload)
+DEF_ID_P1(AntiDataProxy, setConfig)
+DEF_ID_P1(AntiDataProxy, process)
+DEF_ID_P1(AntiDataProxy, handle)
+DEF_ID_P1(AntiDataProxy, onReceive)
+DEF_ID_P1(AntiDataProxy, onMessage)
+DEF_ID_P2(AntiDataProxy, sendData_withHeader)
+DEF_ID_P2(AntiDataProxy, sendReport_withType)
+DEF_ID_P2(AntiDataProxy, postData_withURL)
+
+// ─── MRPCS getters ───
+DEF_ID_P0(CMrpcsMgrE,        getInstance)
+DEF_ID_P0(CMrpcsMgrE,        getState)
+DEF_ID_P0(CMrpcsMgrE,        getReport)
+DEF_ID_P0(CMrpcsMgrE,        getResult)
+DEF_ID_P0(CMrpcsMgrE,        getConfig)
+DEF_ID_P0(CMrpcsMonitor,     getState)
+DEF_ID_P0(CMrpcsMonitor,     getReport)
+DEF_ID_P0(CMrpcsMonitor,     getResult)
+DEF_ID_P0(CPointDataMgr,     getData)
+DEF_ID_P0(CPointDataMgr,     getReport)
+DEF_ID_P0(CPointDataMgr,     getState)
+DEF_ID_P0(CPointGlobalMgr,   getData)
+DEF_ID_P0(CPointGlobalMgr,   getReport)
+DEF_ID_P0(CPointGlobalMgr,   getState)
+DEF_ID_P0(CMrpcsLFUpdater,   getState)
+DEF_ID_P0(CMrpcsLFUpdater,   getConfig)
+DEF_ID_P0(CMrpcsLFUpdater,   getVersion)
+
+DEF_ID_P1(CMrpcsMgrE,        setConfig)
+DEF_ID_P1(CMrpcsMgrE,        setState)
+DEF_ID_P1(CMrpcsMgrE,        handleData)
+DEF_ID_P1(CMrpcsMgrE,        processData)
+DEF_ID_P1(CMrpcsMonitor,     setConfig)
+DEF_ID_P1(CMrpcsMonitor,     handleData)
+DEF_ID_P1(CPointDataMgr,     setData)
+DEF_ID_P1(CPointDataMgr,     handleData)
+DEF_ID_P1(CPointGlobalMgr,   setData)
+DEF_ID_P1(CPointGlobalMgr,   handleData)
+
+DEF_ID_P2(CMrpcsMgrE,        sendData_withType)
+DEF_ID_P2(CMrpcsMgrE,        handleMessage_withData)
+DEF_ID_P2(CPointDataMgr,     sendData_withType)
+DEF_ID_P2(CPointGlobalMgr,   sendData_withType)
+
+// ─── CheckSymbolSource ───
+DEF_ID_P0(CheckSymbolSource, getResult)
+DEF_ID_P0(CheckSymbolSource, getReport)
+DEF_ID_P1(CheckSymbolSource, checkSymbolSourceWithData)
+DEF_ID_P1(CheckSymbolSource, verifySymbolWithData)
+
+// ─── Screenshot / Rotate ───
+DEF_ID_P0(ScreenShot, takeScreenShot)
+DEF_ID_P0(ScreenShot, takeScreenShotEx)
+DEF_ID_P0(ScreenShot, screenshot)
+DEF_ID_P1(ScreenShot, takeScreenShotEx)
+DEF_ID_P1(ScreenShot, screenshotOfView)
+DEF_ID_P1(ScreenShot, getBufFromImage)
+DEF_ID_P1(ScreenShot, getAppWindowsForScreen)
+
+DEF_ID_P0(Rotate, rotate)
+DEF_ID_P0(Rotate, fixOrientation)
+DEF_ID_P0(Rotate, flipVertical)
+DEF_ID_P0(Rotate, flipHorizontal)
+DEF_ID_P1(Rotate, rotate)
+DEF_ID_P1(Rotate, imageRotatedByRadians)
+DEF_ID_P1(Rotate, imageRotatedByDegrees)
+
+// ─── AceMsgBoxImp ───
+DEF_ID_P0(AceMsgBoxImp, viewTitle)
+DEF_ID_P0(AceMsgBoxImp, viewContent)
+DEF_ID_P0(AceMsgBoxImp, leftBtnContent)
+DEF_ID_P0(AceMsgBoxImp, rightBtnContent)
+
+#pragma mark =========================================================
+#pragma mark 13. REGISTER EXTENDED
+#pragma mark =========================================================
+
+static void SBXK_RegisterExtended(void) {
+
+#define REG_B(cls, name)   SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
+#define REG_V1(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@")
+#define REG_V2(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@@")
+#define REG_ID0(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:")
+#define REG_ID1(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@")
+#define REG_ID2(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@@")
+
+    // AntiDataProxy
+    REG_B (AntiDataProxy, checkIntegrity);
+    REG_B (AntiDataProxy, isIntegrityOK);
+    REG_B (AntiDataProxy, verifyData);
+    REG_B (AntiDataProxy, isDataValid);
+    REG_B (AntiDataProxy, isModified);
+    REG_B (AntiDataProxy, isCheat);
+    REG_B (AntiDataProxy, isSuspicious);
+    REG_B (AntiDataProxy, antiCheatCheck);
+    REG_B (AntiDataProxy, securityCheck);
+    REG_B (AntiDataProxy, hasRisk);
+    REG_B (AntiDataProxy, detectRisk);
+    REG_B (AntiDataProxy, isRiskDetected);
+    REG_B (AntiDataProxy, isValid);
+    REG_B (AntiDataProxy, isSafe);
+    REG_B (AntiDataProxy, isClean);
+    REG_B (AntiDataProxy, verifyIntegrity);
+    REG_B (AntiDataProxy, verifySignature);
+    REG_B (AntiDataProxy, shouldPass);
+    REG_B (AntiDataProxy, allowReport);
+    REG_V1(AntiDataProxy, sendData);
+    REG_V1(AntiDataProxy, report);
+    REG_V1(AntiDataProxy, submit);
+    REG_V1(AntiDataProxy, upload);
+    REG_V1(AntiDataProxy, dispatch);
+    REG_V1(AntiDataProxy, flush);
+    REG_ID0(AntiDataProxy, getData);
+    REG_ID0(AntiDataProxy, getPayload);
+    REG_ID0(AntiDataProxy, getHeader);
+    REG_ID0(AntiDataProxy, getBody);
+    REG_ID0(AntiDataProxy, getResponse);
+    REG_ID0(AntiDataProxy, getConfig);
+    REG_ID0(AntiDataProxy, getState);
+    REG_ID0(AntiDataProxy, getStatus);
+    REG_ID1(AntiDataProxy, setData);
+    REG_ID1(AntiDataProxy, setPayload);
+    REG_ID1(AntiDataProxy, setConfig);
+    REG_ID1(AntiDataProxy, process);
+    REG_ID1(AntiDataProxy, handle);
+    REG_ID1(AntiDataProxy, onReceive);
+    REG_ID1(AntiDataProxy, onMessage);
+    REG_ID2(AntiDataProxy, sendData_withHeader);
+    REG_ID2(AntiDataProxy, sendReport_withType);
+    REG_ID2(AntiDataProxy, postData_withURL);
+
+    // TssInfoReceiver
+    REG_B (TssInfoReceiver, isRooted);
+    REG_B (TssInfoReceiver, isRootedDevice);
+    REG_B (TssInfoReceiver, isJailbroken);
+    REG_B (TssInfoReceiver, isJailbreakDevice);
+    REG_B (TssInfoReceiver, isEmulator);
+    REG_B (TssInfoReceiver, isEmulatorDevice);
+    REG_B (TssInfoReceiver, isSimulator);
+    REG_B (TssInfoReceiver, isDebuggerAttached);
+    REG_B (TssInfoReceiver, isDebugged);
+    REG_B (TssInfoReceiver, isModified);
+    REG_B (TssInfoReceiver, isTampered);
+    REG_B (TssInfoReceiver, isInjected);
+    REG_B (TssInfoReceiver, isHooked);
+    REG_B (TssInfoReceiver, hasCheat);
+    REG_B (TssInfoReceiver, hasCheatTool);
+    REG_B (TssInfoReceiver, hasSuspiciousFiles);
+    REG_B (TssInfoReceiver, hasRisk);
+    REG_B (TssInfoReceiver, checkEnvironment);
+    REG_B (TssInfoReceiver, checkSecurity);
+    REG_B (TssInfoReceiver, checkCheat);
+    REG_B (TssInfoReceiver, detectCheat);
+    REG_B (TssInfoReceiver, detectRisk);
+    REG_B (TssInfoReceiver, detectEnvironment);
+    REG_B (TssInfoReceiver, isCheating);
+    REG_B (TssInfoReceiver, isCheatDetected);
+    REG_B (TssInfoReceiver, isSuspicious);
+    REG_B (TssInfoReceiver, antiCheatCheck);
+    REG_B (TssInfoReceiver, securityCheck);
+    REG_B (TssInfoReceiver, shouldReport);
+    REG_B (TssInfoReceiver, shouldBlock);
+    REG_B (TssInfoReceiver, needReport);
+    REG_B (TssInfoReceiver, needBlock);
+    REG_B (TssInfoReceiver, isBlocked);
+    REG_B (TssInfoReceiver, isBanned);
+    REG_B (TssInfoReceiver, isSafe);
+    REG_B (TssInfoReceiver, isClean);
+    REG_B (TssInfoReceiver, isEnvironmentClean);
+    REG_B (TssInfoReceiver, isEnvironmentSafe);
+    REG_B (TssInfoReceiver, verifyIntegrity);
+    REG_B (TssInfoReceiver, verifySignature);
+    REG_B (TssInfoReceiver, checkTokenValid);
+    REG_V1(TssInfoReceiver, start);
+    REG_V1(TssInfoReceiver, stop);
+    REG_V1(TssInfoReceiver, run);
+    REG_V1(TssInfoReceiver, onReceiveData);
+    REG_V1(TssInfoReceiver, onRecvData);
+    REG_V1(TssInfoReceiver, report);
+    REG_V1(TssInfoReceiver, sendReport);
+    REG_V1(TssInfoReceiver, uploadReport);
+    REG_V1(TssInfoReceiver, submitReport);
+    REG_V1(TssInfoReceiver, reportRoot);
+    REG_V1(TssInfoReceiver, reportEmu);
+    REG_V1(TssInfoReceiver, reportDebugger);
+    REG_V1(TssInfoReceiver, reportCheat);
+    REG_V1(TssInfoReceiver, reportAlert);
+    REG_V1(TssInfoReceiver, sendAlert);
+    REG_V1(TssInfoReceiver, blockGame);
+    REG_V1(TssInfoReceiver, blockPlayer);
+    REG_V1(TssInfoReceiver, kickPlayer);
+    REG_ID0(TssInfoReceiver, currentState);
+    REG_ID0(TssInfoReceiver, getState);
+    REG_ID0(TssInfoReceiver, getStatus);
+    REG_ID0(TssInfoReceiver, getReport);
+    REG_ID0(TssInfoReceiver, getResult);
+    REG_ID0(TssInfoReceiver, getData);
+    REG_ID0(TssInfoReceiver, getInfo);
+    REG_ID0(TssInfoReceiver, getRiskInfo);
+    REG_ID0(TssInfoReceiver, getCheatInfo);
+    REG_ID0(TssInfoReceiver, getEnvInfo);
+    REG_ID0(TssInfoReceiver, getConfig);
+    REG_ID1(TssInfoReceiver, updateState);
+    REG_ID1(TssInfoReceiver, setState);
+    REG_ID1(TssInfoReceiver, handleData);
+    REG_ID1(TssInfoReceiver, handleMessage);
+    REG_ID1(TssInfoReceiver, processData);
+    REG_ID1(TssInfoReceiver, onMessage);
+    REG_ID1(TssInfoReceiver, onCommand);
+
+    // CheckSymbolSource
+    REG_B (CheckSymbolSource, CheckSymbol);
+    REG_B (CheckSymbolSource, checkSymbol);
+    REG_B (CheckSymbolSource, checkSymbolSource);
+    REG_B (CheckSymbolSource, isSymbolValid);
+    REG_B (CheckSymbolSource, isSymbolOK);
+    REG_B (CheckSymbolSource, verifySymbol);
+    REG_B (CheckSymbolSource, verifySymbols);
+    REG_B (CheckSymbolSource, isSourceSafe);
+    REG_B (CheckSymbolSource, checkSource);
+    REG_B (CheckSymbolSource, isSourceOK);
+    REG_B (CheckSymbolSource, sourceIsValid);
+    REG_ID0(CheckSymbolSource, getResult);
+    REG_ID0(CheckSymbolSource, getReport);
+    REG_ID1(CheckSymbolSource, checkSymbolSourceWithData);
+    REG_ID1(CheckSymbolSource, verifySymbolWithData);
+
+    // MRPCS
+    REG_B (CFastScanThread, isRunning);
+    REG_B (CFastScanThread, shouldScan);
+    REG_B (CFastScanThread, hasResult);
+    REG_V1(CFastScanThread, start);
+    REG_V1(CFastScanThread, run);
+    REG_V1(CFastScanThread, execute);
+    REG_V1(CFastScanThread, scan);
+    REG_V1(CFastScanThread, doScan);
+    REG_V1(CFastScanThread, report);
+    REG_V1(CFastScanThread, sendReport);
+
+    REG_B (CScanThread, isRunning);
+    REG_B (CScanThread, shouldScan);
+    REG_B (CScanThread, hasResult);
+    REG_V1(CScanThread, start);
+    REG_V1(CScanThread, run);
+    REG_V1(CScanThread, execute);
+    REG_V1(CScanThread, scan);
+    REG_V1(CScanThread, doScan);
+    REG_V1(CScanThread, report);
+    REG_V1(CScanThread, sendReport);
+
+    REG_B (CSendThread, isRunning);
+    REG_B (CSendThread, shouldSend);
+    REG_B (CSendThread, hasData);
+    REG_V1(CSendThread, start);
+    REG_V1(CSendThread, run);
+    REG_V1(CSendThread, execute);
+    REG_V1(CSendThread, send);
+    REG_V1(CSendThread, doSend);
+    REG_V1(CSendThread, report);
+
+    REG_B (CMrpcsMonitor, isRunning);
+    REG_B (CMrpcsMonitor, shouldReport);
+    REG_V1(CMrpcsMonitor, start);
+    REG_V1(CMrpcsMonitor, stop);
+    REG_V1(CMrpcsMonitor, run);
+    REG_V1(CMrpcsMonitor, execute);
+    REG_V1(CMrpcsMonitor, report);
+    REG_V1(CMrpcsMonitor, sendReport);
+    REG_ID0(CMrpcsMonitor, getState);
+    REG_ID0(CMrpcsMonitor, getReport);
+    REG_ID0(CMrpcsMonitor, getResult);
+    REG_ID1(CMrpcsMonitor, setConfig);
+    REG_ID1(CMrpcsMonitor, handleData);
+
+    REG_B (CMrpcsMgrE, isReady);
+    REG_B (CMrpcsMgrE, shouldReport);
+    REG_V1(CMrpcsMgrE, sendScanResult);
+    REG_V1(CMrpcsMgrE, reportResult);
+    REG_V1(CMrpcsMgrE, sendReport);
+    REG_V1(CMrpcsMgrE, report);
+    REG_V1(CMrpcsMgrE, upload);
+    REG_ID0(CMrpcsMgrE, getInstance);
+    REG_ID0(CMrpcsMgrE, getState);
+    REG_ID0(CMrpcsMgrE, getReport);
+    REG_ID0(CMrpcsMgrE, getResult);
+    REG_ID0(CMrpcsMgrE, getConfig);
+    REG_ID1(CMrpcsMgrE, setConfig);
+    REG_ID1(CMrpcsMgrE, setState);
+    REG_ID1(CMrpcsMgrE, handleData);
+    REG_ID1(CMrpcsMgrE, processData);
+    REG_ID2(CMrpcsMgrE, sendData_withType);
+    REG_ID2(CMrpcsMgrE, handleMessage_withData);
+
+    REG_B (CPointDataMgr, shouldReport);
+    REG_B (CPointDataMgr, hasData);
+    REG_V1(CPointDataMgr, report);
+    REG_V1(CPointDataMgr, sendData);
+    REG_V1(CPointDataMgr, uploadData);
+    REG_V1(CPointDataMgr, dispatch);
+    REG_ID0(CPointDataMgr, getData);
+    REG_ID0(CPointDataMgr, getReport);
+    REG_ID0(CPointDataMgr, getState);
+    REG_ID1(CPointDataMgr, setData);
+    REG_ID1(CPointDataMgr, handleData);
+    REG_ID2(CPointDataMgr, sendData_withType);
+
+    REG_B (CPointGlobalMgr, shouldReport);
+    REG_B (CPointGlobalMgr, hasData);
+    REG_V1(CPointGlobalMgr, report);
+    REG_V1(CPointGlobalMgr, sendReport);
+    REG_V1(CPointGlobalMgr, upload);
+    REG_ID0(CPointGlobalMgr, getData);
+    REG_ID0(CPointGlobalMgr, getReport);
+    REG_ID0(CPointGlobalMgr, getState);
+    REG_ID1(CPointGlobalMgr, setData);
+    REG_ID1(CPointGlobalMgr, handleData);
+    REG_ID2(CPointGlobalMgr, sendData_withType);
+
+    REG_B (CMrpcsLFUpdater, shouldUpdate);
+    REG_B (CMrpcsLFUpdater, hasUpdate);
+    REG_V1(CMrpcsLFUpdater, update);
+    REG_V1(CMrpcsLFUpdater, start);
+    REG_V1(CMrpcsLFUpdater, run);
+    REG_V1(CMrpcsLFUpdater, check);
+    REG_V1(CMrpcsLFUpdater, report);
+    REG_ID0(CMrpcsLFUpdater, getState);
+    REG_ID0(CMrpcsLFUpdater, getConfig);
+    REG_ID0(CMrpcsLFUpdater, getVersion);
+
+    // NetworkManager alert reporters
+    REG_V1(NetworkManager, sendRootAlert);
+    REG_V1(NetworkManager, sendEmuAlert);
+    REG_V1(NetworkManager, sendDebuggerAlert);
+    REG_V1(NetworkManager, sendCheatAlert);
+    REG_V1(NetworkManager, send9010Alert);
+    REG_V1(NetworkManager, send9014Alert);
+    REG_V1(NetworkManager, send9005Alert);
+    REG_V1(NetworkManager, sendShellReport);
+    REG_V1(NetworkManager, sendCheckState);
+
+    // ScreenShot / Rotate
+    REG_ID0(ScreenShot, takeScreenShot);
+    REG_ID0(ScreenShot, takeScreenShotEx);
+    REG_ID0(ScreenShot, screenshot);
+    REG_ID1(ScreenShot, takeScreenShotEx);
+    REG_ID1(ScreenShot, screenshotOfView);
+    REG_ID1(ScreenShot, getBufFromImage);
+    REG_ID1(ScreenShot, getAppWindowsForScreen);
+
+    REG_ID0(Rotate, rotate);
+    REG_ID0(Rotate, fixOrientation);
+    REG_ID0(Rotate, flipVertical);
+    REG_ID0(Rotate, flipHorizontal);
+    REG_ID1(Rotate, rotate);
+    REG_ID1(Rotate, imageRotatedByRadians);
+    REG_ID1(Rotate, imageRotatedByDegrees);
+
+    // AceMsgBoxImp
+    REG_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn);
+    REG_V1(AceMsgBoxImp, dismiss);
+    REG_V1(AceMsgBoxImp, show);
+    REG_ID0(AceMsgBoxImp, viewTitle);
+    REG_ID0(AceMsgBoxImp, viewContent);
+    REG_ID0(AceMsgBoxImp, leftBtnContent);
+    REG_ID0(AceMsgBoxImp, rightBtnContent);
+
+#undef REG_B
+#undef REG_V1
+#undef REG_V2
+#undef REG_ID0
+#undef REG_ID1
+#undef REG_ID2
+}
+
+#pragma mark =========================================================
+#pragma mark 14. REGISTER ALL (base + extended)
 #pragma mark =========================================================
 
 static void SBXK_RegisterAll(void) {
 
-#define REG_B(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
-#define REG_V1(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@")
+#define REG_B(cls, name)   SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
+#define REG_V1(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@")
+#define REG_ID0(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:")
+#define REG_ID1(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@")
+#define REG_ID2(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@@")
+#define REG_ID3(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@@@")
 
-    // Detection NO
+    // ─── BOOL detection ───
     REG_B(IntegrityChecker,  integrity_detect);
     REG_B(IntegrityChecker,  MTML_INTEGRITY_DETECT);
     REG_B(JailbreakDetector, isJailbroken);
@@ -411,8 +1120,6 @@ static void SBXK_RegisterAll(void) {
     REG_B(SecurityChecker,   isCydiaInstalled);
     REG_B(SecurityChecker,   hasSuspiciousFiles);
     REG_B(SecurityChecker,   isEnvironmentClean);
-
-    // Detection YES
     REG_B(SecurityChecker,   verifyIntegrity);
     REG_B(SecurityChecker,   checkTokenValid);
     REG_B(SecurityChecker,   isEnvironmentSafe);
@@ -421,7 +1128,7 @@ static void SBXK_RegisterAll(void) {
     REG_B(AReachability,     isConnectionRequired);
     REG_B(GVGCloudVoiceExtension, CheckDeviceMuteStat);
 
-    // GAD
+    // ─── void no-op ───
     REG_V1(GADAppOpenAd, adDidDismissFullScreenContent);
     REG_V1(GADAppOpenAd, adWillDismissFullScreenContent);
     REG_V1(GADAppOpenAd, adDidRecordClick);
@@ -430,67 +1137,119 @@ static void SBXK_RegisterAll(void) {
     REG_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError);
     REG_V1(GADAppOpenAd, setPaidEventHandler);
     REG_V1(GADAppOpenAd, adDidRecordUserInteraction);
-
-    // GSDK
-    REG_V1(GSDKPing, ping);
-    REG_V1(GSDKPing, stopPing);
-    REG_V1(GSDKPing, simplePing_didFailToSendPacket_sequenceNumber_error);
-    REG_V1(GSDKPing, simplePing_didFailWithError);
-    REG_V1(GSDKPing, simplePing_didReceivePingResponsePacket_sequenceNumber);
-    REG_V1(GSDKPing, simplePing_didReceiveUnexpectedPacket);
-    REG_V1(GSDKPing, simplePing_didSendPacket_sequenceNumber);
-    REG_V1(GSDKPing, simplePing_didStartWithAddress);
-    REG_V1(GSDKInGameManager, GSDKRealTimeDetect);
-    REG_V1(GSDKInGameSystem,  GSDKInnerRealTimeDetect);
-    REG_V1(GSDKHttpRequest,   requestControl_Openid_Acctype_Zoneid_Env);
-    REG_V1(GSDKInitManager,   detectOperation);
-    REG_V1(GSDKRealTimeDetect, pingDelayDetect);
-    REG_V1(GSDKRealTimeDetect, updDelayDetect_Port);
-    REG_V1(GSDKUdpDetect,     isUDPConnect_Port);
-    REG_V1(GSDKWIFI,          ping);
-    REG_V1(GSDKDetectPort,    isConnection_Port);
-
-    // GCloud — void(id)
-    REG_V1(GCloudVoiceEngine, StopRecording);
-    REG_V1(GCloudVoiceEngine, StartBGMPlay);
-    REG_V1(GCloudVoiceEngine, StopBGMPlay);
-    REG_V1(GCloudVoiceEngine, PauseBGMPlay);
-    REG_V1(GCloudVoiceEngine, ResumeBGMPlay);
-    REG_V1(GCloudVoiceEngine, RSTSStopRecording);
-    REG_V1(GCloudVoiceEngine, TextToStreamSpeechStop);
-    REG_V1(GCloudVoiceEngine, StartRecording);
-    REG_V1(GCloudVoiceEngine, SetBGMPath);
-    REG_V1(GCloudVoiceEngine, SetLogCallBack);
-
-    // Ads / Firebase / APM
     REG_V1(NetworkManager, SendSecurityReport);
-    REG_V1(FBAdMonitor,    startMonitoringAd);
-    REG_V1(FBAdEvent,      logEvent_withParameters);
-    REG_V1(FBAdLogger,     logMessage_withLevel);
-    REG_V1(FIRMessaging,   retrieveFCMTokenForSenderID_completion);
-    REG_V1(FIRMessaging,   deleteFCMTokenForSenderID_completion);
-    REG_V1(FIRMessaging,   subscribeToTopic_completion);
-    REG_V1(FIRMessaging,   unsubscribeFromTopic_completion);
-    REG_V1(FIRMessaging,   setAPNSToken_withUserInfo);
-    REG_V1(APMMonitor,     handleEvent);
-    REG_V1(APMMonitor,     startMonitoring);
-    REG_V1(APMCollector,   collectMetrics);
-    REG_V1(TApmSceneMarker, markLoadLevel);
-    REG_V1(TApmSceneMarker, postStepEvent);
-    REG_V1(TApmSceneMarker, postStreamEvent);
-    REG_V1(TDataMasterApplication, handleOpenURL);
-    REG_V1(TcApiTool,      openUniversallinkIfNeed);
-    REG_V1(TikTokAuth,     authorizeWithPermissions);
-    REG_V1(TikTokAuth,     handleOpenURL);
-    REG_V1(VKAuth,         authorizeWithPermissions);
-    REG_V1(SCSDKLoginClient, loginWithCompletion);
+
+    // ─── id pass-through — GSDK ───
+    REG_ID0(GSDKCPU,               getSystemCPUCircle);
+    REG_ID0(GSDKMemory,            getSystemAvailableMemory);
+    REG_ID0(GSDKInGameManager,     GSDKRealTimeDetect);
+    REG_ID0(GSDKInGameSystem,      GSDKInnerEnd);
+    REG_ID0(GSDKInGameSystem,      GSDKInnerRealTimeDetect);
+    REG_ID0(GSDKPing,              ping);
+    REG_ID0(GSDKPing,              stopPing);
+    REG_ID0(GSDKPingDetect,        ping);
+    REG_ID0(PingDelegate,          pingTimer);
+    REG_ID0(SimplePing,            start);
+    REG_ID0(SimplePing,            startWithHostAddress);
+    REG_ID0(SimplePing,            readData);
+    REG_ID0(GSDKRealTimeDetect,    pingDelayDetect);
+    REG_ID0(GSDKRealTimeDetect,    updDelayDetect_Port);
+    REG_ID0(GSDKUdpDetect,         isUDPConnect_Port);
+    REG_ID0(GSDKWIFI,              ping);
+    REG_ID0(GSDKDetectPort,        isConnection_Port);
+    REG_ID0(GSDKInitManager,       detectOperation);
+    REG_ID0(GSDKPayEvent,          GSDKPay_Tag_Status_Msg);
+    REG_ID0(GSDKHttpRequest,       requestControl_Openid_Acctype_Zoneid_Env);
+
+    REG_ID1(SimplePing,            sendPingWithData);
+    REG_ID1(SimplePing,            didFailWithError);
+    REG_ID1(FBAdViewabilityValidator, checkViewability);
+    REG_ID1(TApmSceneMarker,       postStepEvent);
+    REG_ID1(TApmSceneMarker,       postStreamEvent);
+    REG_ID1(APMCollector,          collectMetrics);
+    REG_ID1(APMCollector,          reportNow);
+    REG_ID1(AudioDeviceMgr,        UpdateDeviceState);
+
+    REG_ID2(SimplePing,            validatePingResponsePacket_sequenceNumber);
+    REG_ID2(FIRMessaging,          retrieveFCMTokenForSenderID_completion);
+    REG_ID2(FIRMessaging,          deleteFCMTokenForSenderID_completion);
+    REG_ID2(FIRMessaging,          subscribeToTopic_completion);
+    REG_ID2(FIRMessaging,          unsubscribeFromTopic_completion);
+    REG_ID2(FIRMessaging,          setAPNSToken_withUserInfo);
+    REG_ID2(GSDKInGameSystem,      GSDKInnerSaveFPS_FpsDots);
+
+    REG_ID3(SimplePing,            pingPacketWithType_payload_requiresChecksum);
+    REG_ID3(GSDKInGameSystem,      GSDKInnerStart_SceneID_RoomIP);
+
+    // ─── id pass-through — Voice ───
+    REG_ID0(GVGCloudVoice,           openMic);
+    REG_ID0(GVGCloudVoice,           openSpeaker);
+    REG_ID0(GVGCloudVoiceExtension,  GetBGMPlayState);
+    REG_ID0(GVGCloudVoiceExtension,  GetMicState);
+    REG_ID0(GVGCloudVoiceExtension,  GetSpeakerState);
+    REG_ID0(GVoiceMuteSwitch,        detectMuteSwitch);
+    REG_ID0(GCloudVoiceEngine,       StartTve);
+    REG_ID0(GCloudVoiceEngine,       TestMic);
+    REG_ID0(GCloudVoiceEngine,       GetMicLevel);
+    REG_ID0(GCloudVoiceEngine,       GetSpeakerLevel);
+    REG_ID0(GCloudVoiceEngine,       GetBGMLevel);
+    REG_ID0(GCloudVoiceEngine,       GetBGMFileTime);
+    REG_ID0(GCloudVoiceEngine,       GetBGMPlayTime);
+    REG_ID0(GCloudVoiceEngine,       GetRecordKaraokeTotalTime);
+    REG_ID0(GCloudVoiceEngine,       StartPreview);
+    REG_ID0(GCloudVoiceEngine,       StopPreview);
+    REG_ID0(GCloudVoiceEngine,       PauseKaraoke);
+    REG_ID0(GCloudVoiceEngine,       ResumeKaraoke);
+    REG_ID0(GCloudVoiceEngine,       RSTSStopRecording);
+    REG_ID0(GCloudVoiceEngine,       TextToStreamSpeechStop);
+    REG_ID0(GCloudVoiceEngine,       StopKaraokeRecording);
+    REG_ID0(GCloudCoreRemoteConfig,  getConfig);
+    REG_ID0(GCloudUnityPlugin,       Initialize);
+    REG_ID0(GCloudUnityPlugin,       ReportEvent);
+
+    REG_ID1(GCloudVoiceEngine,       StartRecording);
+    REG_ID1(GCloudVoiceEngine,       StopRecording);
+    REG_ID1(GCloudVoiceEngine,       StartBGMPlay);
+    REG_ID1(GCloudVoiceEngine,       StopBGMPlay);
+    REG_ID1(GCloudVoiceEngine,       PauseBGMPlay);
+    REG_ID1(GCloudVoiceEngine,       ResumeBGMPlay);
+    REG_ID1(GCloudVoiceEngine,       SetBGMPath);
+    REG_ID1(GCloudVoiceEngine,       SetLogCallBack);
+    REG_ID1(GCloudCoreRemoteConfig,  updateConfig);
+    REG_ID1(GCloudUnityPlugin,       SetGameObjectName);
+
+    REG_ID2(GCloudVoiceEngine,       QuitRoom_Scenes_timeout);
+
+    // ─── id pass-through — Firebase / Ads ───
+    REG_ID0(FIRMessagingRmqManager,  openDatabase);
+    REG_ID0(FIRMessaging,            APNSToken);
+    REG_ID0(GADAppOpenAd,            responseInfo);
+    REG_ID0(GADMobileAds,            initializationStatus);
+    REG_ID0(GADAdNetworkResponseInfo, adUnitMapping);
+    REG_ID0(FBAdViewabilityValidator, stopMonitoring);
+    REG_ID0(FBAdMonitor,             stopMonitoring);
+
+    // ─── id pass-through — APM ───
+    REG_ID0(APMDeviceInfoSupport,    getBatteryState);
+    REG_ID0(APMDeviceInfoSupport,    getThermalState);
+    REG_ID0(TApmSceneMarker,         markLevelFin);
+
+    // ─── id pass-through — Misc ───
+    REG_ID0(serviceCommunication,    getValueForKeypath);
+    REG_ID0(AudioDeviceMgr,          GetAudioDeviceConnectState);
+    REG_ID0(VKAuth,                  logout);
+    REG_ID0(SCSDKLoginClient,        logout);
 
 #undef REG_B
 #undef REG_V1
+#undef REG_ID0
+#undef REG_ID1
+#undef REG_ID2
+#undef REG_ID3
 }
 
 #pragma mark =========================================================
-#pragma mark 8. LOG VIEWER
+#pragma mark 15. LOG VIEWER
 #pragma mark =========================================================
 
 @interface SBXK_LogViewer : NSObject
@@ -555,7 +1314,7 @@ static void SBXK_RegisterAll(void) {
 @end
 
 #pragma mark =========================================================
-#pragma mark 9. RETRY + ENTRY
+#pragma mark 16. RETRY + ENTRY
 #pragma mark =========================================================
 
 static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
@@ -569,13 +1328,15 @@ static void SBXK_RetryPass(void) {
         return;
     }
     SBXK_RegisterAll();
+    SBXK_RegisterExtended();
 }
 
 static void SBXK_RunInstall(void) {
     atomic_store(&g_phase, 20);
     SBXK_RegisterAll();
+    SBXK_RegisterExtended();
     atomic_store(&g_phase, 30);
-    NSLog(@"[SBXK] v7.5 install: done=%lu skip=%lu",
+    NSLog(@"[SBXK] v7.7 install: done=%lu skip=%lu",
           (unsigned long)g_done.count, (unsigned long)g_skip.count);
 }
 
@@ -593,7 +1354,7 @@ static void SBXK_Bootstrap(void) {
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
 
-        NSLog(@"[SBXK] v7.5 boot");
+        NSLog(@"[SBXK] v7.7 boot");
 
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
