@@ -1,9 +1,20 @@
 // ============================================================================
-// ShadowBypass XK v6.1.1 — iOS 14+, arm64/arm64e, no jailbreak
+// ShadowBypass XK v6.1.2 — iOS 14+, arm64/arm64e, no jailbreak
 //
-// Fixes over v6.1:
-//   [A] كل Macros لا تطلب أسماء معاملات — تستخدم _a1.._aN داخلياً
-//   [B] g_hooks[] مقدَّم قبل SBXK_InstallAllSwizzles
+// v6.1.2:
+//   [A] إزالة كل البانر Amar VIP — لا UIAlertController، لا observer
+//   [B] Crash Logger: يلتقط SIGSEGV/ABRT/BUS/ILL/FPE/TRAP + NSException
+//       ويكتب: signal، phase، hook_idx، si_addr، backtrace على القرص
+//   [C] Phase Markers: تسجيل كل مرحلة في Documents/sbxk_phase.log
+//   [D] عند الإقلاع التالي: يُطبع محتوى آخر crash log في NSLog
+//   [E] dyld callback بسيط — يضبط flag فقط، بلا dispatch_async
+//   [F] Retry timer كل 5s للفئات المتأخرة
+//
+// قراءة السبب:
+//   - Console.app / idevicesyslog → ابحث [SBXK] → سيظهر PREVIOUS CRASH LOG
+//   - الملفات داخل التطبيق: Documents/sbxk_crash.log (الحالي)
+//                            Documents/sbxk_crash_prev.log (السابق)
+//                            Documents/sbxk_phase.log (تتبع المراحل)
 //
 // Build:
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -20,13 +31,49 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
-#import <os/lock.h>
+#import <signal.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <stdio.h>
 #import <string.h>
+
+// backtrace ضعيف التصريح (قد لا يكون موجوداً في بعض البيئات)
+extern int backtrace(void **buffer, int size) __attribute__((weak_import));
+extern void backtrace_symbols_fd(void *const *buffer, int size, int fd) __attribute__((weak_import));
 
 #define SBXK_LOG(fmt, ...) NSLog(@"[SBXK] " fmt, ##__VA_ARGS__)
 
 #pragma mark =========================================================
-#pragma mark 1. HOOK TABLE TYPE
+#pragma mark 0. PHASE + CRASH PATHS
+#pragma mark =========================================================
+
+static volatile int g_phase = 0;
+static volatile int g_current_hook = -1;
+
+static char g_crash_path[512] = {0};
+static char g_phase_path[512] = {0};
+
+// — كتابات آمنة في سياق الإشارة —
+static void sbxk_wr(int fd, const char *s) {
+    if (!s) s = "(null)";
+    size_t len = strlen(s);
+    while (len > 0) {
+        ssize_t w = write(fd, s, len);
+        if (w <= 0) return;
+        s += w; len -= (size_t)w;
+    }
+}
+static void sbxk_wrn(int fd, long v) {
+    char b[32]; int n = snprintf(b, sizeof(b), "%ld", v);
+    if (n > 0) write(fd, b, (size_t)n);
+}
+static void sbxk_wrhex(int fd, const void *p) {
+    char b[32]; int n = snprintf(b, sizeof(b), "%p", p);
+    if (n > 0) write(fd, b, (size_t)n);
+}
+
+#pragma mark =========================================================
+#pragma mark 1. TYPE + GLOBALS
 #pragma mark =========================================================
 
 typedef struct {
@@ -37,11 +84,10 @@ typedef struct {
 } sbxk_hook_t;
 
 static NSMutableSet<NSString *> *g_pendingClasses = nil;
-static os_unfair_lock g_retry_lock = OS_UNFAIR_LOCK_INIT;
 static volatile bool  g_retry_pending = false;
 
 #pragma mark =========================================================
-#pragma mark 2. IMP DEFINITION MACROS — بدون arg names
+#pragma mark 2. IMP MACROS — بلا أسماء معاملات
 #pragma mark =========================================================
 
 #define DEF_BOOL_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return NO; }
@@ -51,8 +97,6 @@ static volatile bool  g_retry_pending = false;
 #define DEF_ID_1(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; return @(0); }
 #define DEF_ID_2(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; return @(0); }
 #define DEF_ID_3(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3; return @(0); }
-#define DEF_ID_4(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3, id _a4) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3;(void)_a4; return @(0); }
-#define DEF_ID_5(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3, id _a4, id _a5) { (void)_s;(void)_c;(void)_a1;(void)_a2;(void)_a3;(void)_a4;(void)_a5; return @(0); }
 
 #define DEF_VOID_0(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; }
 #define DEF_VOID_1(cls, name) static void SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; }
@@ -105,7 +149,7 @@ DEF_BOOL_YES(AReachability, isConnectionOnDemand)
 DEF_BOOL_YES(AReachability, isConnectionRequired)
 DEF_BOOL_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
 
-// --- GAD callbacks — void (id, SEL, id) ---
+// --- GAD ---
 DEF_VOID_1(GADAppOpenAd, adDidDismissFullScreenContent)
 DEF_VOID_1(GADAppOpenAd, adWillDismissFullScreenContent)
 DEF_VOID_1(GADAppOpenAd, adDidRecordClick)
@@ -124,7 +168,7 @@ static id SBXK_WeaponProcessor_CalculateDamage(id _s, SEL _c, id _t, float _d) {
 DEF_BOOL_NO(CharacterMovement, IsSpeedExceeded)
 DEF_ID_0(BulletSimulator, CheckWallCollision)
 static void SBXK_NetworkManager_SendSecurityReport(id _s, SEL _c, id _r) {
-    (void)_s; (void)_c; (void)_r; SBXK_LOG(@"suppressed SecurityReport");
+    (void)_s; (void)_c; (void)_r;
 }
 
 // --- GSDK ---
@@ -306,11 +350,10 @@ static NSInteger SBXK_ATTrackingManager_trackingAuthorizationStatus(id _s, SEL _
 }
 
 #pragma mark =========================================================
-#pragma mark 4. HOOK TABLE — قبل المُثبِّت
+#pragma mark 4. HOOK TABLE
 #pragma mark =========================================================
 
 static const sbxk_hook_t g_hooks[] = {
-    // Detection
     {"IntegrityChecker", "integrity_detect", (IMP)SBXK_IntegrityChecker_integrity_detect, "B"},
     {"IntegrityChecker", "MTML_INTEGRITY_DETECT", (IMP)SBXK_IntegrityChecker_MTML_INTEGRITY_DETECT, "B"},
     {"JailbreakDetector", "isJailbroken", (IMP)SBXK_JailbreakDetector_isJailbroken, "B"},
@@ -349,7 +392,6 @@ static const sbxk_hook_t g_hooks[] = {
     {"AReachability", "isConnectionRequired", (IMP)SBXK_AReachability_isConnectionRequired, "B"},
     {"GVGCloudVoiceExtension", "CheckDeviceMuteStat", (IMP)SBXK_GVGCloudVoiceExtension_CheckDeviceMuteStat, "B"},
 
-    // GAD — void callbacks
     {"GADAppOpenAd", "adDidDismissFullScreenContent:", (IMP)SBXK_GADAppOpenAd_adDidDismissFullScreenContent, "v"},
     {"GADAppOpenAd", "adWillDismissFullScreenContent:", (IMP)SBXK_GADAppOpenAd_adWillDismissFullScreenContent, "v"},
     {"GADAppOpenAd", "adDidRecordClick:", (IMP)SBXK_GADAppOpenAd_adDidRecordClick, "v"},
@@ -361,13 +403,11 @@ static const sbxk_hook_t g_hooks[] = {
     {"GADMobileAds", "initializationStatus", (IMP)SBXK_GADMobileAds_initializationStatus, "@"},
     {"GADAdNetworkResponseInfo", "adUnitMapping", (IMP)SBXK_GADAdNetworkResponseInfo_adUnitMapping, "@"},
 
-    // Game
     {"WeaponProcessor", "CalculateDamage:distance:", (IMP)SBXK_WeaponProcessor_CalculateDamage, "@"},
     {"CharacterMovement", "IsSpeedExceeded", (IMP)SBXK_CharacterMovement_IsSpeedExceeded, "B"},
     {"BulletSimulator", "CheckWallCollision", (IMP)SBXK_BulletSimulator_CheckWallCollision, "@"},
     {"NetworkManager", "SendSecurityReport:", (IMP)SBXK_NetworkManager_SendSecurityReport, "v"},
 
-    // GSDK
     {"GSDKCPU", "getSystemCPUCircle", (IMP)SBXK_GSDKCPU_getSystemCPUCircle, "@"},
     {"GSDKMemory", "getSystemAvailableMemory", (IMP)SBXK_GSDKMemory_getSystemAvailableMemory, "@"},
     {"GSDKInGameManager", "GSDKRealTimeDetect", (IMP)SBXK_GSDKInGameManager_GSDKRealTimeDetect, "@"},
@@ -409,7 +449,6 @@ static const sbxk_hook_t g_hooks[] = {
     {"SimplePing", "validatePingResponsePacket:sequenceNumber:", (IMP)SBXK_SimplePing_validatePingResponsePacket_sequenceNumber, "@"},
     {"SimplePing", "pingPacketWithType:payload:requiresChecksum:", (IMP)SBXK_SimplePing_pingPacketWithType_payload_requiresChecksum, "@"},
 
-    // Voice
     {"GVGCloudVoice", "openMic", (IMP)SBXK_GVGCloudVoice_openMic, "@"},
     {"GVGCloudVoice", "openSpeaker", (IMP)SBXK_GVGCloudVoice_openSpeaker, "@"},
     {"GVGCloudVoice", "setAppInfo:withKey:andOpenID:", (IMP)SBXK_GVGCloudVoice_setAppInfo_withKey_andOpenID, "v"},
@@ -475,7 +514,6 @@ static const sbxk_hook_t g_hooks[] = {
     {"GCloudUnityPlugin", "ReportEvent", (IMP)SBXK_GCloudUnityPlugin_ReportEvent, "@"},
     {"GCloudUnityPlugin", "SetGameObjectName:", (IMP)SBXK_GCloudUnityPlugin_SetGameObjectName, "@"},
 
-    // Firebase / Ads
     {"FIRMessagingRmqManager", "openDatabase", (IMP)SBXK_FIRMessagingRmqManager_openDatabase, "@"},
     {"FIRMessaging", "retrieveFCMTokenForSenderID:completion:", (IMP)SBXK_FIRMessaging_retrieveFCMTokenForSenderID_completion, "@"},
     {"FIRMessaging", "deleteFCMTokenForSenderID:completion:", (IMP)SBXK_FIRMessaging_deleteFCMTokenForSenderID_completion, "@"},
@@ -490,7 +528,6 @@ static const sbxk_hook_t g_hooks[] = {
     {"FBAdEvent", "logEvent:withParameters:", (IMP)SBXK_FBAdEvent_logEvent_withParameters, "@"},
     {"FBAdLogger", "logMessage:withLevel:", (IMP)SBXK_FBAdLogger_logMessage_withLevel, "@"},
 
-    // QQ
     {"QQApiInterface", "sendReq:resultBlock:", (IMP)SBXK_QQApiInterface_sendReq_resultBlock, "@"},
     {"QQApiInterface", "sendThirdAppBindGroupReq:resultBlock:", (IMP)SBXK_QQApiInterface_sendThirdAppBindGroupReq_resultBlock, "@"},
     {"QQApiInterface", "sendThirdAppUnBindGroupReq:resultBlock:", (IMP)SBXK_QQApiInterface_sendThirdAppUnBindGroupReq_resultBlock, "@"},
@@ -505,7 +542,6 @@ static const sbxk_hook_t g_hooks[] = {
     {"TcApiTool", "openUniversallinkIfNeed:", (IMP)SBXK_TcApiTool_openUniversallinkIfNeed, "@"},
     {"GTMSessionFetcher", "setSystemCompletionHandler:forSessionIdentifier:", (IMP)SBXK_GTMSessionFetcher_setSystemCompletionHandler_forSessionIdentifier, "@"},
 
-    // IMSDK
     {"IMSDKNoticeIMSDKManager", "getImageCache:imagePath:imageHash:queue:completeHandle:", (IMP)SBXK_IMSDKNoticeIMSDKManager_getImageCache_imagePath_imageHash_queue_completeHandle, "@"},
     {"IMSDKNoticeIMSDKManager", "imsdkCoreKitNoticeImageFileHash:", (IMP)SBXK_IMSDKNoticeIMSDKManager_imsdkCoreKitNoticeImageFileHash, "@"},
     {"IMSDKStatAdjustManager", "reportEvent:eventBody:isRealtime:", (IMP)SBXK_IMSDKStatAdjustManager_reportEvent_eventBody_isRealtime, "@"},
@@ -514,7 +550,6 @@ static const sbxk_hook_t g_hooks[] = {
     {"IMSDKStatAdjustManager", "reportRevenue:currencyCode:revenueValue:params:extraJson:", (IMP)SBXK_IMSDKStatAdjustManager_reportRevenue_currencyCode_revenueValue_params_extraJson, "@"},
     {"INTLWebViewManager", "openURL:observerID:baseParams:", (IMP)SBXK_INTLWebViewManager_openURL_observerID_baseParams, "@"},
 
-    // APM
     {"APMMonitor", "handleEvent:", (IMP)SBXK_APMMonitor_handleEvent, "@"},
     {"APMMonitor", "startMonitoring:", (IMP)SBXK_APMMonitor_startMonitoring, "@"},
     {"APMDeviceInfoSupport", "getBatteryState", (IMP)SBXK_APMDeviceInfoSupport_getBatteryState, "@"},
@@ -526,7 +561,6 @@ static const sbxk_hook_t g_hooks[] = {
     {"TApmSceneMarker", "postStepEvent:", (IMP)SBXK_TApmSceneMarker_postStepEvent, "@"},
     {"TApmSceneMarker", "postStreamEvent:", (IMP)SBXK_TApmSceneMarker_postStreamEvent, "@"},
 
-    // Misc
     {"serviceCommunication", "getValueForKeypath", (IMP)SBXK_serviceCommunication_getValueForKeypath, "@"},
     {"AudioDeviceMgr", "GetAudioDeviceConnectState", (IMP)SBXK_AudioDeviceMgr_GetAudioDeviceConnectState, "@"},
     {"AudioDeviceMgr", "UpdateDeviceState:", (IMP)SBXK_AudioDeviceMgr_UpdateDeviceState, "@"},
@@ -537,13 +571,123 @@ static const sbxk_hook_t g_hooks[] = {
     {"SCSDKLoginClient", "loginWithCompletion:", (IMP)SBXK_SCSDKLoginClient_loginWithCompletion, "@"},
     {"SCSDKLoginClient", "logout", (IMP)SBXK_SCSDKLoginClient_logout, "@"},
 
-    // Advertising
     {"ASIdentifierManager", "advertisingIdentifier", (IMP)SBXK_ASIdentifierManager_advertisingIdentifier, "@"},
     {"ATTrackingManager", "trackingAuthorizationStatus", (IMP)SBXK_ATTrackingManager_trackingAuthorizationStatus, "q"},
 };
 
 #pragma mark =========================================================
-#pragma mark 5. INSTALL DRIVER
+#pragma mark 5. CRASH LOGGER
+#pragma mark =========================================================
+
+static void sbxk_signal_handler(int sig, siginfo_t *info, void *ctx) {
+    (void)ctx;
+    if (g_crash_path[0] == 0) { signal(sig, SIG_DFL); raise(sig); return; }
+
+    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        sbxk_wr(fd, "\n=== SBXK CRASH ===\n");
+        sbxk_wr(fd, "signal="); sbxk_wrn(fd, sig); sbxk_wr(fd, "\n");
+        sbxk_wr(fd, "phase=");  sbxk_wrn(fd, g_phase); sbxk_wr(fd, "\n");
+        sbxk_wr(fd, "hook_idx="); sbxk_wrn(fd, g_current_hook); sbxk_wr(fd, "\n");
+        if (g_current_hook >= 0) {
+            size_t n = sizeof(g_hooks) / sizeof(g_hooks[0]);
+            if ((size_t)g_current_hook < n) {
+                sbxk_wr(fd, "hook_cls="); sbxk_wr(fd, g_hooks[g_current_hook].cls); sbxk_wr(fd, "\n");
+                sbxk_wr(fd, "hook_sel="); sbxk_wr(fd, g_hooks[g_current_hook].sel); sbxk_wr(fd, "\n");
+            }
+        }
+        if (info) {
+            sbxk_wr(fd, "si_addr="); sbxk_wrhex(fd, info->si_addr); sbxk_wr(fd, "\n");
+        }
+        if (backtrace && backtrace_symbols_fd) {
+            sbxk_wr(fd, "--- backtrace ---\n");
+            void *frames[64];
+            int nf = backtrace(frames, 64);
+            backtrace_symbols_fd(frames, nf, fd);
+        }
+        sbxk_wr(fd, "=== END CRASH ===\n");
+        close(fd);
+    }
+
+    // إعادة تشغيل الإشارة الافتراضية بعد كتابة السجل
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void sbxk_uncaught_exception(NSException *e) {
+    if (g_crash_path[0] == 0) return;
+
+    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        sbxk_wr(fd, "\n=== SBXK EXCEPTION ===\n");
+        sbxk_wr(fd, "phase="); sbxk_wrn(fd, g_phase); sbxk_wr(fd, "\n");
+        sbxk_wr(fd, "hook_idx="); sbxk_wrn(fd, g_current_hook); sbxk_wr(fd, "\n");
+        sbxk_wr(fd, "name="); sbxk_wr(fd, [[e name] UTF8String]); sbxk_wr(fd, "\n");
+        sbxk_wr(fd, "reason="); sbxk_wr(fd, [[e reason] UTF8String]); sbxk_wr(fd, "\n");
+        if (backtrace && backtrace_symbols_fd) {
+            sbxk_wr(fd, "--- backtrace ---\n");
+            void *frames[64];
+            int nf = backtrace(frames, 64);
+            backtrace_symbols_fd(frames, nf, fd);
+        }
+        sbxk_wr(fd, "=== END EXCEPTION ===\n");
+        close(fd);
+    }
+}
+
+static void SBXK_InitCrashPaths(void) {
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *c = [docs stringByAppendingPathComponent:@"sbxk_crash.log"];
+    NSString *p = [docs stringByAppendingPathComponent:@"sbxk_phase.log"];
+    strncpy(g_crash_path, c.UTF8String, sizeof(g_crash_path) - 1);
+    strncpy(g_phase_path, p.UTF8String, sizeof(g_phase_path) - 1);
+}
+
+static void SBXK_InstallCrashHandlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = sbxk_signal_handler;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL);
+    sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+
+    NSSetUncaughtExceptionHandler(&sbxk_uncaught_exception);
+}
+
+static void SBXK_MarkPhase(int p, const char *msg) {
+    g_phase = p;
+    if (g_phase_path[0] == 0) return;
+    int fd = open(g_phase_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    sbxk_wr(fd, "phase="); sbxk_wrn(fd, p);
+    if (msg) { sbxk_wr(fd, " msg="); sbxk_wr(fd, msg); }
+    sbxk_wr(fd, "\n");
+    close(fd);
+}
+
+static void SBXK_FlushPreviousCrash(void) {
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *current = [docs stringByAppendingPathComponent:@"sbxk_crash.log"];
+    NSString *prev    = [docs stringByAppendingPathComponent:@"sbxk_crash_prev.log"];
+
+    if (![[NSFileManager defaultManager] fileExistsAtPath:current]) return;
+    NSData *data = [NSData dataWithContentsOfFile:current];
+    if (data.length > 0) {
+        NSString *s = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (s) SBXK_LOG(@"PREVIOUS CRASH LOG:\n%@", s);
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:prev error:nil];
+    [[NSFileManager defaultManager] moveItemAtPath:current toPath:prev error:nil];
+}
+
+#pragma mark =========================================================
+#pragma mark 6. INSTALL DRIVER
 #pragma mark =========================================================
 
 static const char *SBXK_ReturnTypeForMethod(Class c, SEL s, BOOL *isClassMethod) {
@@ -554,8 +698,8 @@ static const char *SBXK_ReturnTypeForMethod(Class c, SEL s, BOOL *isClassMethod)
         if (m) { if (isClassMethod) *isClassMethod = YES; }
         else return NULL;
     }
-    Class sigHolder = *isClassMethod ? object_getClass(c) : c;
-    NSMethodSignature *sig = [sigHolder instanceMethodSignatureForSelector:s];
+    Class holder = *isClassMethod ? object_getClass(c) : c;
+    NSMethodSignature *sig = [holder instanceMethodSignatureForSelector:s];
     if (sig) return [sig methodReturnType];
     return method_getTypeEncoding(m);
 }
@@ -569,7 +713,7 @@ static void SBXK_InstallOneHook(const sbxk_hook_t *h) {
     SEL s = sel_registerName(h->sel);
     BOOL isClassMethod = NO;
     const char *ret = SBXK_ReturnTypeForMethod(c, s, &isClassMethod);
-    if (!ret) { SBXK_LOG(@"skip %s -%s (no method)", h->cls, h->sel); return; }
+    if (!ret) return;
     if (strcmp(ret, h->expectedRet) != 0) {
         SBXK_LOG(@"skip %s -%s (ret='%s' want='%s')", h->cls, h->sel, ret, h->expectedRet);
         return;
@@ -588,14 +732,16 @@ static void SBXK_InstallAllSwizzles(void) {
     size_t n = sizeof(g_hooks) / sizeof(g_hooks[0]);
     size_t missing = 0;
     for (size_t i = 0; i < n; i++) {
+        g_current_hook = (int)i;
         if (!objc_getClass(g_hooks[i].cls)) { missing++; continue; }
         SBXK_InstallOneHook(&g_hooks[i]);
     }
+    g_current_hook = -1;
     SBXK_LOG(@"install pass: total=%zu missing_classes=%zu", n, missing);
 }
 
 #pragma mark =========================================================
-#pragma mark 6. NSFileManager SWIZZLE
+#pragma mark 7. NSFileManager SWIZZLE
 #pragma mark =========================================================
 
 static NSArray<NSString *> *SBXK_JailbreakPrefixes(void) {
@@ -611,23 +757,17 @@ static NSArray<NSString *> *SBXK_JailbreakPrefixes(void) {
 static BOOL SBXK_NSFileManager_fileExistsAtPath_(id self, SEL _cmd, NSString *path) {
     for (NSString *p in SBXK_JailbreakPrefixes())
         if ([path isEqualToString:p] || [path hasPrefix:p]) return NO;
-    IMP orig = class_getMethodImplementation([NSFileManager class],
-                                              @selector(SBXK_orig_fileExistsAtPath:));
-    if (orig) {
-        BOOL (*fn)(id, SEL, NSString *) = (void *)orig;
-        return fn(self, @selector(SBXK_orig_fileExistsAtPath:), path);
-    }
+    IMP orig = class_getMethodImplementation([NSFileManager class], @selector(SBXK_orig_fileExistsAtPath:));
+    if (orig) { BOOL (*fn)(id, SEL, NSString *) = (void *)orig;
+        return fn(self, @selector(SBXK_orig_fileExistsAtPath:), path); }
     return NO;
 }
 static BOOL SBXK_NSFileManager_fileExistsAtPath_isDirectory_(id self, SEL _cmd, NSString *path, BOOL *isDir) {
     for (NSString *p in SBXK_JailbreakPrefixes())
         if ([path isEqualToString:p] || [path hasPrefix:p]) { if (isDir) *isDir = NO; return NO; }
-    IMP orig = class_getMethodImplementation([NSFileManager class],
-                                              @selector(SBXK_orig_fileExistsAtPath:isDirectory:));
-    if (orig) {
-        BOOL (*fn)(id, SEL, NSString *, BOOL *) = (void *)orig;
-        return fn(self, @selector(SBXK_orig_fileExistsAtPath:isDirectory:), path, isDir);
-    }
+    IMP orig = class_getMethodImplementation([NSFileManager class], @selector(SBXK_orig_fileExistsAtPath:isDirectory:));
+    if (orig) { BOOL (*fn)(id, SEL, NSString *, BOOL *) = (void *)orig;
+        return fn(self, @selector(SBXK_orig_fileExistsAtPath:isDirectory:), path, isDir); }
     return NO;
 }
 
@@ -646,61 +786,6 @@ static void SBXK_InstallFileManagerSwizzle(void) {
         method_setImplementation(m2, (IMP)SBXK_NSFileManager_fileExistsAtPath_isDirectory_);
     }
 }
-
-#pragma mark =========================================================
-#pragma mark 7. BANNER — Notification-based
-#pragma mark =========================================================
-
-@interface SBXK_Banner : NSObject
-@end
-
-@implementation SBXK_Banner
-
-+ (void)installObserver {
-    [[NSNotificationCenter defaultCenter]
-        addObserver:self
-           selector:@selector(onFinishLaunching:)
-               name:UIApplicationDidFinishLaunchingNotification
-             object:nil];
-}
-
-+ (void)onFinishLaunching:(NSNotification *)note {
-    (void)note;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self show]; });
-}
-
-+ (void)show {
-    UIWindow *w = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if (s.activationState == UISceneActivationStateForegroundActive &&
-                [s isKindOfClass:[UIWindowScene class]]) {
-                for (UIWindow *win in ((UIWindowScene *)s).windows)
-                    if (win.isKeyWindow) { w = win; break; }
-                if (w) break;
-            }
-        }
-    }
-    if (!w) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        w = [UIApplication sharedApplication].keyWindow;
-#pragma clang diagnostic pop
-    }
-    if (!w || !w.rootViewController) return;
-    if (w.rootViewController.presentedViewController) return;
-
-    UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"AMAR VIP 2026"
-        message:@"حماية عمار مفعلة 😎\nالحساب الآن تحت الحماية الشبحية."
-        preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"استمرار"
-                                          style:UIAlertActionStyleDefault handler:nil]];
-    [w.rootViewController presentViewController:a animated:YES completion:nil];
-}
-
-@end
 
 #pragma mark =========================================================
 #pragma mark 8. FILE CLEANUP
@@ -730,20 +815,23 @@ static void SBXK_StartCleanupTimer(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 9. DYLD CALLBACK
+#pragma mark 9. RETRY — dyld callback + periodic timer
 #pragma mark =========================================================
 
 static void sbxk_image_added_cb(const struct mach_header *mh, intptr_t slide) {
     (void)mh; (void)slide;
-    os_unfair_lock_lock(&g_retry_lock);
-    g_retry_pending = true;
-    os_unfair_lock_unlock(&g_retry_lock);
+    g_retry_pending = true;   // simple flag — no locks, no dispatch
+}
+
+static void SBXK_StartRetryTimer(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        os_unfair_lock_lock(&g_retry_lock);
-        bool run = g_retry_pending;
-        g_retry_pending = false;
-        os_unfair_lock_unlock(&g_retry_lock);
-        if (run) SBXK_InstallAllSwizzles();
+        [NSTimer scheduledTimerWithTimeInterval:5.0 repeats:YES block:^(NSTimer *t) {
+            (void)t;
+            if (g_retry_pending) {
+                g_retry_pending = false;
+                SBXK_InstallAllSwizzles();
+            }
+        }];
     });
 }
 
@@ -752,20 +840,36 @@ static void sbxk_image_added_cb(const struct mach_header *mh, intptr_t slide) {
 #pragma mark =========================================================
 
 static void SBXK_RunInstalls(void) {
-    SBXK_LOG(@"v6.1.1 install pass — start");
+    SBXK_MarkPhase(20, "install_start");
     SBXK_InstallAllSwizzles();
+    SBXK_MarkPhase(30, "swizzle_done");
     SBXK_InstallFileManagerSwizzle();
+    SBXK_MarkPhase(40, "filemanager_done");
     SBXK_StartCleanupTimer();
-    SBXK_LOG(@"v6.1.1 install pass — done");
+    SBXK_StartRetryTimer();
+    SBXK_MarkPhase(50, "install_done");
 }
 
 __attribute__((constructor))
 static void SBXK_Bootstrap(void) {
     @autoreleasepool {
-        SBXK_LOG(@"v6.1.1 boot");
+        // 1) Paths + crash handlers FIRST — قبل أي شيء آخر
+        SBXK_InitCrashPaths();
+        SBXK_InstallCrashHandlers();
+        SBXK_MarkPhase(1, "boot");
+
+        // 2) طبع أي crash سابق في system log
+        SBXK_FlushPreviousCrash();
+        SBXK_MarkPhase(2, "flushed");
+
+        SBXK_LOG(@"v6.1.2 boot");
         g_pendingClasses = [NSMutableSet set];
-        [SBXK_Banner installObserver];
+
+        // 3) dyld retry
         _dyld_register_func_for_add_image(sbxk_image_added_cb);
+        SBXK_MarkPhase(3, "dyld_registered");
+
+        // 4) install pass بعد 7s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(7 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool { SBXK_RunInstalls(); }
