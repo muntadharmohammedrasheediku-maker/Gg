@@ -1,19 +1,20 @@
 // ============================================================================
-// ShadowBypass XK v7.7 — iOS 14+, arm64
-// Full integrated single-file build.
+// ShadowBypass XK v7.10 — iOS 14+ arm64 — SINGLE FILE (.mm, ObjC++)
 //
-//   v7.6 core  : detection NO, lifecycle no-op, id pass-through
-//   v7.7 ext   : TssInfo / AntiDataProxy / MRPCS / CheckSymbol / Alert gates
-//
-// قاعدة pass-through id:
-//   DEF_ID_Pn → يستدعي الأصل ويرجّع النتيجة كما هي.
-//   لا يصنع كائنًا جديدًا → لا unrecognized selector.
+//   - Core detection-no + lifecycle no-op + id pass-through
+//   - TssInfo / AntiDataProxy / MRPCS / CheckSymbol / Alert gates
+//   - Injection-tool kill + real ObjC classes dari imports.txt
+//   - C++ mangled rebind via fishhook (inline)
+//   - Compile-time XOR string obfuscation (constexpr)
+//   - Anti-debug (ptrace / sysctl)
+//   - Self-integrity + crash log
 //
 // البناء:
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 //   clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=14.0 \
-//         -fobjc-arc -fblocks -O2 -dynamiclib -Wno-nullability-completeness \
-//         ShadowBypassXK.m \
+//         -fobjc-arc -fblocks -O2 -dynamiclib -std=c++17 \
+//         -fvisibility=hidden -Wno-nullability-completeness \
+//         ShadowBypassXK.mm \
 //         -framework Foundation -framework UIKit -framework Security -framework AdSupport \
 //         -o ShadowBypassXK.dylib
 // ============================================================================
@@ -23,23 +24,109 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <mach/mach.h>
+#import <mach/mach_time.h>
 #import <signal.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <string.h>
+#import <stdint.h>
 #import <stdatomic.h>
+#import <dlfcn.h>
+#import <sys/mman.h>
+#import <sys/sysctl.h>
+#import <sys/types.h>
+#include <array>
 
 #pragma mark =========================================================
-#pragma mark 0. GLOBALS
+#pragma mark 0. STRING OBFUSCATION — constexpr XOR (compile-time)
+#pragma mark =========================================================
+//
+// xors() di-evaluate di compile-time. Hanya ciphertext yang masuk binary.
+// Plaintext literal tidak di-emit dengan -O2 (biasanya — cek `strings`).
+
+template <size_t N>
+constexpr std::array<uint8_t, N> sbxk_xors(const char (&s)[N], uint32_t seed) {
+    std::array<uint8_t, N> out{};
+    for (size_t i = 0; i < N; i++) {
+        uint32_t k = seed + (uint32_t)i * 0x9E3779B1u;
+        k ^= k >> 13; k *= 0x85EBCA6Bu; k ^= k >> 16;
+        uint8_t b = (uint8_t)s[i];
+        b = (uint8_t)((b << 3) | (b >> 5));
+        out[i] = b ^ (uint8_t)k;
+    }
+    return out;
+}
+
+static NSString *SBXK_Dec(const uint8_t *blob, size_t n, uint32_t seed) {
+    char buf[256];
+    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+    for (size_t i = 0; i < n; i++) {
+        uint32_t k = seed + (uint32_t)i * 0x9E3779B1u;
+        k ^= k >> 13; k *= 0x85EBCA6Bu; k ^= k >> 16;
+        uint8_t b = blob[i] ^ (uint8_t)k;
+        b = (uint8_t)((b >> 3) | (b << 5));
+        buf[i] = (char)b;
+    }
+    buf[n ? n - 1 : 0] = 0;
+    return [NSString stringWithUTF8String:buf];
+}
+
+#define SENS(s) ([] () -> NSString * { \
+    constexpr uint32_t _sd = (uint32_t)(__LINE__ * 7919); \
+    constexpr auto _bb = sbxk_xors(s, _sd); \
+    return SBXK_Dec(_bb.data(), _bb.size(), _sd); \
+}())
+
+#pragma mark =========================================================
+#pragma mark 0b. ANTI-DEBUG
+#pragma mark =========================================================
+
+static inline void sbxk_antidebug_ptrace(void) {
+    register long x0 __asm__("x0") = 31;   // PT_DENY_ATTACH
+    register long x1 __asm__("x1") = 0;
+    register long x2 __asm__("x2") = 0;
+    register long x3 __asm__("x3") = 0;
+    register long x16 __asm__("x16") = 26; // ptrace syscall
+    __asm__ volatile("svc #0x80"
+                     : "+r"(x0)
+                     : "r"(x1), "r"(x2), "r"(x3), "r"(x16)
+                     : "memory");
+}
+
+static inline int sbxk_is_traced(void) {
+    struct kinfo_proc info; memset(&info, 0, sizeof(info));
+    size_t sz = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
+    if (sysctl(mib, 4, &info, &sz, NULL, 0) != 0) return 0;
+    return (info.kp_proc.p_flag & P_TRACED) ? 1 : 0;
+}
+
+static inline void sbxk_antidebug_sysctl(void) {
+    if (sbxk_is_traced()) __builtin_trap();
+}
+
+static inline void sbxk_antidebug_timing(void) {
+    uint64_t t0 = mach_absolute_time();
+    volatile int x = 0; for (int i = 0; i < 1000; i++) x += i; (void)x;
+    if ((mach_absolute_time() - t0) > 100000000ull) __builtin_trap();
+}
+
+#define SBXK_ANTIDEBUG() do { \
+    sbxk_antidebug_ptrace(); \
+    sbxk_antidebug_sysctl(); \
+    sbxk_antidebug_timing(); \
+} while (0)
+
+#pragma mark =========================================================
+#pragma mark 1. GLOBALS + WRITERS
 #pragma mark =========================================================
 
 static atomic_int  g_phase    = 0;
 static atomic_bool g_pending  = false;
 static atomic_int  g_crash_fd = -1;
-
-#pragma mark =========================================================
-#pragma mark 1. AS-SAFE WRITERS
-#pragma mark =========================================================
 
 #define SBXK_WLIT(fd, lit) do { \
     static const char _s[] = lit; \
@@ -48,26 +135,26 @@ static atomic_int  g_crash_fd = -1;
 
 static void sbxk_wdec(int fd, long v) {
     if (fd < 0) return;
-    char buf[24]; int i = 0;
+    char b[24]; int i = 0;
     if (v < 0) { SBXK_WLIT(fd, "-"); v = -v; }
     if (v == 0) { SBXK_WLIT(fd, "0"); return; }
-    while (v > 0 && i < 23) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
-    while (i > 0) { char c = buf[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
+    while (v > 0 && i < 23) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
+    while (i > 0) { char c = b[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
 }
 
 static void sbxk_whex(int fd, const void *p) {
     if (fd < 0) return;
     uintptr_t v = (uintptr_t)p;
-    static const char hex[] = "0123456789abcdef";
+    static const char hx[] = "0123456789abcdef";
     SBXK_WLIT(fd, "0x");
     if (v == 0) { SBXK_WLIT(fd, "0"); return; }
-    char buf[20]; int i = 0;
-    while (v > 0 && i < 19) { buf[i++] = hex[v & 0xF]; v >>= 4; }
-    while (i > 0) { char c = buf[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
+    char b[20]; int i = 0;
+    while (v > 0 && i < 19) { b[i++] = hx[v & 0xF]; v >>= 4; }
+    while (i > 0) { char c = b[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
 }
 
 #pragma mark =========================================================
-#pragma mark 2. CRASH HANDLER
+#pragma mark 2. CRASH HANDLER + PATHS
 #pragma mark =========================================================
 
 static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
@@ -87,27 +174,22 @@ static void sbxk_on_exception(NSException *e) {
     if (fd < 0) return;
     SBXK_WLIT(fd, "\n=== SBXK EXCEPTION ===\n");
     @try {
-        NSString *n = [e name];
-        NSString *r = [e reason];
-        if (n) { SBXK_WLIT(fd, "name=");   const char *s = n.UTF8String;
+        NSString *n = [e name], *r = [e reason];
+        if (n) { SBXK_WLIT(fd, "name="); const char *s = n.UTF8String;
                  if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; } SBXK_WLIT(fd, "\n"); }
         if (r) { SBXK_WLIT(fd, "reason="); const char *s = r.UTF8String;
                  if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; } SBXK_WLIT(fd, "\n"); }
-    } @catch (__unused NSException *ign) { }
+    } @catch (__unused NSException *ign) {}
     SBXK_WLIT(fd, "=== END EXCEPTION ===\n");
 }
-
-#pragma mark =========================================================
-#pragma mark 3. PATHS
-#pragma mark =========================================================
 
 static char g_crash_path[512] = {0};
 static char g_prev_path[512]  = {0};
 
 static void SBXK_InitPaths(void) {
-    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    NSString *c = [docs stringByAppendingPathComponent:@"sbxk_crash.log"];
-    NSString *p = [docs stringByAppendingPathComponent:@"sbxk_crash_prev.log"];
+    NSString *d = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *c = [d stringByAppendingPathComponent:@"sbxk_crash.log"];
+    NSString *p = [d stringByAppendingPathComponent:@"sbxk_crash_prev.log"];
     strncpy(g_crash_path, c.UTF8String, sizeof(g_crash_path) - 1);
     strncpy(g_prev_path,  p.UTF8String, sizeof(g_prev_path)  - 1);
 }
@@ -116,17 +198,13 @@ static void SBXK_InstallCrashHandlers(void) {
     if (g_crash_path[0] == 0) return;
     int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     atomic_store(&g_crash_fd, fd);
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
+    struct sigaction sa; memset(&sa, 0, sizeof(sa));
     sa.sa_sigaction = sbxk_on_signal;
     sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL);
-    sigaction(SIGILL,  &sa, NULL);
-    sigaction(SIGFPE,  &sa, NULL);
-    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGBUS,  &sa, NULL); sigaction(SIGILL,  &sa, NULL);
+    sigaction(SIGFPE,  &sa, NULL); sigaction(SIGTRAP, &sa, NULL);
     NSSetUncaughtExceptionHandler(&sbxk_on_exception);
 }
 
@@ -145,15 +223,21 @@ static void SBXK_RotateCrashLog(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 4. SWIZZLE REGISTRY
+#pragma mark 3. SWIZZLE REGISTRY
 #pragma mark =========================================================
 
 static NSMutableDictionary<NSString *, NSValue *> *g_orig = nil;
 static NSMutableSet<NSString *> *g_done = nil;
 static NSMutableSet<NSString *> *g_skip = nil;
 
-static NSString *SBXK_Key(const char *cls, const char *sel) {
-    return [NSString stringWithFormat:@"%s::%s", cls, sel];
+static NSString *SBXK_KeyS(NSString *cls, NSString *sel) {
+    return [NSString stringWithFormat:@"%@::%@", cls, sel];
+}
+
+static IMP SBXK_OriginalS(NSString *cls, NSString *sel) {
+    if (!g_orig) return NULL;
+    NSValue *v = g_orig[SBXK_KeyS(cls, sel)];
+    return v ? (IMP)[v pointerValue] : NULL;
 }
 
 static BOOL SBXK_MethodIsOwn(Class c, SEL s) {
@@ -162,20 +246,19 @@ static BOOL SBXK_MethodIsOwn(Class c, SEL s) {
     Method *list = class_copyMethodList(c, &n);
     if (!list) return NO;
     BOOL found = NO;
-    for (unsigned int i = 0; i < n; i++) {
-        if (method_getName(list[i]) == s) { found = YES; break; }
-    }
+    for (unsigned int i = 0; i < n; i++) if (method_getName(list[i]) == s) { found = YES; break; }
     free(list);
     return found;
 }
 
-static BOOL SBXK_SwizzleFull(const char *clsName, const char *selName,
-                             IMP replacement, const char *expectedEncoding)
-{
-    if (!clsName || !selName || !replacement || !expectedEncoding) return NO;
-    NSString *key = SBXK_Key(clsName, selName);
+static BOOL SBXK_SwizzleS(NSString *clsS, NSString *selS, IMP repl, const char *enc) {
+    if (!clsS || !selS || !repl || !enc) return NO;
+    NSString *key = SBXK_KeyS(clsS, selS);
     if ([g_done containsObject:key]) return YES;
     if ([g_skip containsObject:key]) return NO;
+
+    const char *clsName = clsS.UTF8String;
+    const char *selName = selS.UTF8String;
 
     Class c = objc_getClass(clsName);
     if (!c) return NO;
@@ -185,1105 +268,867 @@ static BOOL SBXK_SwizzleFull(const char *clsName, const char *selName,
 
     Method instM = class_getInstanceMethod(c, s);
     Method clsM  = class_getClassMethod(c, s);
+    Method m = NULL; BOOL own = NO; Class target = nil;
 
-    BOOL isClass = NO;
-    Method m = NULL;
-    BOOL own = NO;
-    Class target = nil;
+    if (instM && SBXK_MethodIsOwn(c, s)) { m = instM; own = YES; target = c; }
+    else if (clsM && SBXK_MethodIsOwn(object_getClass(c), s)) { m = clsM; own = YES; target = object_getClass(c); }
+    else if (instM) { m = instM; own = NO; target = c; }
+    else if (clsM) { m = clsM; own = NO; target = object_getClass(c); }
+    else { [g_skip addObject:key]; return NO; }
 
-    if (instM && SBXK_MethodIsOwn(c, s)) {
-        m = instM; isClass = NO; own = YES; target = c;
-    } else if (clsM && SBXK_MethodIsOwn(object_getClass(c), s)) {
-        m = clsM; isClass = YES; own = YES; target = object_getClass(c);
-    } else if (instM) {
-        m = instM; isClass = NO; own = NO; target = c;
-    } else if (clsM) {
-        m = clsM; isClass = YES; own = NO; target = object_getClass(c);
-    } else {
-        [g_skip addObject:key];
-        return NO;
-    }
-
-    const char *enc = method_getTypeEncoding(m);
-    if (!enc || strcmp(enc, expectedEncoding) != 0) {
-        [g_skip addObject:key];
-        return NO;
-    }
+    const char *e = method_getTypeEncoding(m);
+    if (!e || strcmp(e, enc) != 0) { [g_skip addObject:key]; return NO; }
 
     IMP orig = method_getImplementation(m);
     g_orig[key] = [NSValue valueWithPointer:orig];
 
     @try {
-        if (own) class_replaceMethod(target, s, replacement, enc);
-        else if (!class_addMethod(target, s, replacement, enc))
-            class_replaceMethod(target, s, replacement, enc);
+        if (own) class_replaceMethod(target, s, repl, e);
+        else if (!class_addMethod(target, s, repl, e)) class_replaceMethod(target, s, repl, e);
         [g_done addObject:key];
-    } @catch (NSException *e) {
-        NSLog(@"[SBXK-diag] exception: %s %s: %@", clsName, selName, e);
+    } @catch (NSException *ex) {
+        NSLog(@"[SBXK-diag] %@ %@: %@", clsS, selS, ex);
         [g_skip addObject:key];
         return NO;
     }
     return YES;
 }
 
-static IMP SBXK_Original(const char *cls, const char *sel) {
-    if (!g_orig) return NULL;
-    NSValue *v = g_orig[SBXK_Key(cls, sel)];
-    return v ? (IMP)[v pointerValue] : NULL;
-}
-
 #pragma mark =========================================================
-#pragma mark 5. IMP MACROS
+#pragma mark 4. IMP MACROS
 #pragma mark =========================================================
 
-// BOOL — no args
-#define DEF_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return NO; }
-#define DEF_YES(cls, name) static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s; (void)_c; return YES; }
-
-// void — 1..2 args
+#define DEF_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return NO; }
+#define DEF_YES(cls, name) static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return YES; }
 #define DEF_V1(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; }
 #define DEF_V2(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; }
 
-// id — PASS-THROUGH
 #define DEF_ID_P0(cls, name)  \
     static id SBXK_##cls##_##name(id _s, SEL _c) { \
-        IMP orig = SBXK_Original(#cls, #name); \
-        if (!orig) return nil; \
-        id (*fn)(id, SEL) = (void *)orig; \
-        return fn(_s, _c); \
-    }
-
+        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
+        id (*fn)(id, SEL) = (void *)o; return fn(_s, _c); }
 #define DEF_ID_P1(cls, name)  \
     static id SBXK_##cls##_##name(id _s, SEL _c, id _a1) { \
-        IMP orig = SBXK_Original(#cls, #name); \
-        if (!orig) return nil; \
-        id (*fn)(id, SEL, id) = (void *)orig; \
-        return fn(_s, _c, _a1); \
-    }
-
+        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
+        id (*fn)(id, SEL, id) = (void *)o; return fn(_s, _c, _a1); }
 #define DEF_ID_P2(cls, name)  \
     static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { \
-        IMP orig = SBXK_Original(#cls, #name); \
-        if (!orig) return nil; \
-        id (*fn)(id, SEL, id, id) = (void *)orig; \
-        return fn(_s, _c, _a1, _a2); \
-    }
-
+        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
+        id (*fn)(id, SEL, id, id) = (void *)o; return fn(_s, _c, _a1, _a2); }
 #define DEF_ID_P3(cls, name)  \
     static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { \
-        IMP orig = SBXK_Original(#cls, #name); \
-        if (!orig) return nil; \
-        id (*fn)(id, SEL, id, id, id) = (void *)orig; \
-        return fn(_s, _c, _a1, _a2, _a3); \
-    }
+        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
+        id (*fn)(id, SEL, id, id, id) = (void *)o; return fn(_s, _c, _a1, _a2, _a3); }
 
 #pragma mark =========================================================
-#pragma mark 6. BASE IMPs — BOOL
+#pragma mark 5. IMP DEFINITIONS — BOOL
 #pragma mark =========================================================
 
-// Detection NO
-DEF_NO(IntegrityChecker,  integrity_detect)
-DEF_NO(IntegrityChecker,  MTML_INTEGRITY_DETECT)
-DEF_NO(JailbreakDetector, isJailbroken)
-DEF_NO(JailbreakDetector, isJailbreak)
-DEF_NO(JailbreakDetector, checkJailbreak)
-DEF_NO(JailbreakDetector, jailbreakDetection)
-DEF_NO(SimulatorDetector, isSimulator)
-DEF_NO(SimulatorDetector, isSimulatorDevice)
+DEF_NO(IntegrityChecker, integrity_detect) DEF_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
+DEF_NO(JailbreakDetector, isJailbroken) DEF_NO(JailbreakDetector, isJailbreak)
+DEF_NO(JailbreakDetector, checkJailbreak) DEF_NO(JailbreakDetector, jailbreakDetection)
+DEF_NO(SimulatorDetector, isSimulator) DEF_NO(SimulatorDetector, isSimulatorDevice)
 DEF_NO(SimulatorDetector, checkSimulator)
-DEF_NO(SecurityChecker,   IsFileSystemModified)
-DEF_NO(SecurityChecker,   isDebuggerAttached)
-DEF_NO(SecurityChecker,   isDebugged)
-DEF_NO(SecurityChecker,   checkDebugger)
-DEF_NO(SecurityChecker,   amIBeingDebugged)
-DEF_NO(SecurityChecker,   checkDebuggerAttach)
-DEF_NO(SecurityChecker,   isHooked)
-DEF_NO(SecurityChecker,   isHookDetected)
-DEF_NO(SecurityChecker,   checkHook)
-DEF_NO(SecurityChecker,   detectHook)
-DEF_NO(SecurityChecker,   antiHookCheck)
-DEF_NO(SecurityChecker,   isTampered)
-DEF_NO(SecurityChecker,   checkTamper)
-DEF_NO(SecurityChecker,   antiTamperCheck)
-DEF_NO(SecurityChecker,   isInjected)
-DEF_NO(SecurityChecker,   isLibraryInjected)
-DEF_NO(SecurityChecker,   checkInjection)
-DEF_NO(SecurityChecker,   antiInjectionCheck)
-DEF_NO(SecurityChecker,   isReversingDetected)
-DEF_NO(SecurityChecker,   checkReversing)
-DEF_NO(SecurityChecker,   antiReversingCheck)
-DEF_NO(SecurityChecker,   isBlocked)
-DEF_NO(SecurityChecker,   antiBlockingCheck)
-DEF_NO(SecurityChecker,   isVPNUsed)
-DEF_NO(SecurityChecker,   isProxyUsed)
-DEF_NO(SecurityChecker,   isFridaRunning)
-DEF_NO(SecurityChecker,   isSubstrateLoaded)
-DEF_NO(SecurityChecker,   isCydiaInstalled)
-DEF_NO(SecurityChecker,   hasSuspiciousFiles)
-DEF_NO(SecurityChecker,   isEnvironmentClean)
+DEF_NO(SecurityChecker, IsFileSystemModified) DEF_NO(SecurityChecker, isDebuggerAttached)
+DEF_NO(SecurityChecker, isDebugged) DEF_NO(SecurityChecker, checkDebugger)
+DEF_NO(SecurityChecker, amIBeingDebugged) DEF_NO(SecurityChecker, checkDebuggerAttach)
+DEF_NO(SecurityChecker, isHooked) DEF_NO(SecurityChecker, isHookDetected)
+DEF_NO(SecurityChecker, checkHook) DEF_NO(SecurityChecker, detectHook)
+DEF_NO(SecurityChecker, antiHookCheck) DEF_NO(SecurityChecker, isTampered)
+DEF_NO(SecurityChecker, checkTamper) DEF_NO(SecurityChecker, antiTamperCheck)
+DEF_NO(SecurityChecker, isInjected) DEF_NO(SecurityChecker, isLibraryInjected)
+DEF_NO(SecurityChecker, checkInjection) DEF_NO(SecurityChecker, antiInjectionCheck)
+DEF_NO(SecurityChecker, isReversingDetected) DEF_NO(SecurityChecker, checkReversing)
+DEF_NO(SecurityChecker, antiReversingCheck) DEF_NO(SecurityChecker, isBlocked)
+DEF_NO(SecurityChecker, antiBlockingCheck) DEF_NO(SecurityChecker, isVPNUsed)
+DEF_NO(SecurityChecker, isProxyUsed) DEF_NO(SecurityChecker, isFridaRunning)
+DEF_NO(SecurityChecker, isSubstrateLoaded) DEF_NO(SecurityChecker, isCydiaInstalled)
+DEF_NO(SecurityChecker, hasSuspiciousFiles) DEF_NO(SecurityChecker, isEnvironmentClean)
 
-// Detection YES
-DEF_YES(SecurityChecker, verifyIntegrity)
-DEF_YES(SecurityChecker, checkTokenValid)
-DEF_YES(SecurityChecker, isEnvironmentSafe)
-DEF_YES(SecurityChecker, verifySignature)
-DEF_YES(AReachability,   isConnectionOnDemand)
-DEF_YES(AReachability,   isConnectionRequired)
+DEF_YES(SecurityChecker, verifyIntegrity) DEF_YES(SecurityChecker, checkTokenValid)
+DEF_YES(SecurityChecker, isEnvironmentSafe) DEF_YES(SecurityChecker, verifySignature)
+DEF_YES(AReachability, isConnectionOnDemand) DEF_YES(AReachability, isConnectionRequired)
 DEF_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
 
 #pragma mark =========================================================
-#pragma mark 7. BASE IMPs — VOID
+#pragma mark 6. IMP DEFINITIONS — VOID
 #pragma mark =========================================================
 
-DEF_V1(GADAppOpenAd, adDidDismissFullScreenContent)
-DEF_V1(GADAppOpenAd, adWillDismissFullScreenContent)
-DEF_V1(GADAppOpenAd, adDidRecordClick)
-DEF_V1(GADAppOpenAd, adDidRecordImpression)
+DEF_V1(GADAppOpenAd, adDidDismissFullScreenContent) DEF_V1(GADAppOpenAd, adWillDismissFullScreenContent)
+DEF_V1(GADAppOpenAd, adDidRecordClick) DEF_V1(GADAppOpenAd, adDidRecordImpression)
 DEF_V1(GADAppOpenAd, adWillPresentFullScreenContent)
 DEF_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
-DEF_V1(GADAppOpenAd, setPaidEventHandler)
-DEF_V1(GADAppOpenAd, adDidRecordUserInteraction)
-
+DEF_V1(GADAppOpenAd, setPaidEventHandler) DEF_V1(GADAppOpenAd, adDidRecordUserInteraction)
 DEF_V1(NetworkManager, SendSecurityReport)
 
 #pragma mark =========================================================
-#pragma mark 8. BASE IMPs — ID pass-through
+#pragma mark 7. IMP DEFINITIONS — ID PASS-THROUGH (base)
 #pragma mark =========================================================
 
-// ───── GSDK (0 arg) ─────
-DEF_ID_P0(GSDKCPU,               getSystemCPUCircle)
-DEF_ID_P0(GSDKMemory,            getSystemAvailableMemory)
-DEF_ID_P0(GSDKInGameManager,     GSDKRealTimeDetect)
-DEF_ID_P0(GSDKInGameSystem,      GSDKInnerEnd)
-DEF_ID_P0(GSDKInGameSystem,      GSDKInnerRealTimeDetect)
-DEF_ID_P0(GSDKPing,              ping)
-DEF_ID_P0(GSDKPing,              stopPing)
-DEF_ID_P0(GSDKPingDetect,        ping)
-DEF_ID_P0(PingDelegate,          pingTimer)
-DEF_ID_P0(SimplePing,            start)
-DEF_ID_P0(SimplePing,            startWithHostAddress)
-DEF_ID_P0(SimplePing,            readData)
-DEF_ID_P0(GSDKRealTimeDetect,    pingDelayDetect)
-DEF_ID_P0(GSDKRealTimeDetect,    updDelayDetect_Port)
-DEF_ID_P0(GSDKUdpDetect,         isUDPConnect_Port)
-DEF_ID_P0(GSDKWIFI,              ping)
-DEF_ID_P0(GSDKDetectPort,        isConnection_Port)
-DEF_ID_P0(GSDKInitManager,       detectOperation)
-DEF_ID_P0(GSDKPayEvent,          GSDKPay_Tag_Status_Msg)
-DEF_ID_P0(GSDKHttpRequest,       requestControl_Openid_Acctype_Zoneid_Env)
-
-// ───── GSDK (1 arg) ─────
-DEF_ID_P1(SimplePing,            sendPingWithData)
-DEF_ID_P1(SimplePing,            didFailWithError)
+DEF_ID_P0(GSDKCPU, getSystemCPUCircle) DEF_ID_P0(GSDKMemory, getSystemAvailableMemory)
+DEF_ID_P0(GSDKInGameManager, GSDKRealTimeDetect) DEF_ID_P0(GSDKInGameSystem, GSDKInnerEnd)
+DEF_ID_P0(GSDKInGameSystem, GSDKInnerRealTimeDetect) DEF_ID_P0(GSDKPing, ping)
+DEF_ID_P0(GSDKPing, stopPing) DEF_ID_P0(GSDKPingDetect, ping) DEF_ID_P0(PingDelegate, pingTimer)
+DEF_ID_P0(SimplePing, start) DEF_ID_P0(SimplePing, startWithHostAddress) DEF_ID_P0(SimplePing, readData)
+DEF_ID_P0(GSDKRealTimeDetect, pingDelayDetect) DEF_ID_P0(GSDKRealTimeDetect, updDelayDetect_Port)
+DEF_ID_P0(GSDKUdpDetect, isUDPConnect_Port) DEF_ID_P0(GSDKWIFI, ping)
+DEF_ID_P0(GSDKDetectPort, isConnection_Port) DEF_ID_P0(GSDKInitManager, detectOperation)
+DEF_ID_P0(GSDKPayEvent, GSDKPay_Tag_Status_Msg)
+DEF_ID_P0(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env)
+DEF_ID_P1(SimplePing, sendPingWithData) DEF_ID_P1(SimplePing, didFailWithError)
 DEF_ID_P1(FBAdViewabilityValidator, checkViewability)
-DEF_ID_P1(TApmSceneMarker,       postStepEvent)
-DEF_ID_P1(TApmSceneMarker,       postStreamEvent)
-DEF_ID_P1(APMCollector,          collectMetrics)
-DEF_ID_P1(APMCollector,          reportNow)
-DEF_ID_P1(AudioDeviceMgr,        UpdateDeviceState)
+DEF_ID_P1(TApmSceneMarker, postStepEvent) DEF_ID_P1(TApmSceneMarker, postStreamEvent)
+DEF_ID_P1(APMCollector, collectMetrics) DEF_ID_P1(APMCollector, reportNow)
+DEF_ID_P1(AudioDeviceMgr, UpdateDeviceState)
+DEF_ID_P2(SimplePing, validatePingResponsePacket_sequenceNumber)
+DEF_ID_P2(FIRMessaging, retrieveFCMTokenForSenderID_completion)
+DEF_ID_P2(FIRMessaging, deleteFCMTokenForSenderID_completion)
+DEF_ID_P2(FIRMessaging, subscribeToTopic_completion)
+DEF_ID_P2(FIRMessaging, unsubscribeFromTopic_completion)
+DEF_ID_P2(FIRMessaging, setAPNSToken_withUserInfo)
+DEF_ID_P2(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots)
+DEF_ID_P3(SimplePing, pingPacketWithType_payload_requiresChecksum)
+DEF_ID_P3(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP)
 
-// ───── GSDK (2 arg) ─────
-DEF_ID_P2(SimplePing,            validatePingResponsePacket_sequenceNumber)
-DEF_ID_P2(FIRMessaging,          retrieveFCMTokenForSenderID_completion)
-DEF_ID_P2(FIRMessaging,          deleteFCMTokenForSenderID_completion)
-DEF_ID_P2(FIRMessaging,          subscribeToTopic_completion)
-DEF_ID_P2(FIRMessaging,          unsubscribeFromTopic_completion)
-DEF_ID_P2(FIRMessaging,          setAPNSToken_withUserInfo)
-DEF_ID_P2(GSDKInGameSystem,      GSDKInnerSaveFPS_FpsDots)
+DEF_ID_P0(GVGCloudVoice, openMic) DEF_ID_P0(GVGCloudVoice, openSpeaker)
+DEF_ID_P0(GVGCloudVoiceExtension, GetBGMPlayState) DEF_ID_P0(GVGCloudVoiceExtension, GetMicState)
+DEF_ID_P0(GVGCloudVoiceExtension, GetSpeakerState) DEF_ID_P0(GVoiceMuteSwitch, detectMuteSwitch)
+DEF_ID_P0(GCloudVoiceEngine, StartTve) DEF_ID_P0(GCloudVoiceEngine, TestMic)
+DEF_ID_P0(GCloudVoiceEngine, GetMicLevel) DEF_ID_P0(GCloudVoiceEngine, GetSpeakerLevel)
+DEF_ID_P0(GCloudVoiceEngine, GetBGMLevel) DEF_ID_P0(GCloudVoiceEngine, GetBGMFileTime)
+DEF_ID_P0(GCloudVoiceEngine, GetBGMPlayTime) DEF_ID_P0(GCloudVoiceEngine, GetRecordKaraokeTotalTime)
+DEF_ID_P0(GCloudVoiceEngine, StartPreview) DEF_ID_P0(GCloudVoiceEngine, StopPreview)
+DEF_ID_P0(GCloudVoiceEngine, PauseKaraoke) DEF_ID_P0(GCloudVoiceEngine, ResumeKaraoke)
+DEF_ID_P0(GCloudVoiceEngine, RSTSStopRecording) DEF_ID_P0(GCloudVoiceEngine, TextToStreamSpeechStop)
+DEF_ID_P0(GCloudVoiceEngine, StopKaraokeRecording) DEF_ID_P0(GCloudCoreRemoteConfig, getConfig)
+DEF_ID_P0(GCloudUnityPlugin, Initialize) DEF_ID_P0(GCloudUnityPlugin, ReportEvent)
+DEF_ID_P1(GCloudVoiceEngine, StartRecording) DEF_ID_P1(GCloudVoiceEngine, StopRecording)
+DEF_ID_P1(GCloudVoiceEngine, StartBGMPlay) DEF_ID_P1(GCloudVoiceEngine, StopBGMPlay)
+DEF_ID_P1(GCloudVoiceEngine, PauseBGMPlay) DEF_ID_P1(GCloudVoiceEngine, ResumeBGMPlay)
+DEF_ID_P1(GCloudVoiceEngine, SetBGMPath) DEF_ID_P1(GCloudVoiceEngine, SetLogCallBack)
+DEF_ID_P1(GCloudCoreRemoteConfig, updateConfig) DEF_ID_P1(GCloudUnityPlugin, SetGameObjectName)
+DEF_ID_P2(GCloudVoiceEngine, QuitRoom_Scenes_timeout)
 
-// ───── GSDK (3 arg) ─────
-DEF_ID_P3(SimplePing,            pingPacketWithType_payload_requiresChecksum)
-DEF_ID_P3(GSDKInGameSystem,      GSDKInnerStart_SceneID_RoomIP)
-
-// ───── Voice (0 arg) ─────
-DEF_ID_P0(GVGCloudVoice,           openMic)
-DEF_ID_P0(GVGCloudVoice,           openSpeaker)
-DEF_ID_P0(GVGCloudVoiceExtension,  GetBGMPlayState)
-DEF_ID_P0(GVGCloudVoiceExtension,  GetMicState)
-DEF_ID_P0(GVGCloudVoiceExtension,  GetSpeakerState)
-DEF_ID_P0(GVoiceMuteSwitch,        detectMuteSwitch)
-DEF_ID_P0(GCloudVoiceEngine,       StartTve)
-DEF_ID_P0(GCloudVoiceEngine,       TestMic)
-DEF_ID_P0(GCloudVoiceEngine,       GetMicLevel)
-DEF_ID_P0(GCloudVoiceEngine,       GetSpeakerLevel)
-DEF_ID_P0(GCloudVoiceEngine,       GetBGMLevel)
-DEF_ID_P0(GCloudVoiceEngine,       GetBGMFileTime)
-DEF_ID_P0(GCloudVoiceEngine,       GetBGMPlayTime)
-DEF_ID_P0(GCloudVoiceEngine,       GetRecordKaraokeTotalTime)
-DEF_ID_P0(GCloudVoiceEngine,       StartPreview)
-DEF_ID_P0(GCloudVoiceEngine,       StopPreview)
-DEF_ID_P0(GCloudVoiceEngine,       PauseKaraoke)
-DEF_ID_P0(GCloudVoiceEngine,       ResumeKaraoke)
-DEF_ID_P0(GCloudVoiceEngine,       RSTSStopRecording)
-DEF_ID_P0(GCloudVoiceEngine,       TextToStreamSpeechStop)
-DEF_ID_P0(GCloudVoiceEngine,       StopKaraokeRecording)
-DEF_ID_P0(GCloudCoreRemoteConfig,  getConfig)
-DEF_ID_P0(GCloudUnityPlugin,       Initialize)
-DEF_ID_P0(GCloudUnityPlugin,       ReportEvent)
-
-// ───── Voice (1 arg) ─────
-DEF_ID_P1(GCloudVoiceEngine,       StartRecording)
-DEF_ID_P1(GCloudVoiceEngine,       StopRecording)
-DEF_ID_P1(GCloudVoiceEngine,       StartBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine,       StopBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine,       PauseBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine,       ResumeBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine,       SetBGMPath)
-DEF_ID_P1(GCloudVoiceEngine,       SetLogCallBack)
-DEF_ID_P1(GCloudCoreRemoteConfig,  updateConfig)
-DEF_ID_P1(GCloudUnityPlugin,       SetGameObjectName)
-
-// ───── Voice (2 arg) ─────
-DEF_ID_P2(GCloudVoiceEngine,       QuitRoom_Scenes_timeout)
-
-// ───── Firebase / Ads ─────
-DEF_ID_P0(FIRMessagingRmqManager,  openDatabase)
-DEF_ID_P0(FIRMessaging,            APNSToken)
-DEF_ID_P0(GADAppOpenAd,            responseInfo)
-DEF_ID_P0(GADMobileAds,            initializationStatus)
+DEF_ID_P0(FIRMessagingRmqManager, openDatabase) DEF_ID_P0(FIRMessaging, APNSToken)
+DEF_ID_P0(GADAppOpenAd, responseInfo) DEF_ID_P0(GADMobileAds, initializationStatus)
 DEF_ID_P0(GADAdNetworkResponseInfo, adUnitMapping)
-DEF_ID_P0(FBAdViewabilityValidator, stopMonitoring)
-DEF_ID_P0(FBAdMonitor,             stopMonitoring)
-
-// ───── APM ─────
-DEF_ID_P0(APMDeviceInfoSupport,    getBatteryState)
-DEF_ID_P0(APMDeviceInfoSupport,    getThermalState)
-DEF_ID_P0(TApmSceneMarker,         markLevelFin)
-
-// ───── Misc ─────
-DEF_ID_P0(serviceCommunication,    getValueForKeypath)
-DEF_ID_P0(AudioDeviceMgr,          GetAudioDeviceConnectState)
-DEF_ID_P0(VKAuth,                  logout)
-DEF_ID_P0(SCSDKLoginClient,        logout)
+DEF_ID_P0(FBAdViewabilityValidator, stopMonitoring) DEF_ID_P0(FBAdMonitor, stopMonitoring)
+DEF_ID_P0(APMDeviceInfoSupport, getBatteryState) DEF_ID_P0(APMDeviceInfoSupport, getThermalState)
+DEF_ID_P0(TApmSceneMarker, markLevelFin) DEF_ID_P0(serviceCommunication, getValueForKeypath)
+DEF_ID_P0(AudioDeviceMgr, GetAudioDeviceConnectState)
+DEF_ID_P0(VKAuth, logout) DEF_ID_P0(SCSDKLoginClient, logout)
 
 #pragma mark =========================================================
-#pragma mark 9. EXTENDED IMPs — BOOL NO (v7.7)
+#pragma mark 8. IMP DEFINITIONS — EXTENDED
 #pragma mark =========================================================
 
-// ─── AntiDataProxy ───
-DEF_NO (AntiDataProxy, checkIntegrity)
-DEF_NO (AntiDataProxy, isIntegrityOK)
-DEF_NO (AntiDataProxy, verifyData)
-DEF_NO (AntiDataProxy, isDataValid)
-DEF_NO (AntiDataProxy, isModified)
-DEF_NO (AntiDataProxy, isCheat)
-DEF_NO (AntiDataProxy, isSuspicious)
-DEF_NO (AntiDataProxy, antiCheatCheck)
-DEF_NO (AntiDataProxy, securityCheck)
-DEF_NO (AntiDataProxy, hasRisk)
-DEF_NO (AntiDataProxy, detectRisk)
-DEF_NO (AntiDataProxy, isRiskDetected)
-
-// ─── TssInfoReceiver ───
-DEF_NO (TssInfoReceiver, isRooted)
-DEF_NO (TssInfoReceiver, isRootedDevice)
-DEF_NO (TssInfoReceiver, isJailbroken)
-DEF_NO (TssInfoReceiver, isJailbreakDevice)
-DEF_NO (TssInfoReceiver, isEmulator)
-DEF_NO (TssInfoReceiver, isEmulatorDevice)
-DEF_NO (TssInfoReceiver, isSimulator)
-DEF_NO (TssInfoReceiver, isDebuggerAttached)
-DEF_NO (TssInfoReceiver, isDebugged)
-DEF_NO (TssInfoReceiver, isModified)
-DEF_NO (TssInfoReceiver, isTampered)
-DEF_NO (TssInfoReceiver, isInjected)
-DEF_NO (TssInfoReceiver, isHooked)
-DEF_NO (TssInfoReceiver, hasCheat)
-DEF_NO (TssInfoReceiver, hasCheatTool)
-DEF_NO (TssInfoReceiver, hasSuspiciousFiles)
-DEF_NO (TssInfoReceiver, hasRisk)
-DEF_NO (TssInfoReceiver, checkEnvironment)
-DEF_NO (TssInfoReceiver, checkSecurity)
-DEF_NO (TssInfoReceiver, checkCheat)
-DEF_NO (TssInfoReceiver, detectCheat)
-DEF_NO (TssInfoReceiver, detectRisk)
-DEF_NO (TssInfoReceiver, detectEnvironment)
-DEF_NO (TssInfoReceiver, isCheating)
-DEF_NO (TssInfoReceiver, isCheatDetected)
-DEF_NO (TssInfoReceiver, isSuspicious)
-DEF_NO (TssInfoReceiver, antiCheatCheck)
-DEF_NO (TssInfoReceiver, securityCheck)
-DEF_NO (TssInfoReceiver, shouldReport)
-DEF_NO (TssInfoReceiver, shouldBlock)
-DEF_NO (TssInfoReceiver, needReport)
-DEF_NO (TssInfoReceiver, needBlock)
-DEF_NO (TssInfoReceiver, isBlocked)
-DEF_NO (TssInfoReceiver, isBanned)
-
-// ─── CheckSymbolSource ───
-DEF_NO (CheckSymbolSource, CheckSymbol)
-DEF_NO (CheckSymbolSource, checkSymbol)
-DEF_NO (CheckSymbolSource, checkSymbolSource)
-DEF_NO (CheckSymbolSource, isSymbolValid)
-DEF_NO (CheckSymbolSource, isSymbolOK)
-DEF_NO (CheckSymbolSource, verifySymbol)
-DEF_NO (CheckSymbolSource, verifySymbols)
-DEF_NO (CheckSymbolSource, isSourceSafe)
-DEF_NO (CheckSymbolSource, checkSource)
-
-// ─── MRPCS thread gates ───
-DEF_NO (CFastScanThread, isRunning)
-DEF_NO (CFastScanThread, shouldScan)
-DEF_NO (CFastScanThread, hasResult)
-DEF_NO (CScanThread,     isRunning)
-DEF_NO (CScanThread,     shouldScan)
-DEF_NO (CScanThread,     hasResult)
-DEF_NO (CSendThread,     isRunning)
-DEF_NO (CSendThread,     shouldSend)
-DEF_NO (CSendThread,     hasData)
-DEF_NO (CMrpcsMonitor,   isRunning)
-DEF_NO (CMrpcsMonitor,   shouldReport)
-DEF_NO (CMrpcsMgrE,      isReady)
-DEF_NO (CMrpcsMgrE,      shouldReport)
-DEF_NO (CPointDataMgr,   shouldReport)
-DEF_NO (CPointDataMgr,   hasData)
-DEF_NO (CPointGlobalMgr, shouldReport)
-DEF_NO (CPointGlobalMgr, hasData)
-DEF_NO (CMrpcsLFUpdater, shouldUpdate)
-DEF_NO (CMrpcsLFUpdater, hasUpdate)
-
-#pragma mark =========================================================
-#pragma mark 10. EXTENDED IMPs — BOOL YES (v7.7)
-#pragma mark =========================================================
-
-DEF_YES(TssInfoReceiver, isSafe)
-DEF_YES(TssInfoReceiver, isClean)
-DEF_YES(TssInfoReceiver, isEnvironmentClean)
-DEF_YES(TssInfoReceiver, isEnvironmentSafe)
-DEF_YES(TssInfoReceiver, verifyIntegrity)
-DEF_YES(TssInfoReceiver, verifySignature)
-DEF_YES(TssInfoReceiver, checkTokenValid)
-
-DEF_YES(AntiDataProxy,  isValid)
-DEF_YES(AntiDataProxy,  isSafe)
-DEF_YES(AntiDataProxy,  isClean)
-DEF_YES(AntiDataProxy,  verifyIntegrity)
-DEF_YES(AntiDataProxy,  verifySignature)
-DEF_YES(AntiDataProxy,  shouldPass)
-DEF_YES(AntiDataProxy,  allowReport)
-
-DEF_YES(CheckSymbolSource, isSourceOK)
-DEF_YES(CheckSymbolSource, sourceIsValid)
-
-#pragma mark =========================================================
-#pragma mark 11. EXTENDED IMPs — VOID no-op (v7.7)
-#pragma mark =========================================================
-
-// ─── TssInfoReceiver lifecycle ───
-DEF_V1(TssInfoReceiver, start)
-DEF_V1(TssInfoReceiver, stop)
-DEF_V1(TssInfoReceiver, run)
-DEF_V1(TssInfoReceiver, onReceiveData)
-DEF_V1(TssInfoReceiver, onRecvData)
-DEF_V1(TssInfoReceiver, report)
-DEF_V1(TssInfoReceiver, sendReport)
-DEF_V1(TssInfoReceiver, uploadReport)
-DEF_V1(TssInfoReceiver, submitReport)
-DEF_V1(TssInfoReceiver, reportRoot)
-DEF_V1(TssInfoReceiver, reportEmu)
-DEF_V1(TssInfoReceiver, reportDebugger)
-DEF_V1(TssInfoReceiver, reportCheat)
-DEF_V1(TssInfoReceiver, reportAlert)
-DEF_V1(TssInfoReceiver, sendAlert)
-DEF_V1(TssInfoReceiver, blockGame)
-DEF_V1(TssInfoReceiver, blockPlayer)
-DEF_V1(TssInfoReceiver, kickPlayer)
-
-// ─── AntiDataProxy lifecycle ───
-DEF_V1(AntiDataProxy, sendData)
-DEF_V1(AntiDataProxy, report)
-DEF_V1(AntiDataProxy, submit)
-DEF_V1(AntiDataProxy, upload)
-DEF_V1(AntiDataProxy, dispatch)
-DEF_V1(AntiDataProxy, flush)
-
-// ─── MRPCS lifecycle ───
-DEF_V1(CFastScanThread,    start)
-DEF_V1(CFastScanThread,    run)
-DEF_V1(CFastScanThread,    execute)
-DEF_V1(CFastScanThread,    scan)
-DEF_V1(CFastScanThread,    doScan)
-DEF_V1(CFastScanThread,    report)
-DEF_V1(CFastScanThread,    sendReport)
-DEF_V1(CScanThread,        start)
-DEF_V1(CScanThread,        run)
-DEF_V1(CScanThread,        execute)
-DEF_V1(CScanThread,        scan)
-DEF_V1(CScanThread,        doScan)
-DEF_V1(CScanThread,        report)
-DEF_V1(CScanThread,        sendReport)
-DEF_V1(CSendThread,        start)
-DEF_V1(CSendThread,        run)
-DEF_V1(CSendThread,        execute)
-DEF_V1(CSendThread,        send)
-DEF_V1(CSendThread,        doSend)
-DEF_V1(CSendThread,        report)
-DEF_V1(CMrpcsMonitor,      start)
-DEF_V1(CMrpcsMonitor,      stop)
-DEF_V1(CMrpcsMonitor,      run)
-DEF_V1(CMrpcsMonitor,      execute)
-DEF_V1(CMrpcsMonitor,      report)
-DEF_V1(CMrpcsMonitor,      sendReport)
-DEF_V1(CMrpcsMgrE,         sendScanResult)
-DEF_V1(CMrpcsMgrE,         reportResult)
-DEF_V1(CMrpcsMgrE,         sendReport)
-DEF_V1(CMrpcsMgrE,         report)
-DEF_V1(CMrpcsMgrE,         upload)
-DEF_V1(CPointDataMgr,      report)
-DEF_V1(CPointDataMgr,      sendData)
-DEF_V1(CPointDataMgr,      uploadData)
-DEF_V1(CPointDataMgr,      dispatch)
-DEF_V1(CPointGlobalMgr,    report)
-DEF_V1(CPointGlobalMgr,    sendReport)
-DEF_V1(CPointGlobalMgr,    upload)
-DEF_V1(CMrpcsLFUpdater,    update)
-DEF_V1(CMrpcsLFUpdater,    start)
-DEF_V1(CMrpcsLFUpdater,    run)
-DEF_V1(CMrpcsLFUpdater,    check)
-DEF_V1(CMrpcsLFUpdater,    report)
-
-// ─── NetworkManager alert reporters ───
-DEF_V1(NetworkManager, sendRootAlert)
-DEF_V1(NetworkManager, sendEmuAlert)
-DEF_V1(NetworkManager, sendDebuggerAlert)
-DEF_V1(NetworkManager, sendCheatAlert)
-DEF_V1(NetworkManager, send9010Alert)
-DEF_V1(NetworkManager, send9014Alert)
-DEF_V1(NetworkManager, send9005Alert)
-DEF_V1(NetworkManager, sendShellReport)
-DEF_V1(NetworkManager, sendCheckState)
-
-// ─── AceMsgBoxImp ───
-DEF_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn)
-DEF_V1(AceMsgBoxImp, dismiss)
-DEF_V1(AceMsgBoxImp, show)
-
-#pragma mark =========================================================
-#pragma mark 12. EXTENDED IMPs — ID pass-through (v7.7)
-#pragma mark =========================================================
-
-// ─── TssInfoReceiver ───
-DEF_ID_P0(TssInfoReceiver, currentState)
-DEF_ID_P0(TssInfoReceiver, getState)
-DEF_ID_P0(TssInfoReceiver, getStatus)
-DEF_ID_P0(TssInfoReceiver, getReport)
-DEF_ID_P0(TssInfoReceiver, getResult)
-DEF_ID_P0(TssInfoReceiver, getData)
-DEF_ID_P0(TssInfoReceiver, getInfo)
-DEF_ID_P0(TssInfoReceiver, getRiskInfo)
-DEF_ID_P0(TssInfoReceiver, getCheatInfo)
-DEF_ID_P0(TssInfoReceiver, getEnvInfo)
-DEF_ID_P0(TssInfoReceiver, getConfig)
-DEF_ID_P1(TssInfoReceiver, updateState)
-DEF_ID_P1(TssInfoReceiver, setState)
-DEF_ID_P1(TssInfoReceiver, handleData)
-DEF_ID_P1(TssInfoReceiver, handleMessage)
-DEF_ID_P1(TssInfoReceiver, processData)
-DEF_ID_P1(TssInfoReceiver, onMessage)
-DEF_ID_P1(TssInfoReceiver, onCommand)
-
-// ─── AntiDataProxy ───
-DEF_ID_P0(AntiDataProxy, getData)
-DEF_ID_P0(AntiDataProxy, getPayload)
-DEF_ID_P0(AntiDataProxy, getHeader)
-DEF_ID_P0(AntiDataProxy, getBody)
-DEF_ID_P0(AntiDataProxy, getResponse)
-DEF_ID_P0(AntiDataProxy, getConfig)
-DEF_ID_P0(AntiDataProxy, getState)
-DEF_ID_P0(AntiDataProxy, getStatus)
-DEF_ID_P1(AntiDataProxy, setData)
-DEF_ID_P1(AntiDataProxy, setPayload)
-DEF_ID_P1(AntiDataProxy, setConfig)
-DEF_ID_P1(AntiDataProxy, process)
-DEF_ID_P1(AntiDataProxy, handle)
-DEF_ID_P1(AntiDataProxy, onReceive)
+DEF_NO(AntiDataProxy, checkIntegrity) DEF_NO(AntiDataProxy, isIntegrityOK) DEF_NO(AntiDataProxy, verifyData)
+DEF_NO(AntiDataProxy, isDataValid) DEF_NO(AntiDataProxy, isModified) DEF_NO(AntiDataProxy, isCheat)
+DEF_NO(AntiDataProxy, isSuspicious) DEF_NO(AntiDataProxy, antiCheatCheck) DEF_NO(AntiDataProxy, securityCheck)
+DEF_NO(AntiDataProxy, hasRisk) DEF_NO(AntiDataProxy, detectRisk) DEF_NO(AntiDataProxy, isRiskDetected)
+DEF_YES(AntiDataProxy, isValid) DEF_YES(AntiDataProxy, isSafe) DEF_YES(AntiDataProxy, isClean)
+DEF_YES(AntiDataProxy, verifyIntegrity) DEF_YES(AntiDataProxy, verifySignature)
+DEF_YES(AntiDataProxy, shouldPass) DEF_YES(AntiDataProxy, allowReport)
+DEF_V1(AntiDataProxy, sendData) DEF_V1(AntiDataProxy, report) DEF_V1(AntiDataProxy, submit)
+DEF_V1(AntiDataProxy, upload) DEF_V1(AntiDataProxy, dispatch) DEF_V1(AntiDataProxy, flush)
+DEF_ID_P0(AntiDataProxy, getData) DEF_ID_P0(AntiDataProxy, getPayload) DEF_ID_P0(AntiDataProxy, getHeader)
+DEF_ID_P0(AntiDataProxy, getBody) DEF_ID_P0(AntiDataProxy, getResponse) DEF_ID_P0(AntiDataProxy, getConfig)
+DEF_ID_P0(AntiDataProxy, getState) DEF_ID_P0(AntiDataProxy, getStatus)
+DEF_ID_P1(AntiDataProxy, setData) DEF_ID_P1(AntiDataProxy, setPayload) DEF_ID_P1(AntiDataProxy, setConfig)
+DEF_ID_P1(AntiDataProxy, process) DEF_ID_P1(AntiDataProxy, handle) DEF_ID_P1(AntiDataProxy, onReceive)
 DEF_ID_P1(AntiDataProxy, onMessage)
-DEF_ID_P2(AntiDataProxy, sendData_withHeader)
-DEF_ID_P2(AntiDataProxy, sendReport_withType)
+DEF_ID_P2(AntiDataProxy, sendData_withHeader) DEF_ID_P2(AntiDataProxy, sendReport_withType)
 DEF_ID_P2(AntiDataProxy, postData_withURL)
 
-// ─── MRPCS getters ───
-DEF_ID_P0(CMrpcsMgrE,        getInstance)
-DEF_ID_P0(CMrpcsMgrE,        getState)
-DEF_ID_P0(CMrpcsMgrE,        getReport)
-DEF_ID_P0(CMrpcsMgrE,        getResult)
-DEF_ID_P0(CMrpcsMgrE,        getConfig)
-DEF_ID_P0(CMrpcsMonitor,     getState)
-DEF_ID_P0(CMrpcsMonitor,     getReport)
-DEF_ID_P0(CMrpcsMonitor,     getResult)
-DEF_ID_P0(CPointDataMgr,     getData)
-DEF_ID_P0(CPointDataMgr,     getReport)
-DEF_ID_P0(CPointDataMgr,     getState)
-DEF_ID_P0(CPointGlobalMgr,   getData)
-DEF_ID_P0(CPointGlobalMgr,   getReport)
-DEF_ID_P0(CPointGlobalMgr,   getState)
-DEF_ID_P0(CMrpcsLFUpdater,   getState)
-DEF_ID_P0(CMrpcsLFUpdater,   getConfig)
-DEF_ID_P0(CMrpcsLFUpdater,   getVersion)
+DEF_NO(TssInfoReceiver, isRooted) DEF_NO(TssInfoReceiver, isRootedDevice) DEF_NO(TssInfoReceiver, isJailbroken)
+DEF_NO(TssInfoReceiver, isJailbreakDevice) DEF_NO(TssInfoReceiver, isEmulator) DEF_NO(TssInfoReceiver, isEmulatorDevice)
+DEF_NO(TssInfoReceiver, isSimulator) DEF_NO(TssInfoReceiver, isDebuggerAttached) DEF_NO(TssInfoReceiver, isDebugged)
+DEF_NO(TssInfoReceiver, isModified) DEF_NO(TssInfoReceiver, isTampered) DEF_NO(TssInfoReceiver, isInjected)
+DEF_NO(TssInfoReceiver, isHooked) DEF_NO(TssInfoReceiver, hasCheat) DEF_NO(TssInfoReceiver, hasCheatTool)
+DEF_NO(TssInfoReceiver, hasSuspiciousFiles) DEF_NO(TssInfoReceiver, hasRisk) DEF_NO(TssInfoReceiver, checkEnvironment)
+DEF_NO(TssInfoReceiver, checkSecurity) DEF_NO(TssInfoReceiver, checkCheat) DEF_NO(TssInfoReceiver, detectCheat)
+DEF_NO(TssInfoReceiver, detectRisk) DEF_NO(TssInfoReceiver, detectEnvironment) DEF_NO(TssInfoReceiver, isCheating)
+DEF_NO(TssInfoReceiver, isCheatDetected) DEF_NO(TssInfoReceiver, isSuspicious) DEF_NO(TssInfoReceiver, antiCheatCheck)
+DEF_NO(TssInfoReceiver, securityCheck) DEF_NO(TssInfoReceiver, shouldReport) DEF_NO(TssInfoReceiver, shouldBlock)
+DEF_NO(TssInfoReceiver, needReport) DEF_NO(TssInfoReceiver, needBlock) DEF_NO(TssInfoReceiver, isBlocked)
+DEF_NO(TssInfoReceiver, isBanned)
+DEF_YES(TssInfoReceiver, isSafe) DEF_YES(TssInfoReceiver, isClean) DEF_YES(TssInfoReceiver, isEnvironmentClean)
+DEF_YES(TssInfoReceiver, isEnvironmentSafe) DEF_YES(TssInfoReceiver, verifyIntegrity)
+DEF_YES(TssInfoReceiver, verifySignature) DEF_YES(TssInfoReceiver, checkTokenValid)
+DEF_V1(TssInfoReceiver, start) DEF_V1(TssInfoReceiver, stop) DEF_V1(TssInfoReceiver, run)
+DEF_V1(TssInfoReceiver, onReceiveData) DEF_V1(TssInfoReceiver, onRecvData) DEF_V1(TssInfoReceiver, report)
+DEF_V1(TssInfoReceiver, sendReport) DEF_V1(TssInfoReceiver, uploadReport) DEF_V1(TssInfoReceiver, submitReport)
+DEF_V1(TssInfoReceiver, reportRoot) DEF_V1(TssInfoReceiver, reportEmu) DEF_V1(TssInfoReceiver, reportDebugger)
+DEF_V1(TssInfoReceiver, reportCheat) DEF_V1(TssInfoReceiver, reportAlert) DEF_V1(TssInfoReceiver, sendAlert)
+DEF_V1(TssInfoReceiver, blockGame) DEF_V1(TssInfoReceiver, blockPlayer) DEF_V1(TssInfoReceiver, kickPlayer)
+DEF_ID_P0(TssInfoReceiver, currentState) DEF_ID_P0(TssInfoReceiver, getState) DEF_ID_P0(TssInfoReceiver, getStatus)
+DEF_ID_P0(TssInfoReceiver, getReport) DEF_ID_P0(TssInfoReceiver, getResult) DEF_ID_P0(TssInfoReceiver, getData)
+DEF_ID_P0(TssInfoReceiver, getInfo) DEF_ID_P0(TssInfoReceiver, getRiskInfo) DEF_ID_P0(TssInfoReceiver, getCheatInfo)
+DEF_ID_P0(TssInfoReceiver, getEnvInfo) DEF_ID_P0(TssInfoReceiver, getConfig)
+DEF_ID_P1(TssInfoReceiver, updateState) DEF_ID_P1(TssInfoReceiver, setState) DEF_ID_P1(TssInfoReceiver, handleData)
+DEF_ID_P1(TssInfoReceiver, handleMessage) DEF_ID_P1(TssInfoReceiver, processData) DEF_ID_P1(TssInfoReceiver, onMessage)
+DEF_ID_P1(TssInfoReceiver, onCommand)
 
-DEF_ID_P1(CMrpcsMgrE,        setConfig)
-DEF_ID_P1(CMrpcsMgrE,        setState)
-DEF_ID_P1(CMrpcsMgrE,        handleData)
-DEF_ID_P1(CMrpcsMgrE,        processData)
-DEF_ID_P1(CMrpcsMonitor,     setConfig)
-DEF_ID_P1(CMrpcsMonitor,     handleData)
-DEF_ID_P1(CPointDataMgr,     setData)
-DEF_ID_P1(CPointDataMgr,     handleData)
-DEF_ID_P1(CPointGlobalMgr,   setData)
-DEF_ID_P1(CPointGlobalMgr,   handleData)
+DEF_NO(CheckSymbolSource, CheckSymbol) DEF_NO(CheckSymbolSource, checkSymbol) DEF_NO(CheckSymbolSource, checkSymbolSource)
+DEF_NO(CheckSymbolSource, isSymbolValid) DEF_NO(CheckSymbolSource, isSymbolOK) DEF_NO(CheckSymbolSource, verifySymbol)
+DEF_NO(CheckSymbolSource, verifySymbols) DEF_NO(CheckSymbolSource, isSourceSafe) DEF_NO(CheckSymbolSource, checkSource)
+DEF_YES(CheckSymbolSource, isSourceOK) DEF_YES(CheckSymbolSource, sourceIsValid)
+DEF_ID_P0(CheckSymbolSource, getResult) DEF_ID_P0(CheckSymbolSource, getReport)
+DEF_ID_P1(CheckSymbolSource, checkSymbolSourceWithData) DEF_ID_P1(CheckSymbolSource, verifySymbolWithData)
 
-DEF_ID_P2(CMrpcsMgrE,        sendData_withType)
-DEF_ID_P2(CMrpcsMgrE,        handleMessage_withData)
-DEF_ID_P2(CPointDataMgr,     sendData_withType)
-DEF_ID_P2(CPointGlobalMgr,   sendData_withType)
+DEF_NO(CFastScanThread, isRunning) DEF_NO(CFastScanThread, shouldScan) DEF_NO(CFastScanThread, hasResult)
+DEF_NO(CScanThread, isRunning) DEF_NO(CScanThread, shouldScan) DEF_NO(CScanThread, hasResult)
+DEF_NO(CSendThread, isRunning) DEF_NO(CSendThread, shouldSend) DEF_NO(CSendThread, hasData)
+DEF_NO(CMrpcsMonitor, isRunning) DEF_NO(CMrpcsMonitor, shouldReport)
+DEF_NO(CMrpcsMgrE, isReady) DEF_NO(CMrpcsMgrE, shouldReport)
+DEF_NO(CPointDataMgr, shouldReport) DEF_NO(CPointDataMgr, hasData)
+DEF_NO(CPointGlobalMgr, shouldReport) DEF_NO(CPointGlobalMgr, hasData)
+DEF_NO(CMrpcsLFUpdater, shouldUpdate) DEF_NO(CMrpcsLFUpdater, hasUpdate)
 
-// ─── CheckSymbolSource ───
-DEF_ID_P0(CheckSymbolSource, getResult)
-DEF_ID_P0(CheckSymbolSource, getReport)
-DEF_ID_P1(CheckSymbolSource, checkSymbolSourceWithData)
-DEF_ID_P1(CheckSymbolSource, verifySymbolWithData)
+DEF_V1(CFastScanThread, start) DEF_V1(CFastScanThread, run) DEF_V1(CFastScanThread, execute)
+DEF_V1(CFastScanThread, scan) DEF_V1(CFastScanThread, doScan) DEF_V1(CFastScanThread, report)
+DEF_V1(CFastScanThread, sendReport)
+DEF_V1(CScanThread, start) DEF_V1(CScanThread, run) DEF_V1(CScanThread, execute)
+DEF_V1(CScanThread, scan) DEF_V1(CScanThread, doScan) DEF_V1(CScanThread, report) DEF_V1(CScanThread, sendReport)
+DEF_V1(CSendThread, start) DEF_V1(CSendThread, run) DEF_V1(CSendThread, execute)
+DEF_V1(CSendThread, send) DEF_V1(CSendThread, doSend) DEF_V1(CSendThread, report)
+DEF_V1(CMrpcsMonitor, start) DEF_V1(CMrpcsMonitor, stop) DEF_V1(CMrpcsMonitor, run)
+DEF_V1(CMrpcsMonitor, execute) DEF_V1(CMrpcsMonitor, report) DEF_V1(CMrpcsMonitor, sendReport)
+DEF_V1(CMrpcsMgrE, sendScanResult) DEF_V1(CMrpcsMgrE, reportResult) DEF_V1(CMrpcsMgrE, sendReport)
+DEF_V1(CMrpcsMgrE, report) DEF_V1(CMrpcsMgrE, upload)
+DEF_V1(CPointDataMgr, report) DEF_V1(CPointDataMgr, sendData) DEF_V1(CPointDataMgr, uploadData)
+DEF_V1(CPointDataMgr, dispatch)
+DEF_V1(CPointGlobalMgr, report) DEF_V1(CPointGlobalMgr, sendReport) DEF_V1(CPointGlobalMgr, upload)
+DEF_V1(CMrpcsLFUpdater, update) DEF_V1(CMrpcsLFUpdater, start) DEF_V1(CMrpcsLFUpdater, run)
+DEF_V1(CMrpcsLFUpdater, check) DEF_V1(CMrpcsLFUpdater, report)
 
-// ─── Screenshot / Rotate (fixed — P0 dan P1 tidak tabrakan) ───
-DEF_ID_P0(ScreenShot, takeScreenShot)
-DEF_ID_P0(ScreenShot, screenshot)
-DEF_ID_P1(ScreenShot, takeScreenShotEx)
-DEF_ID_P1(ScreenShot, screenshotOfView)
-DEF_ID_P1(ScreenShot, getBufFromImage)
-DEF_ID_P1(ScreenShot, getAppWindowsForScreen)
+DEF_ID_P0(CMrpcsMgrE, getInstance) DEF_ID_P0(CMrpcsMgrE, getState) DEF_ID_P0(CMrpcsMgrE, getReport)
+DEF_ID_P0(CMrpcsMgrE, getResult) DEF_ID_P0(CMrpcsMgrE, getConfig)
+DEF_ID_P0(CMrpcsMonitor, getState) DEF_ID_P0(CMrpcsMonitor, getReport) DEF_ID_P0(CMrpcsMonitor, getResult)
+DEF_ID_P0(CPointDataMgr, getData) DEF_ID_P0(CPointDataMgr, getReport) DEF_ID_P0(CPointDataMgr, getState)
+DEF_ID_P0(CPointGlobalMgr, getData) DEF_ID_P0(CPointGlobalMgr, getReport) DEF_ID_P0(CPointGlobalMgr, getState)
+DEF_ID_P0(CMrpcsLFUpdater, getState) DEF_ID_P0(CMrpcsLFUpdater, getConfig) DEF_ID_P0(CMrpcsLFUpdater, getVersion)
+DEF_ID_P1(CMrpcsMgrE, setConfig) DEF_ID_P1(CMrpcsMgrE, setState) DEF_ID_P1(CMrpcsMgrE, handleData)
+DEF_ID_P1(CMrpcsMgrE, processData)
+DEF_ID_P1(CMrpcsMonitor, setConfig) DEF_ID_P1(CMrpcsMonitor, handleData)
+DEF_ID_P1(CPointDataMgr, setData) DEF_ID_P1(CPointDataMgr, handleData)
+DEF_ID_P1(CPointGlobalMgr, setData) DEF_ID_P1(CPointGlobalMgr, handleData)
+DEF_ID_P2(CMrpcsMgrE, sendData_withType) DEF_ID_P2(CMrpcsMgrE, handleMessage_withData)
+DEF_ID_P2(CPointDataMgr, sendData_withType) DEF_ID_P2(CPointGlobalMgr, sendData_withType)
 
-DEF_ID_P0(Rotate, fixOrientation)
-DEF_ID_P0(Rotate, flipVertical)
-DEF_ID_P0(Rotate, flipHorizontal)
-DEF_ID_P1(Rotate, rotate)
-DEF_ID_P1(Rotate, imageRotatedByRadians)
-DEF_ID_P1(Rotate, imageRotatedByDegrees)
+DEF_V1(NetworkManager, sendRootAlert) DEF_V1(NetworkManager, sendEmuAlert)
+DEF_V1(NetworkManager, sendDebuggerAlert) DEF_V1(NetworkManager, sendCheatAlert)
+DEF_V1(NetworkManager, send9010Alert) DEF_V1(NetworkManager, send9014Alert)
+DEF_V1(NetworkManager, send9005Alert) DEF_V1(NetworkManager, sendShellReport)
+DEF_V1(NetworkManager, sendCheckState)
 
-// ─── AceMsgBoxImp ───
-DEF_ID_P0(AceMsgBoxImp, viewTitle)
-DEF_ID_P0(AceMsgBoxImp, viewContent)
-DEF_ID_P0(AceMsgBoxImp, leftBtnContent)
-DEF_ID_P0(AceMsgBoxImp, rightBtnContent)
+DEF_ID_P0(ScreenShot, takeScreenShot) DEF_ID_P0(ScreenShot, screenshot)
+DEF_ID_P1(ScreenShot, takeScreenShotEx) DEF_ID_P1(ScreenShot, screenshotOfView)
+DEF_ID_P1(ScreenShot, getBufFromImage) DEF_ID_P1(ScreenShot, getAppWindowsForScreen)
+DEF_ID_P0(Rotate, fixOrientation) DEF_ID_P0(Rotate, flipVertical) DEF_ID_P0(Rotate, flipHorizontal)
+DEF_ID_P1(Rotate, rotate) DEF_ID_P1(Rotate, imageRotatedByRadians) DEF_ID_P1(Rotate, imageRotatedByDegrees)
+
+DEF_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn)
+DEF_V1(AceMsgBoxImp, dismiss) DEF_V1(AceMsgBoxImp, show)
+DEF_ID_P0(AceMsgBoxImp, viewTitle) DEF_ID_P0(AceMsgBoxImp, viewContent)
+DEF_ID_P0(AceMsgBoxImp, leftBtnContent) DEF_ID_P0(AceMsgBoxImp, rightBtnContent)
 
 #pragma mark =========================================================
-#pragma mark 13. REGISTER EXTENDED
+#pragma mark 9. INJECTION KILL + REAL ObjC
 #pragma mark =========================================================
 
-static void SBXK_RegisterExtended(void) {
+DEF_NO(SBXK_FridaDet, isFridaPresent) DEF_NO(SBXK_FridaDet, isFridaRunning) DEF_NO(SBXK_FridaDet, hasFrida)
+DEF_NO(SBXK_FridaDet, checkFrida) DEF_NO(SBXK_FridaDet, detectFrida) DEF_NO(SBXK_FridaDet, isFridaGadgetLoaded)
+DEF_NO(SBXK_FridaDet, hasFridaGadget) DEF_NO(SBXK_FridaDet, isFridaAgentLoaded) DEF_NO(SBXK_FridaDet, hasNamedPipe)
+DEF_NO(SBXK_FridaDet, checkNamedPipe) DEF_NO(SBXK_FridaDet, isPipeOpen)
+DEF_NO(SBXK_SubDet, isSubstrateLoaded) DEF_NO(SBXK_SubDet, hasSubstrate) DEF_NO(SBXK_SubDet, checkSubstrate)
+DEF_NO(SBXK_SubDet, isCydiaSubstrateLoaded) DEF_NO(SBXK_SubDet, isSubstituteLoaded) DEF_NO(SBXK_SubDet, hasSubstitute)
+DEF_NO(SBXK_SubDet, checkSubstitute)
+DEF_NO(SBXK_InjectDet, isElleKitLoaded) DEF_NO(SBXK_InjectDet, hasElleKit) DEF_NO(SBXK_InjectDet, isLibhookerLoaded)
+DEF_NO(SBXK_InjectDet, hasLibhooker) DEF_NO(SBXK_InjectDet, isTweakInjectLoaded) DEF_NO(SBXK_InjectDet, hasTweakInject)
+DEF_NO(SBXK_InjectDet, checkTweaks) DEF_NO(SBXK_InjectDet, hasJailbreakTweak) DEF_NO(SBXK_InjectDet, isDylibInjected)
+DEF_NO(SBXK_InjectDet, isImageInjected) DEF_NO(SBXK_InjectDet, hasInjectedDylib) DEF_NO(SBXK_InjectDet, isForeignImageLoaded)
+DEF_NO(SBXK_InjectDet, hasHooked) DEF_NO(SBXK_InjectDet, hasMSHook) DEF_NO(SBXK_InjectDet, checkMSHook)
+DEF_NO(SBXK_InjectDet, checkSymbolHook) DEF_NO(SBXK_InjectDet, hasSwizzled) DEF_NO(SBXK_InjectDet, hasDYLD_INSERT)
+DEF_NO(SBXK_InjectDet, isDYLDInjected) DEF_NO(SBXK_InjectDet, checkDYLD) DEF_NO(SBXK_InjectDet, isEnvInjected)
+DEF_NO(SBXK_InjectDet, hasEnvVarInject) DEF_NO(SBXK_InjectDet, isAttached) DEF_NO(SBXK_InjectDet, isBeingDebugged)
+DEF_NO(SBXK_InjectDet, isTraced) DEF_NO(SBXK_InjectDet, hasPtraced) DEF_NO(SBXK_InjectDet, checkPtrace)
+DEF_NO(SBXK_InjectDet, isPtraceDetected) DEF_NO(SBXK_InjectDet, hasForeignExceptionPort)
+DEF_NO(SBXK_InjectDet, hasExceptionHijack) DEF_NO(SBXK_InjectDet, checkExceptionPorts)
+DEF_NO(SBXK_InjectDet, isPortHijacked)
+DEF_YES(SBXK_InjectDet, isEnvironmentClean) DEF_YES(SBXK_InjectDet, isEnvironmentSafe)
+DEF_YES(SBXK_InjectDet, isClean) DEF_YES(SBXK_InjectDet, isSafe)
+DEF_YES(SBXK_InjectDet, verifyNoInjection) DEF_YES(SBXK_InjectDet, verifyNoHook)
+DEF_YES(SBXK_InjectDet, verifyNoDylib) DEF_YES(SBXK_InjectDet, verifyImageClean)
+DEF_V1(SBXK_InjectDet, reportFrida) DEF_V1(SBXK_InjectDet, reportSubstrate) DEF_V1(SBXK_InjectDet, reportSubstitute)
+DEF_V1(SBXK_InjectDet, reportElleKit) DEF_V1(SBXK_InjectDet, reportLibhooker) DEF_V1(SBXK_InjectDet, reportInjection)
+DEF_V1(SBXK_InjectDet, reportHook) DEF_V1(SBXK_InjectDet, reportDylib) DEF_V1(SBXK_InjectDet, reportAttach)
+DEF_V1(SBXK_InjectDet, reportPtrace) DEF_V1(SBXK_InjectDet, reportExceptionPort) DEF_V1(SBXK_InjectDet, reportNamedPipe)
+DEF_V1(SBXK_InjectDet, reportEnvInject) DEF_V1(SBXK_InjectDet, sendAlert) DEF_V1(SBXK_InjectDet, sendReport)
+DEF_V1(SBXK_InjectDet, uploadReport) DEF_V1(SBXK_InjectDet, submitReport) DEF_V1(SBXK_InjectDet, notifyServer)
+DEF_V1(SBXK_InjectDet, alertUser) DEF_V1(SBXK_InjectDet, blockGame) DEF_V1(SBXK_InjectDet, kickPlayer)
 
-#define REG_B(cls, name)   SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
-#define REG_V1(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@")
-#define REG_V2(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@@")
-#define REG_ID0(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:")
-#define REG_ID1(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@")
-#define REG_ID2(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@@")
+// QAPMReport
+DEF_NO(QAPMReport, isEnabled) DEF_NO(QAPMReport, isRunning) DEF_NO(QAPMReport, shouldReport)
+DEF_NO(QAPMReport, hasReport)
+DEF_V1(QAPMReport, report) DEF_V1(QAPMReport, sendReport) DEF_V1(QAPMReport, upload) DEF_V1(QAPMReport, submit)
+DEF_V1(QAPMReport, flush) DEF_V1(QAPMReport, start) DEF_V1(QAPMReport, stop) DEF_V1(QAPMReport, setEnabled)
+DEF_V1(QAPMReport, setUserId) DEF_V1(QAPMReport, setUserValue) DEF_V1(QAPMReport, trackEvent)
+DEF_V1(QAPMReport, reportException) DEF_V1(QAPMReport, reportCrash) DEF_V1(QAPMReport, reportPerformance)
+DEF_V1(QAPMReport, reportNetwork) DEF_V1(QAPMReport, reportBattery)
+DEF_ID_P0(QAPMReport, getState) DEF_ID_P0(QAPMReport, getConfig) DEF_ID_P0(QAPMReport, getReport)
+DEF_ID_P0(QAPMReport, getDeviceId) DEF_ID_P0(QAPMReport, getSessionId)
+DEF_ID_P1(QAPMReport, updateConfig) DEF_ID_P1(QAPMReport, setConfig) DEF_ID_P1(QAPMReport, handleData)
 
-    // AntiDataProxy
-    REG_B (AntiDataProxy, checkIntegrity);
-    REG_B (AntiDataProxy, isIntegrityOK);
-    REG_B (AntiDataProxy, verifyData);
-    REG_B (AntiDataProxy, isDataValid);
-    REG_B (AntiDataProxy, isModified);
-    REG_B (AntiDataProxy, isCheat);
-    REG_B (AntiDataProxy, isSuspicious);
-    REG_B (AntiDataProxy, antiCheatCheck);
-    REG_B (AntiDataProxy, securityCheck);
-    REG_B (AntiDataProxy, hasRisk);
-    REG_B (AntiDataProxy, detectRisk);
-    REG_B (AntiDataProxy, isRiskDetected);
-    REG_B (AntiDataProxy, isValid);
-    REG_B (AntiDataProxy, isSafe);
-    REG_B (AntiDataProxy, isClean);
-    REG_B (AntiDataProxy, verifyIntegrity);
-    REG_B (AntiDataProxy, verifySignature);
-    REG_B (AntiDataProxy, shouldPass);
-    REG_B (AntiDataProxy, allowReport);
-    REG_V1(AntiDataProxy, sendData);
-    REG_V1(AntiDataProxy, report);
-    REG_V1(AntiDataProxy, submit);
-    REG_V1(AntiDataProxy, upload);
-    REG_V1(AntiDataProxy, dispatch);
-    REG_V1(AntiDataProxy, flush);
-    REG_ID0(AntiDataProxy, getData);
-    REG_ID0(AntiDataProxy, getPayload);
-    REG_ID0(AntiDataProxy, getHeader);
-    REG_ID0(AntiDataProxy, getBody);
-    REG_ID0(AntiDataProxy, getResponse);
-    REG_ID0(AntiDataProxy, getConfig);
-    REG_ID0(AntiDataProxy, getState);
-    REG_ID0(AntiDataProxy, getStatus);
-    REG_ID1(AntiDataProxy, setData);
-    REG_ID1(AntiDataProxy, setPayload);
-    REG_ID1(AntiDataProxy, setConfig);
-    REG_ID1(AntiDataProxy, process);
-    REG_ID1(AntiDataProxy, handle);
-    REG_ID1(AntiDataProxy, onReceive);
-    REG_ID1(AntiDataProxy, onMessage);
-    REG_ID2(AntiDataProxy, sendData_withHeader);
-    REG_ID2(AntiDataProxy, sendReport_withType);
-    REG_ID2(AntiDataProxy, postData_withURL);
+// Meemo
+DEF_NO(MeemoUserManager, isGuest) DEF_NO(MeemoUserManager, isBanned) DEF_NO(MeemoUserManager, isBlocked)
+DEF_NO(MeemoUserManager, isUnderage)
+DEF_ID_P0(MeemoUserManager, currentUser) DEF_ID_P0(MeemoUserManager, currentToken)
+DEF_ID_P0(MeemoUserManager, currentOpenId) DEF_ID_P0(MeemoUserManager, currentAccountId)
+DEF_ID_P0(MeemoUserManager, currentSession) DEF_ID_P0(MeemoUserManager, userInfo)
+DEF_ID_P0(MeemoUserManager, getInstance)
+DEF_ID_P1(MeemoUserManager, setUser) DEF_ID_P1(MeemoUserManager, setToken)
+DEF_ID_P1(MeemoUserManager, updateUserInfo)
+DEF_V1(MeemoLogUtil, log) DEF_V1(MeemoLogUtil, logInfo) DEF_V1(MeemoLogUtil, logDebug)
+DEF_V1(MeemoLogUtil, logWarn) DEF_V1(MeemoLogUtil, logError) DEF_V1(MeemoLogUtil, logEvent)
+DEF_V1(MeemoLogUtil, sendLog) DEF_V1(MeemoLogUtil, uploadLog) DEF_V1(MeemoLogUtil, flush)
+DEF_V1(MeemoLogUtil, report)
+DEF_ID_P0(MeemoUtils, getInstance) DEF_ID_P0(MeemoUtils, getDeviceId) DEF_ID_P0(MeemoUtils, getChannel)
+DEF_ID_P0(MeemoUtils, getVersion) DEF_ID_P0(MeemoUtils, getCountryCode) DEF_ID_P0(MeemoUtils, getLanguage)
+DEF_ID_P0(MeemoUtils, getPlatform) DEF_ID_P0(MeemoUtils, getUUID)
 
-    // TssInfoReceiver
-    REG_B (TssInfoReceiver, isRooted);
-    REG_B (TssInfoReceiver, isRootedDevice);
-    REG_B (TssInfoReceiver, isJailbroken);
-    REG_B (TssInfoReceiver, isJailbreakDevice);
-    REG_B (TssInfoReceiver, isEmulator);
-    REG_B (TssInfoReceiver, isEmulatorDevice);
-    REG_B (TssInfoReceiver, isSimulator);
-    REG_B (TssInfoReceiver, isDebuggerAttached);
-    REG_B (TssInfoReceiver, isDebugged);
-    REG_B (TssInfoReceiver, isModified);
-    REG_B (TssInfoReceiver, isTampered);
-    REG_B (TssInfoReceiver, isInjected);
-    REG_B (TssInfoReceiver, isHooked);
-    REG_B (TssInfoReceiver, hasCheat);
-    REG_B (TssInfoReceiver, hasCheatTool);
-    REG_B (TssInfoReceiver, hasSuspiciousFiles);
-    REG_B (TssInfoReceiver, hasRisk);
-    REG_B (TssInfoReceiver, checkEnvironment);
-    REG_B (TssInfoReceiver, checkSecurity);
-    REG_B (TssInfoReceiver, checkCheat);
-    REG_B (TssInfoReceiver, detectCheat);
-    REG_B (TssInfoReceiver, detectRisk);
-    REG_B (TssInfoReceiver, detectEnvironment);
-    REG_B (TssInfoReceiver, isCheating);
-    REG_B (TssInfoReceiver, isCheatDetected);
-    REG_B (TssInfoReceiver, isSuspicious);
-    REG_B (TssInfoReceiver, antiCheatCheck);
-    REG_B (TssInfoReceiver, securityCheck);
-    REG_B (TssInfoReceiver, shouldReport);
-    REG_B (TssInfoReceiver, shouldBlock);
-    REG_B (TssInfoReceiver, needReport);
-    REG_B (TssInfoReceiver, needBlock);
-    REG_B (TssInfoReceiver, isBlocked);
-    REG_B (TssInfoReceiver, isBanned);
-    REG_B (TssInfoReceiver, isSafe);
-    REG_B (TssInfoReceiver, isClean);
-    REG_B (TssInfoReceiver, isEnvironmentClean);
-    REG_B (TssInfoReceiver, isEnvironmentSafe);
-    REG_B (TssInfoReceiver, verifyIntegrity);
-    REG_B (TssInfoReceiver, verifySignature);
-    REG_B (TssInfoReceiver, checkTokenValid);
-    REG_V1(TssInfoReceiver, start);
-    REG_V1(TssInfoReceiver, stop);
-    REG_V1(TssInfoReceiver, run);
-    REG_V1(TssInfoReceiver, onReceiveData);
-    REG_V1(TssInfoReceiver, onRecvData);
-    REG_V1(TssInfoReceiver, report);
-    REG_V1(TssInfoReceiver, sendReport);
-    REG_V1(TssInfoReceiver, uploadReport);
-    REG_V1(TssInfoReceiver, submitReport);
-    REG_V1(TssInfoReceiver, reportRoot);
-    REG_V1(TssInfoReceiver, reportEmu);
-    REG_V1(TssInfoReceiver, reportDebugger);
-    REG_V1(TssInfoReceiver, reportCheat);
-    REG_V1(TssInfoReceiver, reportAlert);
-    REG_V1(TssInfoReceiver, sendAlert);
-    REG_V1(TssInfoReceiver, blockGame);
-    REG_V1(TssInfoReceiver, blockPlayer);
-    REG_V1(TssInfoReceiver, kickPlayer);
-    REG_ID0(TssInfoReceiver, currentState);
-    REG_ID0(TssInfoReceiver, getState);
-    REG_ID0(TssInfoReceiver, getStatus);
-    REG_ID0(TssInfoReceiver, getReport);
-    REG_ID0(TssInfoReceiver, getResult);
-    REG_ID0(TssInfoReceiver, getData);
-    REG_ID0(TssInfoReceiver, getInfo);
-    REG_ID0(TssInfoReceiver, getRiskInfo);
-    REG_ID0(TssInfoReceiver, getCheatInfo);
-    REG_ID0(TssInfoReceiver, getEnvInfo);
-    REG_ID0(TssInfoReceiver, getConfig);
-    REG_ID1(TssInfoReceiver, updateState);
-    REG_ID1(TssInfoReceiver, setState);
-    REG_ID1(TssInfoReceiver, handleData);
-    REG_ID1(TssInfoReceiver, handleMessage);
-    REG_ID1(TssInfoReceiver, processData);
-    REG_ID1(TssInfoReceiver, onMessage);
-    REG_ID1(TssInfoReceiver, onCommand);
+DEF_NO(PBConfigManager, isModified) DEF_NO(PBConfigManager, isTampered)
+DEF_ID_P0(PBConfigManager, getConfig) DEF_ID_P0(PBConfigManager, getInstance) DEF_ID_P0(PBConfigManager, currentConfig)
+DEF_ID_P1(PBConfigManager, updateConfig) DEF_ID_P1(PBConfigManager, setConfig)
+DEF_ID_P0(CdnConfigManager, getConfig) DEF_ID_P0(CdnConfigManager, getInstance) DEF_ID_P0(CdnConfigManager, currentConfig)
+DEF_ID_P1(CdnConfigManager, updateConfig)
 
-    // CheckSymbolSource
-    REG_B (CheckSymbolSource, CheckSymbol);
-    REG_B (CheckSymbolSource, checkSymbol);
-    REG_B (CheckSymbolSource, checkSymbolSource);
-    REG_B (CheckSymbolSource, isSymbolValid);
-    REG_B (CheckSymbolSource, isSymbolOK);
-    REG_B (CheckSymbolSource, verifySymbol);
-    REG_B (CheckSymbolSource, verifySymbols);
-    REG_B (CheckSymbolSource, isSourceSafe);
-    REG_B (CheckSymbolSource, checkSource);
-    REG_B (CheckSymbolSource, isSourceOK);
-    REG_B (CheckSymbolSource, sourceIsValid);
-    REG_ID0(CheckSymbolSource, getResult);
-    REG_ID0(CheckSymbolSource, getReport);
-    REG_ID1(CheckSymbolSource, checkSymbolSourceWithData);
-    REG_ID1(CheckSymbolSource, verifySymbolWithData);
+DEF_ID_P0(MeemoBundleUtils, getInstance) DEF_ID_P0(MeemoBundleUtils, bundlePath) DEF_ID_P0(MeemoBundleUtils, mainBundle)
+DEF_ID_P0(MeemoSubPackageDownloadMgr, getInstance) DEF_ID_P0(MeemoSubPackageDownloadMgr, state)
+DEF_ID_P0(MeemoSubPackageInfoProvider, getInstance) DEF_ID_P0(MeemoSubPackageInfoProvider, currentInfo)
+DEF_ID_P0(MeemoSubPackageUtils, getInstance)
+DEF_ID_P0(MeemoCoreInitalizer, getInstance) DEF_ID_P0(MeemoCoreInitalizer, state)
+DEF_V1(MeemoCoreInitalizer, initialize) DEF_V1(MeemoCoreInitalizer, start)
+DEF_ID_P0(MeemoFlutterViewController, getInstance)
 
-    // MRPCS
-    REG_B (CFastScanThread, isRunning);
-    REG_B (CFastScanThread, shouldScan);
-    REG_B (CFastScanThread, hasResult);
-    REG_V1(CFastScanThread, start);
-    REG_V1(CFastScanThread, run);
-    REG_V1(CFastScanThread, execute);
-    REG_V1(CFastScanThread, scan);
-    REG_V1(CFastScanThread, doScan);
-    REG_V1(CFastScanThread, report);
-    REG_V1(CFastScanThread, sendReport);
+DEF_NO(HotfixPatchDownloadManager, isModified) DEF_NO(HotfixPatchDownloadManager, hasIllegalPatch)
+DEF_NO(HotfixPatchDownloadManager, isTampered)
+DEF_ID_P0(HotfixPatchDownloadManager, getInstance) DEF_ID_P0(HotfixPatchDownloadManager, state)
+DEF_ID_P0(HotfixPatchDownloadManager, currentPatch)
+DEF_ID_P1(HotfixPatchDownloadManager, checkPatch) DEF_ID_P1(HotfixPatchDownloadManager, applyPatch)
 
-    REG_B (CScanThread, isRunning);
-    REG_B (CScanThread, shouldScan);
-    REG_B (CScanThread, hasResult);
-    REG_V1(CScanThread, start);
-    REG_V1(CScanThread, run);
-    REG_V1(CScanThread, execute);
-    REG_V1(CScanThread, scan);
-    REG_V1(CScanThread, doScan);
-    REG_V1(CScanThread, report);
-    REG_V1(CScanThread, sendReport);
+DEF_ID_P0(DeviceInfoPlugin, getInstance) DEF_ID_P0(DeviceInfoPlugin, deviceInfo)
+DEF_ID_P0(DeviceInfoPlugin, model) DEF_ID_P0(DeviceInfoPlugin, systemVersion)
+DEF_ID_P0(DeviceInfoPlugin, identifierForVendor)
+DEF_NO(FlutterFlogPlugin, isEnabled) DEF_V1(FlutterFlogPlugin, log) DEF_V1(FlutterFlogPlugin, report)
+DEF_NO(FlutterQAPMPlugin, isEnabled) DEF_V1(FlutterQAPMPlugin, report) DEF_V1(FlutterQAPMPlugin, trackEvent)
 
-    REG_B (CSendThread, isRunning);
-    REG_B (CSendThread, shouldSend);
-    REG_B (CSendThread, hasData);
-    REG_V1(CSendThread, start);
-    REG_V1(CSendThread, run);
-    REG_V1(CSendThread, execute);
-    REG_V1(CSendThread, send);
-    REG_V1(CSendThread, doSend);
-    REG_V1(CSendThread, report);
+#pragma mark =========================================================
+#pragma mark 10. SELF-INTEGRITY
+#pragma mark =========================================================
 
-    REG_B (CMrpcsMonitor, isRunning);
-    REG_B (CMrpcsMonitor, shouldReport);
-    REG_V1(CMrpcsMonitor, start);
-    REG_V1(CMrpcsMonitor, stop);
-    REG_V1(CMrpcsMonitor, run);
-    REG_V1(CMrpcsMonitor, execute);
-    REG_V1(CMrpcsMonitor, report);
-    REG_V1(CMrpcsMonitor, sendReport);
-    REG_ID0(CMrpcsMonitor, getState);
-    REG_ID0(CMrpcsMonitor, getReport);
-    REG_ID0(CMrpcsMonitor, getResult);
-    REG_ID1(CMrpcsMonitor, setConfig);
-    REG_ID1(CMrpcsMonitor, handleData);
+static BOOL sbxk_self_ok(void) {
+    const char *self = NULL;
+    uint32_t cnt = _dyld_image_count();
+    NSString *nm = SENS("ShadowBypassXK.dylib");
+    for (uint32_t i = 0; i < cnt; i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, nm.UTF8String)) { self = n; break; }
+    }
+    if (!self) return NO;
+    int fd = open(self, O_RDONLY); if (fd < 0) return NO;
+    uint8_t buf[64]; ssize_t r = read(fd, buf, sizeof(buf)); close(fd);
+    if (r != (ssize_t)sizeof(buf)) return NO;
+    uint32_t magic; memcpy(&magic, buf, 4);
+    return (magic == 0xFEEDFACF);
+}
 
-    REG_B (CMrpcsMgrE, isReady);
-    REG_B (CMrpcsMgrE, shouldReport);
-    REG_V1(CMrpcsMgrE, sendScanResult);
-    REG_V1(CMrpcsMgrE, reportResult);
-    REG_V1(CMrpcsMgrE, sendReport);
-    REG_V1(CMrpcsMgrE, report);
-    REG_V1(CMrpcsMgrE, upload);
-    REG_ID0(CMrpcsMgrE, getInstance);
-    REG_ID0(CMrpcsMgrE, getState);
-    REG_ID0(CMrpcsMgrE, getReport);
-    REG_ID0(CMrpcsMgrE, getResult);
-    REG_ID0(CMrpcsMgrE, getConfig);
-    REG_ID1(CMrpcsMgrE, setConfig);
-    REG_ID1(CMrpcsMgrE, setState);
-    REG_ID1(CMrpcsMgrE, handleData);
-    REG_ID1(CMrpcsMgrE, processData);
-    REG_ID2(CMrpcsMgrE, sendData_withType);
-    REG_ID2(CMrpcsMgrE, handleMessage_withData);
-
-    REG_B (CPointDataMgr, shouldReport);
-    REG_B (CPointDataMgr, hasData);
-    REG_V1(CPointDataMgr, report);
-    REG_V1(CPointDataMgr, sendData);
-    REG_V1(CPointDataMgr, uploadData);
-    REG_V1(CPointDataMgr, dispatch);
-    REG_ID0(CPointDataMgr, getData);
-    REG_ID0(CPointDataMgr, getReport);
-    REG_ID0(CPointDataMgr, getState);
-    REG_ID1(CPointDataMgr, setData);
-    REG_ID1(CPointDataMgr, handleData);
-    REG_ID2(CPointDataMgr, sendData_withType);
-
-    REG_B (CPointGlobalMgr, shouldReport);
-    REG_B (CPointGlobalMgr, hasData);
-    REG_V1(CPointGlobalMgr, report);
-    REG_V1(CPointGlobalMgr, sendReport);
-    REG_V1(CPointGlobalMgr, upload);
-    REG_ID0(CPointGlobalMgr, getData);
-    REG_ID0(CPointGlobalMgr, getReport);
-    REG_ID0(CPointGlobalMgr, getState);
-    REG_ID1(CPointGlobalMgr, setData);
-    REG_ID1(CPointGlobalMgr, handleData);
-    REG_ID2(CPointGlobalMgr, sendData_withType);
-
-    REG_B (CMrpcsLFUpdater, shouldUpdate);
-    REG_B (CMrpcsLFUpdater, hasUpdate);
-    REG_V1(CMrpcsLFUpdater, update);
-    REG_V1(CMrpcsLFUpdater, start);
-    REG_V1(CMrpcsLFUpdater, run);
-    REG_V1(CMrpcsLFUpdater, check);
-    REG_V1(CMrpcsLFUpdater, report);
-    REG_ID0(CMrpcsLFUpdater, getState);
-    REG_ID0(CMrpcsLFUpdater, getConfig);
-    REG_ID0(CMrpcsLFUpdater, getVersion);
-
-    // NetworkManager alert reporters
-    REG_V1(NetworkManager, sendRootAlert);
-    REG_V1(NetworkManager, sendEmuAlert);
-    REG_V1(NetworkManager, sendDebuggerAlert);
-    REG_V1(NetworkManager, sendCheatAlert);
-    REG_V1(NetworkManager, send9010Alert);
-    REG_V1(NetworkManager, send9014Alert);
-    REG_V1(NetworkManager, send9005Alert);
-    REG_V1(NetworkManager, sendShellReport);
-    REG_V1(NetworkManager, sendCheckState);
-
-    // ScreenShot / Rotate — hanya yang P0/P1 sesuai deklarasi
-    REG_ID0(ScreenShot, takeScreenShot);
-    REG_ID0(ScreenShot, screenshot);
-    REG_ID1(ScreenShot, takeScreenShotEx);
-    REG_ID1(ScreenShot, screenshotOfView);
-    REG_ID1(ScreenShot, getBufFromImage);
-    REG_ID1(ScreenShot, getAppWindowsForScreen);
-
-    REG_ID0(Rotate, fixOrientation);
-    REG_ID0(Rotate, flipVertical);
-    REG_ID0(Rotate, flipHorizontal);
-    REG_ID1(Rotate, rotate);
-    REG_ID1(Rotate, imageRotatedByRadians);
-    REG_ID1(Rotate, imageRotatedByDegrees);
-
-    // AceMsgBoxImp
-    REG_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn);
-    REG_V1(AceMsgBoxImp, dismiss);
-    REG_V1(AceMsgBoxImp, show);
-    REG_ID0(AceMsgBoxImp, viewTitle);
-    REG_ID0(AceMsgBoxImp, viewContent);
-    REG_ID0(AceMsgBoxImp, leftBtnContent);
-    REG_ID0(AceMsgBoxImp, rightBtnContent);
-
-#undef REG_B
-#undef REG_V1
-#undef REG_V2
-#undef REG_ID0
-#undef REG_ID1
-#undef REG_ID2
+static void sbxk_disable_all(void) {
+    for (NSString *k in g_orig.allKeys) {
+        NSValue *v = g_orig[k];
+        IMP orig = (IMP)[v pointerValue];
+        NSArray *p = [k componentsSeparatedByString:@"::"];
+        if (p.count != 2) continue;
+        Class c = objc_getClass([p[0] UTF8String]); if (!c) continue;
+        SEL s = sel_registerName([p[1] UTF8String]);
+        Method m = class_getInstanceMethod(c, s); if (!m) m = class_getClassMethod(c, s);
+        if (m) method_setImplementation(m, orig);
+    }
 }
 
 #pragma mark =========================================================
-#pragma mark 14. REGISTER ALL (base)
+#pragma mark 11. FISHHOOK (inline rebind)
 #pragma mark =========================================================
 
-static void SBXK_RegisterAll(void) {
+struct sbxk_rb { const char *name; void *repl; void **replaced; };
 
-#define REG_B(cls, name)   SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "B@:")
-#define REG_V1(cls, name)  SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "v@:@")
-#define REG_ID0(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:")
-#define REG_ID1(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@")
-#define REG_ID2(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@@")
-#define REG_ID3(cls, name) SBXK_SwizzleFull(#cls, #name, (IMP)SBXK_##cls##_##name, "@@:@@@")
+static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
+                             struct sbxk_rb *b, int nb)
+{
+    if (mh->magic != MH_MAGIC_64) return 0;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    const struct segment_command_64 *le = NULL;
+    const struct symtab_command *st = NULL;
+    const struct dysymtab_command *dy = NULL;
+    const struct load_command *lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (strcmp(sg->segname, "__LINKEDIT") == 0) le = sg;
+        } else if (lc->cmd == LC_SYMTAB) st = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_DYSYMTAB) dy = (const struct dysymtab_command *)lc;
+        lc = (const struct load_command *)((uint8_t *)lc + lc->cmdsize);
+    }
+    if (!le || !st || !dy) return 0;
+    uintptr_t sl = (uintptr_t)slide;
+    intptr_t lb = (intptr_t)(slide + le->vmaddr - le->fileoff);
+    const struct nlist_64 *sym = (const struct nlist_64 *)(lb + st->symoff);
+    const char *str = (const char *)(lb + st->stroff);
+    const struct relocation_info *ind = (const struct relocation_info *)(lb + dy->indirectsymoff);
+    int done = 0;
+    lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sec = (const struct section_64 *)(sg + 1);
+            for (uint32_t j = 0; j < sg->nsects; j++, sec++) {
+                uint8_t ft = sec->flags & SECTION_TYPE;
+                if (ft != S_LAZY_SYMBOL_POINTERS && ft != S_NON_LAZY_SYMBOL_POINTERS) continue;
+                uint32_t cnt = sec->size / sizeof(void *);
+                uint32_t start = sec->reserved1;
+                for (uint32_t k = 0; k < cnt; k++) {
+                    uint32_t si = ind[start + k].r_symbolnum;
+                    if (si == (uint32_t)-1 || si == 0) continue;
+                    const char *nm = str + sym[si].n_un.n_strx;
+                    if (!nm || nm[0] != '_') continue;
+                    const char *cl = nm + 1;
+                    for (int x = 0; x < nb; x++) {
+                        if (strcmp(b[x].name, cl) != 0) continue;
+                        void **slot = (void **)(sl + sec->addr + k * sizeof(void *));
+                        if (b[x].replaced && *b[x].replaced == NULL) *b[x].replaced = *slot;
+                        uintptr_t pg = (uintptr_t)slot & ~(PAGE_SIZE - 1);
+                        vm_protect(mach_task_self_, pg, PAGE_SIZE, false, VM_PROT_READ | VM_PROT_WRITE);
+                        *slot = b[x].repl;
+                        vm_protect(mach_task_self_, pg, PAGE_SIZE, false, VM_PROT_READ);
+                        done++;
+                    }
+                }
+            }
+        }
+        lc = (const struct load_command *)((uint8_t *)lc + lc->cmdsize);
+    }
+    return done;
+}
 
-    // ─── BOOL detection ───
-    REG_B(IntegrityChecker,  integrity_detect);
-    REG_B(IntegrityChecker,  MTML_INTEGRITY_DETECT);
-    REG_B(JailbreakDetector, isJailbroken);
-    REG_B(JailbreakDetector, isJailbreak);
-    REG_B(JailbreakDetector, checkJailbreak);
-    REG_B(JailbreakDetector, jailbreakDetection);
-    REG_B(SimulatorDetector, isSimulator);
-    REG_B(SimulatorDetector, isSimulatorDevice);
-    REG_B(SimulatorDetector, checkSimulator);
-    REG_B(SecurityChecker,   IsFileSystemModified);
-    REG_B(SecurityChecker,   isDebuggerAttached);
-    REG_B(SecurityChecker,   isDebugged);
-    REG_B(SecurityChecker,   checkDebugger);
-    REG_B(SecurityChecker,   amIBeingDebugged);
-    REG_B(SecurityChecker,   checkDebuggerAttach);
-    REG_B(SecurityChecker,   isHooked);
-    REG_B(SecurityChecker,   isHookDetected);
-    REG_B(SecurityChecker,   checkHook);
-    REG_B(SecurityChecker,   detectHook);
-    REG_B(SecurityChecker,   antiHookCheck);
-    REG_B(SecurityChecker,   isTampered);
-    REG_B(SecurityChecker,   checkTamper);
-    REG_B(SecurityChecker,   antiTamperCheck);
-    REG_B(SecurityChecker,   isInjected);
-    REG_B(SecurityChecker,   isLibraryInjected);
-    REG_B(SecurityChecker,   checkInjection);
-    REG_B(SecurityChecker,   antiInjectionCheck);
-    REG_B(SecurityChecker,   isReversingDetected);
-    REG_B(SecurityChecker,   checkReversing);
-    REG_B(SecurityChecker,   antiReversingCheck);
-    REG_B(SecurityChecker,   isBlocked);
-    REG_B(SecurityChecker,   antiBlockingCheck);
-    REG_B(SecurityChecker,   isVPNUsed);
-    REG_B(SecurityChecker,   isProxyUsed);
-    REG_B(SecurityChecker,   isFridaRunning);
-    REG_B(SecurityChecker,   isSubstrateLoaded);
-    REG_B(SecurityChecker,   isCydiaInstalled);
-    REG_B(SecurityChecker,   hasSuspiciousFiles);
-    REG_B(SecurityChecker,   isEnvironmentClean);
-    REG_B(SecurityChecker,   verifyIntegrity);
-    REG_B(SecurityChecker,   checkTokenValid);
-    REG_B(SecurityChecker,   isEnvironmentSafe);
-    REG_B(SecurityChecker,   verifySignature);
-    REG_B(AReachability,     isConnectionOnDemand);
-    REG_B(AReachability,     isConnectionRequired);
-    REG_B(GVGCloudVoiceExtension, CheckDeviceMuteStat);
+static int sbxk_rebind(struct sbxk_rb *b, int nb) {
+    int t = 0;
+    uint32_t c = _dyld_image_count();
+    for (uint32_t i = 0; i < c; i++)
+        t += sbxk_rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), b, nb);
+    return t;
+}
 
-    // ─── void no-op ───
-    REG_V1(GADAppOpenAd, adDidDismissFullScreenContent);
-    REG_V1(GADAppOpenAd, adWillDismissFullScreenContent);
-    REG_V1(GADAppOpenAd, adDidRecordClick);
-    REG_V1(GADAppOpenAd, adDidRecordImpression);
-    REG_V1(GADAppOpenAd, adWillPresentFullScreenContent);
-    REG_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError);
-    REG_V1(GADAppOpenAd, setPaidEventHandler);
-    REG_V1(GADAppOpenAd, adDidRecordUserInteraction);
-    REG_V1(NetworkManager, SendSecurityReport);
+// Stubs
+typedef int (*AnoSDKInit_t)(const char*);
+typedef int (*AnoSDKSetUserInfo_t)(const char*);
+typedef void *(*AnoSDKGetData_t)(int);
+typedef void *(*AnoSDKGetData2_t)(int,int);
+typedef int (*AnoSDKDel_t)(void*);
+typedef int (*AnoSDKIoctl_t)(int,const char*,char*,size_t);
+typedef int (*AnoSDKPause_t)(void);
+typedef int (*AnoSDKRecv_t)(const void*,size_t);
+typedef int (*CheckSym_t)(void);
+typedef int (*GAMELET_Log_t)(const char*);
+typedef int (*GAMELET_Log2_t)(const char*,const char*);
+typedef int (*GAMELET_Msg_t)(int,const void*,size_t);
 
-    // ─── id pass-through — GSDK ───
-    REG_ID0(GSDKCPU,               getSystemCPUCircle);
-    REG_ID0(GSDKMemory,            getSystemAvailableMemory);
-    REG_ID0(GSDKInGameManager,     GSDKRealTimeDetect);
-    REG_ID0(GSDKInGameSystem,      GSDKInnerEnd);
-    REG_ID0(GSDKInGameSystem,      GSDKInnerRealTimeDetect);
-    REG_ID0(GSDKPing,              ping);
-    REG_ID0(GSDKPing,              stopPing);
-    REG_ID0(GSDKPingDetect,        ping);
-    REG_ID0(PingDelegate,          pingTimer);
-    REG_ID0(SimplePing,            start);
-    REG_ID0(SimplePing,            startWithHostAddress);
-    REG_ID0(SimplePing,            readData);
-    REG_ID0(GSDKRealTimeDetect,    pingDelayDetect);
-    REG_ID0(GSDKRealTimeDetect,    updDelayDetect_Port);
-    REG_ID0(GSDKUdpDetect,         isUDPConnect_Port);
-    REG_ID0(GSDKWIFI,              ping);
-    REG_ID0(GSDKDetectPort,        isConnection_Port);
-    REG_ID0(GSDKInitManager,       detectOperation);
-    REG_ID0(GSDKPayEvent,          GSDKPay_Tag_Status_Msg);
-    REG_ID0(GSDKHttpRequest,       requestControl_Openid_Acctype_Zoneid_Env);
+static AnoSDKInit_t orig_AnoSDKInit; static AnoSDKSetUserInfo_t orig_AnoSDKSetUserInfo;
+static AnoSDKGetData_t orig_AnoSDKGetData; static AnoSDKGetData2_t orig_AnoSDKGetData2;
+static AnoSDKDel_t orig_AnoSDKDel; static AnoSDKIoctl_t orig_AnoSDKIoctl;
+static AnoSDKPause_t orig_AnoSDKPause, orig_AnoSDKResume;
+static AnoSDKRecv_t orig_AnoSDKRecvD, orig_AnoSDKRecvS;
+static CheckSym_t orig_CheckSym;
+static GAMELET_Log_t orig_GL1, orig_GL2;
+static GAMELET_Log2_t orig_GL3;
+static GAMELET_Msg_t orig_GM;
 
-    REG_ID1(SimplePing,            sendPingWithData);
-    REG_ID1(SimplePing,            didFailWithError);
-    REG_ID1(FBAdViewabilityValidator, checkViewability);
-    REG_ID1(TApmSceneMarker,       postStepEvent);
-    REG_ID1(TApmSceneMarker,       postStreamEvent);
-    REG_ID1(APMCollector,          collectMetrics);
-    REG_ID1(APMCollector,          reportNow);
-    REG_ID1(AudioDeviceMgr,        UpdateDeviceState);
+static int SBXK_AnoInit(const char*p){(void)p;return 0;}
+static int SBXK_AnoUser(const char*p){(void)p;return 0;}
+static void *SBXK_AnoData(int a){(void)a;return NULL;}
+static void *SBXK_AnoData2(int a,int b){(void)a;(void)b;return NULL;}
+static int SBXK_AnoDel(void*p){(void)p;return 0;}
+static int SBXK_AnoIoctl(int a,const char*i,char*o,size_t n){(void)a;(void)i;(void)o;(void)n;return 0;}
+static int SBXK_AnoPause(void){return 0;}
+static int SBXK_AnoRecv(const void*d,size_t n){(void)d;(void)n;return 0;}
+static int SBXK_CheckSym(void){return 0;}
+static int SBXK_GL1(const char*s){(void)s;return 0;}
+static int SBXK_GL2(const char*s){(void)s;return 0;}
+static int SBXK_GL3(const char*a,const char*b){(void)a;(void)b;return 0;}
+static int SBXK_GM(int a,const void*b,size_t c){(void)a;(void)b;(void)c;return 0;}
 
-    REG_ID2(SimplePing,            validatePingResponsePacket_sequenceNumber);
-    REG_ID2(FIRMessaging,          retrieveFCMTokenForSenderID_completion);
-    REG_ID2(FIRMessaging,          deleteFCMTokenForSenderID_completion);
-    REG_ID2(FIRMessaging,          subscribeToTopic_completion);
-    REG_ID2(FIRMessaging,          unsubscribeFromTopic_completion);
-    REG_ID2(FIRMessaging,          setAPNSToken_withUserInfo);
-    REG_ID2(GSDKInGameSystem,      GSDKInnerSaveFPS_FpsDots);
+// C++ mangled
+typedef int (*UQMCrash_Init_t)(void*,int,int,void*);
+typedef int (*UQMCrash_Str_t)(void*);
+typedef int (*UQMCrash_Log_t)(int,void*,void*);
+typedef int (*UQMCrash_Rpt_t)(void*,int,void*,void*,void*,void*,void*,int);
+static UQMCrash_Init_t orig_UQMInit; static UQMCrash_Str_t orig_UQMUser, orig_UQMApp;
+static UQMCrash_Log_t orig_UQMLog; static UQMCrash_Str_t orig_UQMSetUser;
+static UQMCrash_Rpt_t orig_UQMRpt;
+static int SBXK_UQMInit(void*a,int b,int c,void*d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static int SBXK_UQMUser(void*a){(void)a;return 0;}
+static int SBXK_UQMApp(void*a){(void)a;return 0;}
+static int SBXK_UQMLog(int a,void*b,void*c){(void)a;(void)b;(void)c;return 0;}
+static int SBXK_UQMSetUser(void*a,void*b){(void)a;(void)b;return 0;}
+static int SBXK_UQMRpt(void*a,int b,void*c,void*d,void*e,void*f,void*g,int h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
 
-    REG_ID3(SimplePing,            pingPacketWithType_payload_requiresChecksum);
-    REG_ID3(GSDKInGameSystem,      GSDKInnerStart_SceneID_RoomIP);
+typedef int (*CS_RptStuck_t)(void*,int,int,long,const char*,const char*,const char*,int,const char*);
+typedef int (*CS_RptErr_t)(void*,int,const char*,const char*,const char*,const char*,int,const char*);
+typedef int (*CS_RptLog_t)(void*,const char*,const char*);
+typedef int (*CS_LastUser_t)(void*,void*,int);
+static CS_RptStuck_t orig_CSStuck; static CS_RptErr_t orig_CSErr;
+static CS_RptLog_t orig_CSLog; static CS_LastUser_t orig_CSLast;
+static int SBXK_CSStuck(void*a,int b,int c,long d,const char*e,const char*f,const char*g,int h,const char*i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
+static int SBXK_CSErr(void*a,int b,const char*c,const char*d,const char*e,const char*f,int g,const char*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static int SBXK_CSLog(void*a,const char*b,const char*c){(void)a;(void)b;(void)c;return 0;}
+static int SBXK_CSLast(void*a,void*b,int c){(void)a;(void)b;(void)c;return 0;}
 
-    // ─── id pass-through — Voice ───
-    REG_ID0(GVGCloudVoice,           openMic);
-    REG_ID0(GVGCloudVoice,           openSpeaker);
-    REG_ID0(GVGCloudVoiceExtension,  GetBGMPlayState);
-    REG_ID0(GVGCloudVoiceExtension,  GetMicState);
-    REG_ID0(GVGCloudVoiceExtension,  GetSpeakerState);
-    REG_ID0(GVoiceMuteSwitch,        detectMuteSwitch);
-    REG_ID0(GCloudVoiceEngine,       StartTve);
-    REG_ID0(GCloudVoiceEngine,       TestMic);
-    REG_ID0(GCloudVoiceEngine,       GetMicLevel);
-    REG_ID0(GCloudVoiceEngine,       GetSpeakerLevel);
-    REG_ID0(GCloudVoiceEngine,       GetBGMLevel);
-    REG_ID0(GCloudVoiceEngine,       GetBGMFileTime);
-    REG_ID0(GCloudVoiceEngine,       GetBGMPlayTime);
-    REG_ID0(GCloudVoiceEngine,       GetRecordKaraokeTotalTime);
-    REG_ID0(GCloudVoiceEngine,       StartPreview);
-    REG_ID0(GCloudVoiceEngine,       StopPreview);
-    REG_ID0(GCloudVoiceEngine,       PauseKaraoke);
-    REG_ID0(GCloudVoiceEngine,       ResumeKaraoke);
-    REG_ID0(GCloudVoiceEngine,       RSTSStopRecording);
-    REG_ID0(GCloudVoiceEngine,       TextToStreamSpeechStop);
-    REG_ID0(GCloudVoiceEngine,       StopKaraokeRecording);
-    REG_ID0(GCloudCoreRemoteConfig,  getConfig);
-    REG_ID0(GCloudUnityPlugin,       Initialize);
-    REG_ID0(GCloudUnityPlugin,       ReportEvent);
-
-    REG_ID1(GCloudVoiceEngine,       StartRecording);
-    REG_ID1(GCloudVoiceEngine,       StopRecording);
-    REG_ID1(GCloudVoiceEngine,       StartBGMPlay);
-    REG_ID1(GCloudVoiceEngine,       StopBGMPlay);
-    REG_ID1(GCloudVoiceEngine,       PauseBGMPlay);
-    REG_ID1(GCloudVoiceEngine,       ResumeBGMPlay);
-    REG_ID1(GCloudVoiceEngine,       SetBGMPath);
-    REG_ID1(GCloudVoiceEngine,       SetLogCallBack);
-    REG_ID1(GCloudCoreRemoteConfig,  updateConfig);
-    REG_ID1(GCloudUnityPlugin,       SetGameObjectName);
-
-    REG_ID2(GCloudVoiceEngine,       QuitRoom_Scenes_timeout);
-
-    // ─── id pass-through — Firebase / Ads ───
-    REG_ID0(FIRMessagingRmqManager,  openDatabase);
-    REG_ID0(FIRMessaging,            APNSToken);
-    REG_ID0(GADAppOpenAd,            responseInfo);
-    REG_ID0(GADMobileAds,            initializationStatus);
-    REG_ID0(GADAdNetworkResponseInfo, adUnitMapping);
-    REG_ID0(FBAdViewabilityValidator, stopMonitoring);
-    REG_ID0(FBAdMonitor,             stopMonitoring);
-
-    // ─── id pass-through — APM ───
-    REG_ID0(APMDeviceInfoSupport,    getBatteryState);
-    REG_ID0(APMDeviceInfoSupport,    getThermalState);
-    REG_ID0(TApmSceneMarker,         markLevelFin);
-
-    // ─── id pass-through — Misc ───
-    REG_ID0(serviceCommunication,    getValueForKeypath);
-    REG_ID0(AudioDeviceMgr,          GetAudioDeviceConnectState);
-    REG_ID0(VKAuth,                  logout);
-    REG_ID0(SCSDKLoginClient,        logout);
-
-#undef REG_B
-#undef REG_V1
-#undef REG_ID0
-#undef REG_ID1
-#undef REG_ID2
-#undef REG_ID3
+static void SBXK_RegisterFishhook(void) {
+    struct sbxk_rb rb[] = {
+        { "AnoSDKInit", (void*)SBXK_AnoInit, (void**)&orig_AnoSDKInit },
+        { "AnoSDKSetUserInfo", (void*)SBXK_AnoUser, (void**)&orig_AnoSDKSetUserInfo },
+        { "AnoSDKGetReportData", (void*)SBXK_AnoData, (void**)&orig_AnoSDKGetData },
+        { "AnoSDKGetReportData2", (void*)SBXK_AnoData2, (void**)&orig_AnoSDKGetData2 },
+        { "AnoSDKDelReportData", (void*)SBXK_AnoDel, (void**)&orig_AnoSDKDel },
+        { "AnoSDKIoctl", (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
+        { "AnoSDKIoctlOld", (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
+        { "AnoSDKOnPause", (void*)SBXK_AnoPause, (void**)&orig_AnoSDKPause },
+        { "AnoSDKOnResume", (void*)SBXK_AnoPause, (void**)&orig_AnoSDKResume },
+        { "AnoSDKOnRecvData", (void*)SBXK_AnoRecv, (void**)&orig_AnoSDKRecvD },
+        { "AnoSDKOnRecvSignature", (void*)SBXK_AnoRecv, (void**)&orig_AnoSDKRecvS },
+        { "CheckSymbolSource", (void*)SBXK_CheckSym, (void**)&orig_CheckSym },
+        { "GAMELET_ReportSDKLog", (void*)SBXK_GL1, (void**)&orig_GL1 },
+        { "GAMELET_ReportScriptError", (void*)SBXK_GL2, (void**)&orig_GL2 },
+        { "GAMELET_ReportScriptErrorWithAppInfo", (void*)SBXK_GL3, (void**)&orig_GL3 },
+        { "GAMELET_SendMsg", (void*)SBXK_GM, (void**)&orig_GM },
+        { "__ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_", (void*)SBXK_UQMInit, (void**)&orig_UQMInit },
+        { "__ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE", (void*)SBXK_UQMUser, (void**)&orig_UQMUser },
+        { "__ZN3UQM8UQMCrash8SetAppIdERKNS_9UQMStringE", (void*)SBXK_UQMApp, (void**)&orig_UQMApp },
+        { "__ZN3UQM8UQMCrash7LogInfoEiRKNS_9UQMStringES3_", (void*)SBXK_UQMLog, (void**)&orig_UQMLog },
+        { "__ZN3UQM8UQMCrash12SetUserValueERKNS_9UQMStringES3_", (void*)SBXK_UQMSetUser, (void**)&orig_UQMSetUser },
+        { "__ZN3UQM8UQMCrash18ReportExceptionPRVEiRKNS_9UQMStringES3_S3_RKNS_9UQMVectorINS_9UQMKVPairELj16EEES3_bi", (void*)SBXK_UQMRpt, (void**)&orig_UQMRpt },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent11ReportStuckEiilPKcS3_S3_iS3_", (void*)SBXK_CSStuck, (void**)&orig_CSStuck },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ReportExceptionJsonEiPKcS3_S3_S3_iS3_", (void*)SBXK_CSErr, (void**)&orig_CSErr },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent13ReportLogInfoEPKcS3_", (void*)SBXK_CSLog, (void**)&orig_CSLog },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent20GetLastSessionUserIdEPvi", (void*)SBXK_CSLast, (void**)&orig_CSLast },
+    };
+    int t = sbxk_rebind(rb, (int)(sizeof(rb)/sizeof(rb[0])));
+    NSLog(@"[SBXK-fh] %d/%zu", t, sizeof(rb)/sizeof(rb[0]));
 }
 
 #pragma mark =========================================================
-#pragma mark 15. LOG VIEWER
+#pragma mark 12. REGISTRATION
 #pragma mark =========================================================
 
-@interface SBXK_LogViewer : NSObject
-@end
+#define REG_B(cls, name)   SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "B@:")
+#define REG_V1(cls, name)  SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "v@:@")
+#define REG_V2(cls, name)  SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "v@:@@")
+#define REG_ID0(cls, name) SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:")
+#define REG_ID1(cls, name) SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@")
+#define REG_ID2(cls, name) SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@@")
+#define REG_ID3(cls, name) SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@@@")
 
+static void SBXK_RegBase(void) {
+    REG_B(IntegrityChecker, integrity_detect) REG_B(IntegrityChecker, MTML_INTEGRITY_DETECT)
+    REG_B(JailbreakDetector, isJailbroken) REG_B(JailbreakDetector, isJailbreak)
+    REG_B(JailbreakDetector, checkJailbreak) REG_B(JailbreakDetector, jailbreakDetection)
+    REG_B(SimulatorDetector, isSimulator) REG_B(SimulatorDetector, isSimulatorDevice)
+    REG_B(SimulatorDetector, checkSimulator)
+    REG_B(SecurityChecker, IsFileSystemModified) REG_B(SecurityChecker, isDebuggerAttached)
+    REG_B(SecurityChecker, isDebugged) REG_B(SecurityChecker, checkDebugger)
+    REG_B(SecurityChecker, amIBeingDebugged) REG_B(SecurityChecker, checkDebuggerAttach)
+    REG_B(SecurityChecker, isHooked) REG_B(SecurityChecker, isHookDetected)
+    REG_B(SecurityChecker, checkHook) REG_B(SecurityChecker, detectHook) REG_B(SecurityChecker, antiHookCheck)
+    REG_B(SecurityChecker, isTampered) REG_B(SecurityChecker, checkTamper) REG_B(SecurityChecker, antiTamperCheck)
+    REG_B(SecurityChecker, isInjected) REG_B(SecurityChecker, isLibraryInjected)
+    REG_B(SecurityChecker, checkInjection) REG_B(SecurityChecker, antiInjectionCheck)
+    REG_B(SecurityChecker, isReversingDetected) REG_B(SecurityChecker, checkReversing)
+    REG_B(SecurityChecker, antiReversingCheck) REG_B(SecurityChecker, isBlocked)
+    REG_B(SecurityChecker, antiBlockingCheck) REG_B(SecurityChecker, isVPNUsed)
+    REG_B(SecurityChecker, isProxyUsed) REG_B(SecurityChecker, isFridaRunning)
+    REG_B(SecurityChecker, isSubstrateLoaded) REG_B(SecurityChecker, isCydiaInstalled)
+    REG_B(SecurityChecker, hasSuspiciousFiles) REG_B(SecurityChecker, isEnvironmentClean)
+    REG_B(SecurityChecker, verifyIntegrity) REG_B(SecurityChecker, checkTokenValid)
+    REG_B(SecurityChecker, isEnvironmentSafe) REG_B(SecurityChecker, verifySignature)
+    REG_B(AReachability, isConnectionOnDemand) REG_B(AReachability, isConnectionRequired)
+    REG_B(GVGCloudVoiceExtension, CheckDeviceMuteStat)
+    REG_V1(GADAppOpenAd, adDidDismissFullScreenContent) REG_V1(GADAppOpenAd, adWillDismissFullScreenContent)
+    REG_V1(GADAppOpenAd, adDidRecordClick) REG_V1(GADAppOpenAd, adDidRecordImpression)
+    REG_V1(GADAppOpenAd, adWillPresentFullScreenContent)
+    REG_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
+    REG_V1(GADAppOpenAd, setPaidEventHandler) REG_V1(GADAppOpenAd, adDidRecordUserInteraction)
+    REG_V1(NetworkManager, SendSecurityReport)
+    REG_ID0(GSDKCPU, getSystemCPUCircle) REG_ID0(GSDKMemory, getSystemAvailableMemory)
+    REG_ID0(GSDKInGameManager, GSDKRealTimeDetect) REG_ID0(GSDKInGameSystem, GSDKInnerEnd)
+    REG_ID0(GSDKInGameSystem, GSDKInnerRealTimeDetect) REG_ID0(GSDKPing, ping) REG_ID0(GSDKPing, stopPing)
+    REG_ID0(GSDKPingDetect, ping) REG_ID0(PingDelegate, pingTimer) REG_ID0(SimplePing, start)
+    REG_ID0(SimplePing, startWithHostAddress) REG_ID0(SimplePing, readData)
+    REG_ID0(GSDKRealTimeDetect, pingDelayDetect) REG_ID0(GSDKRealTimeDetect, updDelayDetect_Port)
+    REG_ID0(GSDKUdpDetect, isUDPConnect_Port) REG_ID0(GSDKWIFI, ping)
+    REG_ID0(GSDKDetectPort, isConnection_Port) REG_ID0(GSDKInitManager, detectOperation)
+    REG_ID0(GSDKPayEvent, GSDKPay_Tag_Status_Msg)
+    REG_ID0(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env)
+    REG_ID1(SimplePing, sendPingWithData) REG_ID1(SimplePing, didFailWithError)
+    REG_ID1(FBAdViewabilityValidator, checkViewability)
+    REG_ID1(TApmSceneMarker, postStepEvent) REG_ID1(TApmSceneMarker, postStreamEvent)
+    REG_ID1(APMCollector, collectMetrics) REG_ID1(APMCollector, reportNow)
+    REG_ID1(AudioDeviceMgr, UpdateDeviceState)
+    REG_ID2(SimplePing, validatePingResponsePacket_sequenceNumber)
+    REG_ID2(FIRMessaging, retrieveFCMTokenForSenderID_completion)
+    REG_ID2(FIRMessaging, deleteFCMTokenForSenderID_completion)
+    REG_ID2(FIRMessaging, subscribeToTopic_completion)
+    REG_ID2(FIRMessaging, unsubscribeFromTopic_completion)
+    REG_ID2(FIRMessaging, setAPNSToken_withUserInfo)
+    REG_ID2(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots)
+    REG_ID3(SimplePing, pingPacketWithType_payload_requiresChecksum)
+    REG_ID3(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP)
+    REG_ID0(GVGCloudVoice, openMic) REG_ID0(GVGCloudVoice, openSpeaker)
+    REG_ID0(GVGCloudVoiceExtension, GetBGMPlayState) REG_ID0(GVGCloudVoiceExtension, GetMicState)
+    REG_ID0(GVGCloudVoiceExtension, GetSpeakerState) REG_ID0(GVoiceMuteSwitch, detectMuteSwitch)
+    REG_ID0(GCloudVoiceEngine, StartTve) REG_ID0(GCloudVoiceEngine, TestMic)
+    REG_ID0(GCloudVoiceEngine, GetMicLevel) REG_ID0(GCloudVoiceEngine, GetSpeakerLevel)
+    REG_ID0(GCloudVoiceEngine, GetBGMLevel) REG_ID0(GCloudVoiceEngine, GetBGMFileTime)
+    REG_ID0(GCloudVoiceEngine, GetBGMPlayTime) REG_ID0(GCloudVoiceEngine, GetRecordKaraokeTotalTime)
+    REG_ID0(GCloudVoiceEngine, StartPreview) REG_ID0(GCloudVoiceEngine, StopPreview)
+    REG_ID0(GCloudVoiceEngine, PauseKaraoke) REG_ID0(GCloudVoiceEngine, ResumeKaraoke)
+    REG_ID0(GCloudVoiceEngine, RSTSStopRecording) REG_ID0(GCloudVoiceEngine, TextToStreamSpeechStop)
+    REG_ID0(GCloudVoiceEngine, StopKaraokeRecording) REG_ID0(GCloudCoreRemoteConfig, getConfig)
+    REG_ID0(GCloudUnityPlugin, Initialize) REG_ID0(GCloudUnityPlugin, ReportEvent)
+    REG_ID1(GCloudVoiceEngine, StartRecording) REG_ID1(GCloudVoiceEngine, StopRecording)
+    REG_ID1(GCloudVoiceEngine, StartBGMPlay) REG_ID1(GCloudVoiceEngine, StopBGMPlay)
+    REG_ID1(GCloudVoiceEngine, PauseBGMPlay) REG_ID1(GCloudVoiceEngine, ResumeBGMPlay)
+    REG_ID1(GCloudVoiceEngine, SetBGMPath) REG_ID1(GCloudVoiceEngine, SetLogCallBack)
+    REG_ID1(GCloudCoreRemoteConfig, updateConfig) REG_ID1(GCloudUnityPlugin, SetGameObjectName)
+    REG_ID2(GCloudVoiceEngine, QuitRoom_Scenes_timeout)
+    REG_ID0(FIRMessagingRmqManager, openDatabase) REG_ID0(FIRMessaging, APNSToken)
+    REG_ID0(GADAppOpenAd, responseInfo) REG_ID0(GADMobileAds, initializationStatus)
+    REG_ID0(GADAdNetworkResponseInfo, adUnitMapping)
+    REG_ID0(FBAdViewabilityValidator, stopMonitoring) REG_ID0(FBAdMonitor, stopMonitoring)
+    REG_ID0(APMDeviceInfoSupport, getBatteryState) REG_ID0(APMDeviceInfoSupport, getThermalState)
+    REG_ID0(TApmSceneMarker, markLevelFin) REG_ID0(serviceCommunication, getValueForKeypath)
+    REG_ID0(AudioDeviceMgr, GetAudioDeviceConnectState) REG_ID0(VKAuth, logout)
+    REG_ID0(SCSDKLoginClient, logout)
+}
+
+static void SBXK_RegExtended(void) {
+    REG_B(AntiDataProxy, checkIntegrity) REG_B(AntiDataProxy, isIntegrityOK) REG_B(AntiDataProxy, verifyData)
+    REG_B(AntiDataProxy, isDataValid) REG_B(AntiDataProxy, isModified) REG_B(AntiDataProxy, isCheat)
+    REG_B(AntiDataProxy, isSuspicious) REG_B(AntiDataProxy, antiCheatCheck) REG_B(AntiDataProxy, securityCheck)
+    REG_B(AntiDataProxy, hasRisk) REG_B(AntiDataProxy, detectRisk) REG_B(AntiDataProxy, isRiskDetected)
+    REG_B(AntiDataProxy, isValid) REG_B(AntiDataProxy, isSafe) REG_B(AntiDataProxy, isClean)
+    REG_B(AntiDataProxy, verifyIntegrity) REG_B(AntiDataProxy, verifySignature)
+    REG_B(AntiDataProxy, shouldPass) REG_B(AntiDataProxy, allowReport)
+    REG_V1(AntiDataProxy, sendData) REG_V1(AntiDataProxy, report) REG_V1(AntiDataProxy, submit)
+    REG_V1(AntiDataProxy, upload) REG_V1(AntiDataProxy, dispatch) REG_V1(AntiDataProxy, flush)
+    REG_ID0(AntiDataProxy, getData) REG_ID0(AntiDataProxy, getPayload) REG_ID0(AntiDataProxy, getHeader)
+    REG_ID0(AntiDataProxy, getBody) REG_ID0(AntiDataProxy, getResponse) REG_ID0(AntiDataProxy, getConfig)
+    REG_ID0(AntiDataProxy, getState) REG_ID0(AntiDataProxy, getStatus)
+    REG_ID1(AntiDataProxy, setData) REG_ID1(AntiDataProxy, setPayload) REG_ID1(AntiDataProxy, setConfig)
+    REG_ID1(AntiDataProxy, process) REG_ID1(AntiDataProxy, handle) REG_ID1(AntiDataProxy, onReceive)
+    REG_ID1(AntiDataProxy, onMessage)
+    REG_ID2(AntiDataProxy, sendData_withHeader) REG_ID2(AntiDataProxy, sendReport_withType)
+    REG_ID2(AntiDataProxy, postData_withURL)
+    REG_B(TssInfoReceiver, isRooted) REG_B(TssInfoReceiver, isRootedDevice) REG_B(TssInfoReceiver, isJailbroken)
+    REG_B(TssInfoReceiver, isJailbreakDevice) REG_B(TssInfoReceiver, isEmulator) REG_B(TssInfoReceiver, isEmulatorDevice)
+    REG_B(TssInfoReceiver, isSimulator) REG_B(TssInfoReceiver, isDebuggerAttached) REG_B(TssInfoReceiver, isDebugged)
+    REG_B(TssInfoReceiver, isModified) REG_B(TssInfoReceiver, isTampered) REG_B(TssInfoReceiver, isInjected)
+    REG_B(TssInfoReceiver, isHooked) REG_B(TssInfoReceiver, hasCheat) REG_B(TssInfoReceiver, hasCheatTool)
+    REG_B(TssInfoReceiver, hasSuspiciousFiles) REG_B(TssInfoReceiver, hasRisk) REG_B(TssInfoReceiver, checkEnvironment)
+    REG_B(TssInfoReceiver, checkSecurity) REG_B(TssInfoReceiver, checkCheat) REG_B(TssInfoReceiver, detectCheat)
+    REG_B(TssInfoReceiver, detectRisk) REG_B(TssInfoReceiver, detectEnvironment) REG_B(TssInfoReceiver, isCheating)
+    REG_B(TssInfoReceiver, isCheatDetected) REG_B(TssInfoReceiver, isSuspicious) REG_B(TssInfoReceiver, antiCheatCheck)
+    REG_B(TssInfoReceiver, securityCheck) REG_B(TssInfoReceiver, shouldReport) REG_B(TssInfoReceiver, shouldBlock)
+    REG_B(TssInfoReceiver, needReport) REG_B(TssInfoReceiver, needBlock) REG_B(TssInfoReceiver, isBlocked)
+    REG_B(TssInfoReceiver, isBanned) REG_B(TssInfoReceiver, isSafe) REG_B(TssInfoReceiver, isClean)
+    REG_B(TssInfoReceiver, isEnvironmentClean) REG_B(TssInfoReceiver, isEnvironmentSafe)
+    REG_B(TssInfoReceiver, verifyIntegrity) REG_B(TssInfoReceiver, verifySignature)
+    REG_B(TssInfoReceiver, checkTokenValid)
+    REG_V1(TssInfoReceiver, start) REG_V1(TssInfoReceiver, stop) REG_V1(TssInfoReceiver, run)
+    REG_V1(TssInfoReceiver, onReceiveData) REG_V1(TssInfoReceiver, onRecvData) REG_V1(TssInfoReceiver, report)
+    REG_V1(TssInfoReceiver, sendReport) REG_V1(TssInfoReceiver, uploadReport) REG_V1(TssInfoReceiver, submitReport)
+    REG_V1(TssInfoReceiver, reportRoot) REG_V1(TssInfoReceiver, reportEmu) REG_V1(TssInfoReceiver, reportDebugger)
+    REG_V1(TssInfoReceiver, reportCheat) REG_V1(TssInfoReceiver, reportAlert) REG_V1(TssInfoReceiver, sendAlert)
+    REG_V1(TssInfoReceiver, blockGame) REG_V1(TssInfoReceiver, blockPlayer) REG_V1(TssInfoReceiver, kickPlayer)
+    REG_ID0(TssInfoReceiver, currentState) REG_ID0(TssInfoReceiver, getState) REG_ID0(TssInfoReceiver, getStatus)
+    REG_ID0(TssInfoReceiver, getReport) REG_ID0(TssInfoReceiver, getResult) REG_ID0(TssInfoReceiver, getData)
+    REG_ID0(TssInfoReceiver, getInfo) REG_ID0(TssInfoReceiver, getRiskInfo) REG_ID0(TssInfoReceiver, getCheatInfo)
+    REG_ID0(TssInfoReceiver, getEnvInfo) REG_ID0(TssInfoReceiver, getConfig)
+    REG_ID1(TssInfoReceiver, updateState) REG_ID1(TssInfoReceiver, setState) REG_ID1(TssInfoReceiver, handleData)
+    REG_ID1(TssInfoReceiver, handleMessage) REG_ID1(TssInfoReceiver, processData) REG_ID1(TssInfoReceiver, onMessage)
+    REG_ID1(TssInfoReceiver, onCommand)
+    REG_B(CheckSymbolSource, CheckSymbol) REG_B(CheckSymbolSource, checkSymbol) REG_B(CheckSymbolSource, checkSymbolSource)
+    REG_B(CheckSymbolSource, isSymbolValid) REG_B(CheckSymbolSource, isSymbolOK) REG_B(CheckSymbolSource, verifySymbol)
+    REG_B(CheckSymbolSource, verifySymbols) REG_B(CheckSymbolSource, isSourceSafe) REG_B(CheckSymbolSource, checkSource)
+    REG_B(CheckSymbolSource, isSourceOK) REG_B(CheckSymbolSource, sourceIsValid)
+    REG_ID0(CheckSymbolSource, getResult) REG_ID0(CheckSymbolSource, getReport)
+    REG_ID1(CheckSymbolSource, checkSymbolSourceWithData) REG_ID1(CheckSymbolSource, verifySymbolWithData)
+    REG_B(CFastScanThread, isRunning) REG_B(CFastScanThread, shouldScan) REG_B(CFastScanThread, hasResult)
+    REG_B(CScanThread, isRunning) REG_B(CScanThread, shouldScan) REG_B(CScanThread, hasResult)
+    REG_B(CSendThread, isRunning) REG_B(CSendThread, shouldSend) REG_B(CSendThread, hasData)
+    REG_B(CMrpcsMonitor, isRunning) REG_B(CMrpcsMonitor, shouldReport)
+    REG_B(CMrpcsMgrE, isReady) REG_B(CMrpcsMgrE, shouldReport)
+    REG_B(CPointDataMgr, shouldReport) REG_B(CPointDataMgr, hasData)
+    REG_B(CPointGlobalMgr, shouldReport) REG_B(CPointGlobalMgr, hasData)
+    REG_B(CMrpcsLFUpdater, shouldUpdate) REG_B(CMrpcsLFUpdater, hasUpdate)
+    REG_V1(CFastScanThread, start) REG_V1(CFastScanThread, run) REG_V1(CFastScanThread, execute)
+    REG_V1(CFastScanThread, scan) REG_V1(CFastScanThread, doScan) REG_V1(CFastScanThread, report)
+    REG_V1(CFastScanThread, sendReport)
+    REG_V1(CScanThread, start) REG_V1(CScanThread, run) REG_V1(CScanThread, execute)
+    REG_V1(CScanThread, scan) REG_V1(CScanThread, doScan) REG_V1(CScanThread, report) REG_V1(CScanThread, sendReport)
+    REG_V1(CSendThread, start) REG_V1(CSendThread, run) REG_V1(CSendThread, execute)
+    REG_V1(CSendThread, send) REG_V1(CSendThread, doSend) REG_V1(CSendThread, report)
+    REG_V1(CMrpcsMonitor, start) REG_V1(CMrpcsMonitor, stop) REG_V1(CMrpcsMonitor, run)
+    REG_V1(CMrpcsMonitor, execute) REG_V1(CMrpcsMonitor, report) REG_V1(CMrpcsMonitor, sendReport)
+    REG_V1(CMrpcsMgrE, sendScanResult) REG_V1(CMrpcsMgrE, reportResult) REG_V1(CMrpcsMgrE, sendReport)
+    REG_V1(CMrpcsMgrE, report) REG_V1(CMrpcsMgrE, upload)
+    REG_V1(CPointDataMgr, report) REG_V1(CPointDataMgr, sendData) REG_V1(CPointDataMgr, uploadData)
+    REG_V1(CPointDataMgr, dispatch)
+    REG_V1(CPointGlobalMgr, report) REG_V1(CPointGlobalMgr, sendReport) REG_V1(CPointGlobalMgr, upload)
+    REG_V1(CMrpcsLFUpdater, update) REG_V1(CMrpcsLFUpdater, start) REG_V1(CMrpcsLFUpdater, run)
+    REG_V1(CMrpcsLFUpdater, check) REG_V1(CMrpcsLFUpdater, report)
+    REG_ID0(CMrpcsMgrE, getInstance) REG_ID0(CMrpcsMgrE, getState) REG_ID0(CMrpcsMgrE, getReport)
+    REG_ID0(CMrpcsMgrE, getResult) REG_ID0(CMrpcsMgrE, getConfig)
+    REG_ID0(CMrpcsMonitor, getState) REG_ID0(CMrpcsMonitor, getReport) REG_ID0(CMrpcsMonitor, getResult)
+    REG_ID0(CPointDataMgr, getData) REG_ID0(CPointDataMgr, getReport) REG_ID0(CPointDataMgr, getState)
+    REG_ID0(CPointGlobalMgr, getData) REG_ID0(CPointGlobalMgr, getReport) REG_ID0(CPointGlobalMgr, getState)
+    REG_ID0(CMrpcsLFUpdater, getState) REG_ID0(CMrpcsLFUpdater, getConfig) REG_ID0(CMrpcsLFUpdater, getVersion)
+    REG_ID1(CMrpcsMgrE, setConfig) REG_ID1(CMrpcsMgrE, setState) REG_ID1(CMrpcsMgrE, handleData)
+    REG_ID1(CMrpcsMgrE, processData) REG_ID1(CMrpcsMonitor, setConfig) REG_ID1(CMrpcsMonitor, handleData)
+    REG_ID1(CPointDataMgr, setData) REG_ID1(CPointDataMgr, handleData)
+    REG_ID1(CPointGlobalMgr, setData) REG_ID1(CPointGlobalMgr, handleData)
+    REG_ID2(CMrpcsMgrE, sendData_withType) REG_ID2(CMrpcsMgrE, handleMessage_withData)
+    REG_ID2(CPointDataMgr, sendData_withType) REG_ID2(CPointGlobalMgr, sendData_withType)
+    REG_V1(NetworkManager, sendRootAlert) REG_V1(NetworkManager, sendEmuAlert)
+    REG_V1(NetworkManager, sendDebuggerAlert) REG_V1(NetworkManager, sendCheatAlert)
+    REG_V1(NetworkManager, send9010Alert) REG_V1(NetworkManager, send9014Alert)
+    REG_V1(NetworkManager, send9005Alert) REG_V1(NetworkManager, sendShellReport) REG_V1(NetworkManager, sendCheckState)
+    REG_ID0(ScreenShot, takeScreenShot) REG_ID0(ScreenShot, screenshot)
+    REG_ID1(ScreenShot, takeScreenShotEx) REG_ID1(ScreenShot, screenshotOfView)
+    REG_ID1(ScreenShot, getBufFromImage) REG_ID1(ScreenShot, getAppWindowsForScreen)
+    REG_ID0(Rotate, fixOrientation) REG_ID0(Rotate, flipVertical) REG_ID0(Rotate, flipHorizontal)
+    REG_ID1(Rotate, rotate) REG_ID1(Rotate, imageRotatedByRadians) REG_ID1(Rotate, imageRotatedByDegrees)
+    REG_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn)
+    REG_V1(AceMsgBoxImp, dismiss) REG_V1(AceMsgBoxImp, show)
+    REG_ID0(AceMsgBoxImp, viewTitle) REG_ID0(AceMsgBoxImp, viewContent)
+    REG_ID0(AceMsgBoxImp, leftBtnContent) REG_ID0(AceMsgBoxImp, rightBtnContent)
+}
+
+static void SBXK_RegInjectionKill(void) {
+    REG_B(SBXK_FridaDet, isFridaPresent) REG_B(SBXK_FridaDet, isFridaRunning) REG_B(SBXK_FridaDet, hasFrida)
+    REG_B(SBXK_FridaDet, checkFrida) REG_B(SBXK_FridaDet, detectFrida) REG_B(SBXK_FridaDet, isFridaGadgetLoaded)
+    REG_B(SBXK_FridaDet, hasFridaGadget) REG_B(SBXK_FridaDet, isFridaAgentLoaded) REG_B(SBXK_FridaDet, hasNamedPipe)
+    REG_B(SBXK_FridaDet, checkNamedPipe) REG_B(SBXK_FridaDet, isPipeOpen)
+    REG_B(SBXK_SubDet, isSubstrateLoaded) REG_B(SBXK_SubDet, hasSubstrate) REG_B(SBXK_SubDet, checkSubstrate)
+    REG_B(SBXK_SubDet, isCydiaSubstrateLoaded) REG_B(SBXK_SubDet, isSubstituteLoaded)
+    REG_B(SBXK_SubDet, hasSubstitute) REG_B(SBXK_SubDet, checkSubstitute)
+    REG_B(SBXK_InjectDet, isElleKitLoaded) REG_B(SBXK_InjectDet, hasElleKit) REG_B(SBXK_InjectDet, isLibhookerLoaded)
+    REG_B(SBXK_InjectDet, hasLibhooker) REG_B(SBXK_InjectDet, isTweakInjectLoaded) REG_B(SBXK_InjectDet, hasTweakInject)
+    REG_B(SBXK_InjectDet, checkTweaks) REG_B(SBXK_InjectDet, hasJailbreakTweak) REG_B(SBXK_InjectDet, isDylibInjected)
+    REG_B(SBXK_InjectDet, isImageInjected) REG_B(SBXK_InjectDet, hasInjectedDylib) REG_B(SBXK_InjectDet, isForeignImageLoaded)
+    REG_B(SBXK_InjectDet, hasHooked) REG_B(SBXK_InjectDet, hasMSHook) REG_B(SBXK_InjectDet, checkMSHook)
+    REG_B(SBXK_InjectDet, checkSymbolHook) REG_B(SBXK_InjectDet, hasSwizzled) REG_B(SBXK_InjectDet, hasDYLD_INSERT)
+    REG_B(SBXK_InjectDet, isDYLDInjected) REG_B(SBXK_InjectDet, checkDYLD) REG_B(SBXK_InjectDet, isEnvInjected)
+    REG_B(SBXK_InjectDet, hasEnvVarInject) REG_B(SBXK_InjectDet, isAttached) REG_B(SBXK_InjectDet, isBeingDebugged)
+    REG_B(SBXK_InjectDet, isTraced) REG_B(SBXK_InjectDet, hasPtraced) REG_B(SBXK_InjectDet, checkPtrace)
+    REG_B(SBXK_InjectDet, isPtraceDetected) REG_B(SBXK_InjectDet, hasForeignExceptionPort)
+    REG_B(SBXK_InjectDet, hasExceptionHijack) REG_B(SBXK_InjectDet, checkExceptionPorts)
+    REG_B(SBXK_InjectDet, isPortHijacked)
+    REG_B(SBXK_InjectDet, isEnvironmentClean) REG_B(SBXK_InjectDet, isEnvironmentSafe)
+    REG_B(SBXK_InjectDet, isClean) REG_B(SBXK_InjectDet, isSafe)
+    REG_B(SBXK_InjectDet, verifyNoInjection) REG_B(SBXK_InjectDet, verifyNoHook)
+    REG_B(SBXK_InjectDet, verifyNoDylib) REG_B(SBXK_InjectDet, verifyImageClean)
+    REG_V1(SBXK_InjectDet, reportFrida) REG_V1(SBXK_InjectDet, reportSubstrate) REG_V1(SBXK_InjectDet, reportSubstitute)
+    REG_V1(SBXK_InjectDet, reportElleKit) REG_V1(SBXK_InjectDet, reportLibhooker) REG_V1(SBXK_InjectDet, reportInjection)
+    REG_V1(SBXK_InjectDet, reportHook) REG_V1(SBXK_InjectDet, reportDylib) REG_V1(SBXK_InjectDet, reportAttach)
+    REG_V1(SBXK_InjectDet, reportPtrace) REG_V1(SBXK_InjectDet, reportExceptionPort) REG_V1(SBXK_InjectDet, reportNamedPipe)
+    REG_V1(SBXK_InjectDet, reportEnvInject) REG_V1(SBXK_InjectDet, sendAlert) REG_V1(SBXK_InjectDet, sendReport)
+    REG_V1(SBXK_InjectDet, uploadReport) REG_V1(SBXK_InjectDet, submitReport) REG_V1(SBXK_InjectDet, notifyServer)
+    REG_V1(SBXK_InjectDet, alertUser) REG_V1(SBXK_InjectDet, blockGame) REG_V1(SBXK_InjectDet, kickPlayer)
+}
+
+static void SBXK_RegReal(void) {
+    REG_B(QAPMReport, isEnabled) REG_B(QAPMReport, isRunning) REG_B(QAPMReport, shouldReport) REG_B(QAPMReport, hasReport)
+    REG_V1(QAPMReport, report) REG_V1(QAPMReport, sendReport) REG_V1(QAPMReport, upload) REG_V1(QAPMReport, submit)
+    REG_V1(QAPMReport, flush) REG_V1(QAPMReport, start) REG_V1(QAPMReport, stop) REG_V1(QAPMReport, setEnabled)
+    REG_V1(QAPMReport, setUserId) REG_V1(QAPMReport, setUserValue) REG_V1(QAPMReport, trackEvent)
+    REG_V1(QAPMReport, reportException) REG_V1(QAPMReport, reportCrash) REG_V1(QAPMReport, reportPerformance)
+    REG_V1(QAPMReport, reportNetwork) REG_V1(QAPMReport, reportBattery)
+    REG_ID0(QAPMReport, getState) REG_ID0(QAPMReport, getConfig) REG_ID0(QAPMReport, getReport)
+    REG_ID0(QAPMReport, getDeviceId) REG_ID0(QAPMReport, getSessionId)
+    REG_ID1(QAPMReport, updateConfig) REG_ID1(QAPMReport, setConfig) REG_ID1(QAPMReport, handleData)
+    REG_B(MeemoUserManager, isGuest) REG_B(MeemoUserManager, isBanned) REG_B(MeemoUserManager, isBlocked)
+    REG_B(MeemoUserManager, isUnderage)
+    REG_ID0(MeemoUserManager, currentUser) REG_ID0(MeemoUserManager, currentToken)
+    REG_ID0(MeemoUserManager, currentOpenId) REG_ID0(MeemoUserManager, currentAccountId)
+    REG_ID0(MeemoUserManager, currentSession) REG_ID0(MeemoUserManager, userInfo)
+    REG_ID0(MeemoUserManager, getInstance)
+    REG_ID1(MeemoUserManager, setUser) REG_ID1(MeemoUserManager, setToken) REG_ID1(MeemoUserManager, updateUserInfo)
+    REG_V1(MeemoLogUtil, log) REG_V1(MeemoLogUtil, logInfo) REG_V1(MeemoLogUtil, logDebug)
+    REG_V1(MeemoLogUtil, logWarn) REG_V1(MeemoLogUtil, logError) REG_V1(MeemoLogUtil, logEvent)
+    REG_V1(MeemoLogUtil, sendLog) REG_V1(MeemoLogUtil, uploadLog) REG_V1(MeemoLogUtil, flush) REG_V1(MeemoLogUtil, report)
+    REG_ID0(MeemoUtils, getInstance) REG_ID0(MeemoUtils, getDeviceId) REG_ID0(MeemoUtils, getChannel)
+    REG_ID0(MeemoUtils, getVersion) REG_ID0(MeemoUtils, getCountryCode) REG_ID0(MeemoUtils, getLanguage)
+    REG_ID0(MeemoUtils, getPlatform) REG_ID0(MeemoUtils, getUUID)
+    REG_B(PBConfigManager, isModified) REG_B(PBConfigManager, isTampered)
+    REG_ID0(PBConfigManager, getConfig) REG_ID0(PBConfigManager, getInstance) REG_ID0(PBConfigManager, currentConfig)
+    REG_ID1(PBConfigManager, updateConfig) REG_ID1(PBConfigManager, setConfig)
+    REG_ID0(CdnConfigManager, getConfig) REG_ID0(CdnConfigManager, getInstance)
+    REG_ID0(CdnConfigManager, currentConfig) REG_ID1(CdnConfigManager, updateConfig)
+    REG_ID0(MeemoBundleUtils, getInstance) REG_ID0(MeemoBundleUtils, bundlePath) REG_ID0(MeemoBundleUtils, mainBundle)
+    REG_ID0(MeemoSubPackageDownloadMgr, getInstance) REG_ID0(MeemoSubPackageDownloadMgr, state)
+    REG_ID0(MeemoSubPackageInfoProvider, getInstance) REG_ID0(MeemoSubPackageInfoProvider, currentInfo)
+    REG_ID0(MeemoSubPackageUtils, getInstance)
+    REG_ID0(MeemoCoreInitalizer, getInstance) REG_ID0(MeemoCoreInitalizer, state)
+    REG_V1(MeemoCoreInitalizer, initialize) REG_V1(MeemoCoreInitalizer, start)
+    REG_ID0(MeemoFlutterViewController, getInstance)
+    REG_B(HotfixPatchDownloadManager, isModified) REG_B(HotfixPatchDownloadManager, hasIllegalPatch)
+    REG_B(HotfixPatchDownloadManager, isTampered)
+    REG_ID0(HotfixPatchDownloadManager, getInstance) REG_ID0(HotfixPatchDownloadManager, state)
+    REG_ID0(HotfixPatchDownloadManager, currentPatch)
+    REG_ID1(HotfixPatchDownloadManager, checkPatch) REG_ID1(HotfixPatchDownloadManager, applyPatch)
+    REG_ID0(DeviceInfoPlugin, getInstance) REG_ID0(DeviceInfoPlugin, deviceInfo) REG_ID0(DeviceInfoPlugin, model)
+    REG_ID0(DeviceInfoPlugin, systemVersion) REG_ID0(DeviceInfoPlugin, identifierForVendor)
+    REG_B(FlutterFlogPlugin, isEnabled) REG_V1(FlutterFlogPlugin, log) REG_V1(FlutterFlogPlugin, report)
+    REG_B(FlutterQAPMPlugin, isEnabled) REG_V1(FlutterQAPMPlugin, report) REG_V1(FlutterQAPMPlugin, trackEvent)
+}
+
+#pragma mark =========================================================
+#pragma mark 13. LOG VIEWER
+#pragma mark =========================================================
+
+@interface SBXK_LogViewer : NSObject @end
 @implementation SBXK_LogViewer
-
 + (void)installObserver {
-    [[NSNotificationCenter defaultCenter]
-        addObserver:self
-           selector:@selector(onLaunched:)
-               name:UIApplicationDidFinishLaunchingNotification
-             object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onLaunched:)
+        name:UIApplicationDidFinishLaunchingNotification object:nil];
 }
-
-+ (void)onLaunched:(NSNotification *)note {
-    (void)note;
++ (void)onLaunched:(NSNotification *)n {
+    (void)n;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [self show]; });
 }
-
 + (void)show {
-    NSString *path = [NSHomeDirectory()
-                      stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
-    NSData *d = [NSData dataWithContentsOfFile:path];
-    if (!d || d.length == 0) return;
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (!d.length) return;
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    if (!s || s.length == 0) return;
+    if (!s.length) return;
     if (s.length > 2500) s = [[s substringToIndex:2500] stringByAppendingString:@"…"];
-
     UIWindow *w = nil;
     if (@available(iOS 13.0, *)) {
         for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
             if (sc.activationState == UISceneActivationStateForegroundActive &&
                 [sc isKindOfClass:[UIWindowScene class]]) {
-                for (UIWindow *win in ((UIWindowScene *)sc).windows) {
-                    if (win.isKeyWindow) { w = win; break; }
-                }
+                for (UIWindow *win in ((UIWindowScene *)sc).windows) if (win.isKeyWindow) { w = win; break; }
                 if (w) break;
             }
         }
@@ -1294,23 +1139,16 @@ static void SBXK_RegisterAll(void) {
         w = [UIApplication sharedApplication].keyWindow;
 #pragma clang diagnostic pop
     }
-    if (!w || !w.rootViewController) return;
-    if (w.rootViewController.presentedViewController) return;
-
-    UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"SBXK — previous crash"
-                         message:s
-                  preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK"
-                                          style:UIAlertActionStyleDefault
-                                        handler:nil]];
+    if (!w || !w.rootViewController || w.rootViewController.presentedViewController) return;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"SBXK" message:s
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
     [w.rootViewController presentViewController:a animated:YES completion:nil];
 }
-
 @end
 
 #pragma mark =========================================================
-#pragma mark 16. RETRY + ENTRY
+#pragma mark 14. ENTRY
 #pragma mark =========================================================
 
 static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
@@ -1318,52 +1156,56 @@ static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
     atomic_store(&g_pending, true);
 }
 
-static void SBXK_RetryPass(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ SBXK_RetryPass(); });
-        return;
-    }
-    SBXK_RegisterAll();
-    SBXK_RegisterExtended();
+static void SBXK_FullInstall(void) {
+    SBXK_RegBase();
+    SBXK_RegExtended();
+    SBXK_RegInjectionKill();
+    SBXK_RegReal();
+    SBXK_RegisterFishhook();
 }
 
-static void SBXK_RunInstall(void) {
+static void SBXK_Retry(void) {
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ SBXK_Retry(); });
+        return;
+    }
+    SBXK_FullInstall();
+}
+
+static void SBXK_Run(void) {
     atomic_store(&g_phase, 20);
-    SBXK_RegisterAll();
-    SBXK_RegisterExtended();
+    SBXK_FullInstall();
     atomic_store(&g_phase, 30);
-    NSLog(@"[SBXK] v7.7 install: done=%lu skip=%lu",
-          (unsigned long)g_done.count, (unsigned long)g_skip.count);
+    if (!sbxk_self_ok()) {
+        NSLog(@"[SBXK] self-check fail — rollback");
+        sbxk_disable_all();
+        return;
+    }
+    NSLog(@"[SBXK] v7.10 done=%lu skip=%lu", (unsigned long)g_done.count, (unsigned long)g_skip.count);
 }
 
 __attribute__((constructor))
-static void SBXK_Bootstrap(void) {
+static void SBXK_Boot(void) {
     @autoreleasepool {
         g_orig = [NSMutableDictionary dictionary];
         g_done = [NSMutableSet set];
         g_skip = [NSMutableSet set];
-
         SBXK_InitPaths();
         SBXK_InstallCrashHandlers();
         atomic_store(&g_phase, 1);
-
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
-
-        NSLog(@"[SBXK] v7.7 boot");
-
+        SBXK_ANTIDEBUG();
+        NSLog(@"[SBXK] v7.10 boot");
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
-
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool {
-                SBXK_RunInstall();
+                SBXK_Run();
                 [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES block:^(NSTimer *t) {
                     (void)t;
-                    if (atomic_exchange(&g_pending, false)) {
-                        SBXK_RetryPass();
-                    }
+                    if (atomic_exchange(&g_pending, false)) SBXK_Retry();
                 }];
             }
         });
