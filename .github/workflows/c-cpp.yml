@@ -17,12 +17,10 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
-      - name: List repo files
-        run: |
-          echo "=== Repo files ==="
-          ls -la
+      - name: List repo
+        run: ls -la
 
-      - name: Fetch OpenSSL 3.x xcframework for iOS
+      - name: Download OpenSSL xcframework
         run: |
           set -Eeuo pipefail
           mkdir -p deps
@@ -31,30 +29,85 @@ jobs:
             https://github.com/krzyzanowskim/OpenSSL/releases/download/3.3.2000/OpenSSL.xcframework.zip
           unzip -q openssl.zip
           rm -f openssl.zip
-          echo "=== XCFramework structure ==="
-          find OpenSSL.xcframework -maxdepth 2 -type d
+          echo "=== Full tree (depth 4) ==="
+          find OpenSSL.xcframework -maxdepth 4 | head -100
 
-      - name: Set OpenSSL env
+      - name: Auto-detect OpenSSL paths
         run: |
           set -Eeuo pipefail
-          R="$PWD/deps/OpenSSL.xcframework"
-          if [ -d "$R/ios-arm64" ]; then
-            D="$R/ios-arm64"
-          elif [ -d "$R/ios-arm64_armv7" ]; then
-            D="$R/ios-arm64_armv7"
-          elif [ -d "$R/ios-arm64-arm64e" ]; then
-            D="$R/ios-arm64-arm64e"
-          else
-            echo "cannot find ios-arm64 in $R"
-            find "$R" -maxdepth 2 -type d
+          ROOT="$PWD/deps/OpenSSL.xcframework"
+          
+          # ابحث عن evp.h داخل الـxcframework — الجهاز الحقيقي فقط
+          EVP_DEV=$(find "$ROOT" -path '*ios-arm64*/openssl/evp.h' ! -path '*simulator*' | head -1)
+          
+          if [ -z "$EVP_DEV" ]; then
+            echo "=== evp.h not found in ios-arm64*, trying any ==="
+            EVP_DEV=$(find "$ROOT" -name 'evp.h' -path '*openssl*' | head -3)
+            echo "$EVP_DEV"
+          fi
+          
+          if [ -z "$EVP_DEV" ]; then
+            echo "FATAL: cannot find openssl/evp.h anywhere"
+            find "$ROOT" -name '*.h' | head -20
             exit 1
           fi
-          echo "OSSL_INC=$D/Headers" >> $GITHUB_ENV
-          echo "OSSL_LIB=$D" >> $GITHUB_ENV
-          echo "=== IOS slice ==="
-          ls -la "$D"
-          echo "=== Headers ==="
-          ls -la "$D/Headers" 2>/dev/null || ls -la "$D/include" 2>/dev/null || true
+          
+          echo "Found evp.h at: $EVP_DEV"
+          
+          # استخرج مجلد include (المجلد اللي فيه openssl/)
+          INC_DIR=$(echo "$EVP_DEV" | sed 's|/openssl/evp.h||')
+          echo "Include dir: $INC_DIR"
+          
+          # استخرج lib dir — من مسار evp.h صعود للجذر
+          # عادة: <slice>/<headers>/openssl/evp.h و <slice>/lib*.a
+          SLICE_DIR=$(echo "$EVP_DEV" | sed 's|/Headers/openssl/evp.h||')
+          if [ "$SLICE_DIR" = "$EVP_DEV" ]; then
+            SLICE_DIR=$(echo "$EVP_DEV" | sed 's|/include/openssl/evp.h||')
+          fi
+          if [ "$SLICE_DIR" = "$EVP_DEV" ]; then
+            SLICE_DIR=$(echo "$EVP_DEV" | sed 's|/openssl/evp.h||')
+            SLICE_DIR=$(dirname "$SLICE_DIR")
+          fi
+          echo "Slice dir: $SLICE_DIR"
+          
+          # ابحث عن libcrypto.a و libssl.a
+          LIBCRYPTO=$(find "$SLICE_DIR" -name 'libcrypto.a' -o -name 'libcrypto_static.a' | head -1)
+          LIBSSL=$(find "$SLICE_DIR" -name 'libssl.a' -o -name 'libssl_static.a' | head -1)
+          
+          if [ -z "$LIBCRYPTO" ]; then
+            echo "=== libcrypto.a not in slice, searching whole xcframework ==="
+            LIBCRYPTO=$(find "$ROOT" -name 'libcrypto*.a' ! -path '*simulator*' | head -1)
+          fi
+          if [ -z "$LIBSSL" ]; then
+            LIBSSL=$(find "$ROOT" -name 'libssl*.a' ! -path '*simulator*' | head -1)
+          fi
+          
+          if [ -z "$LIBCRYPTO" ]; then
+            echo "=== libcrypto.a not found as static, checking framework ==="
+            LIBCRYPTO=$(find "$ROOT" -name 'OpenSSL' -path '*ios-arm64*' ! -path '*simulator*' | head -1)
+            LIBSSL=""
+          fi
+          
+          echo "LibCrypto: $LIBCRYPTO"
+          echo "LibSSL:    $LIBSSL"
+          
+          echo "OSSL_INC=$INC_DIR" >> $GITHUB_ENV
+          echo "OSSL_LIBCRYPTO=$LIBCRYPTO" >> $GITHUB_ENV
+          echo "OSSL_LIBSSL=$LIBSSL" >> $GITHUB_ENV
+          
+          # تحقق
+          ls -la "$INC_DIR/openssl/" | head -10
+          file "$LIBCRYPTO"
+
+      - name: Verify OpenSSL headers
+        run: |
+          set -Eeuo pipefail
+          echo "INC: $OSSL_INC"
+          test -f "$OSSL_INC/openssl/evp.h" || { echo "evp.h missing"; exit 1; }
+          test -f "$OSSL_INC/openssl/kdf.h" || { echo "kdf.h missing"; exit 1; }
+          test -f "$OSSL_INC/openssl/core_names.h" || { echo "core_names.h missing"; exit 1; }
+          test -f "$OSSL_INC/openssl/param_build.h" || { echo "param_build.h missing"; exit 1; }
+          echo "All required headers present"
 
       - name: Compile defcrypto.o
         run: |
@@ -75,7 +128,6 @@ jobs:
             -miphoneos-version-min=14.0 -O2 -fPIC -fvisibility=hidden \
             -I "$OSSL_INC" \
             -c defcrypto_bridge.cpp -o defcrypto_bridge.o
-          file defcrypto_bridge.o
 
       - name: Compile ShadowBypassXK.o
         run: |
@@ -83,12 +135,10 @@ jobs:
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           clang -x objective-c++ -std=c++20 -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
-            -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
+            -Wno-nullability-completeness -Wno-deprecated-declarations \
             -Wno-incompatible-pointer-types \
             -I "$OSSL_INC" -I . \
             -c ShadowBypassXK.m -o ShadowBypassXK.o
-          file ShadowBypassXK.o
 
       - name: Compile ShadowMonitorXK.o
         run: |
@@ -96,52 +146,45 @@ jobs:
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           clang -x objective-c++ -std=c++20 -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
-            -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
+            -Wno-nullability-completeness -Wno-deprecated-declarations \
             -Wno-incompatible-pointer-types \
             -I "$OSSL_INC" -I . \
             -c ShadowMonitorXK.m -o ShadowMonitorXK.o
-          file ShadowMonitorXK.o
 
       - name: Link unified dylib
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          
+          LIBS="$OSSL_LIBCRYPTO"
+          if [ -n "$OSSL_LIBSSL" ]; then
+            LIBS="$LIBS $OSSL_LIBSSL"
+          fi
+          
           clang++ -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -dynamiclib -O2 \
             -o ShadowXK.dylib \
-            defcrypto.o \
-            defcrypto_bridge.o \
-            ShadowBypassXK.o \
-            ShadowMonitorXK.o \
-            "$OSSL_LIB/libcrypto.a" \
-            "$OSSL_LIB/libssl.a" \
-            -framework Foundation \
-            -framework UIKit \
-            -framework Security \
-            -framework AdSupport \
-            -lz
+            defcrypto.o defcrypto_bridge.o \
+            ShadowBypassXK.o ShadowMonitorXK.o \
+            $LIBS \
+            -framework Foundation -framework UIKit -framework Security \
+            -framework AdSupport -lz
           file ShadowXK.dylib
 
       - name: Verify
         run: |
           set -Eeuo pipefail
-          echo "=== File info ==="
           file ShadowXK.dylib
-          echo ""
-          echo "=== Linked libraries ==="
+          echo "--- linked libs ---"
           otool -L ShadowXK.dylib
-          echo ""
-          echo "=== Exported bridge symbols ==="
-          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || echo "(none found — check visibility)"
-          echo ""
-          echo "=== Size ==="
+          echo "--- bridge exports ---"
+          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || true
+          echo "--- size ---"
           ls -lh ShadowXK.dylib
 
-      - name: Upload artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: ShadowXK-unified
           path: ShadowXK.dylib
           if-no-files-found: error
-          retention-days: 30
