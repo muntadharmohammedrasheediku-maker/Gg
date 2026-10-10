@@ -1,4 +1,4 @@
-name: build-shadowbypass
+name: build-shadowxk
 
 on: [push, workflow_dispatch]
 
@@ -6,61 +6,91 @@ jobs:
   build:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
-      - name: Fetch fishhook (fallback if submodule missing)
-        run: |
-          if [ ! -f deps/fishhook/fishhook.h ]; then
-            mkdir -p deps/fishhook
-            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h -o deps/fishhook/fishhook.h
-            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c -o deps/fishhook/fishhook.c
-          fi
+      - name: List repo files
+        run: ls -la
 
-      - name: Syntax check
+      - name: Syntax check — ShadowBypassXK.m
         run: |
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -arch arm64 -arch arm64e \
+          clang -arch arm64 \
             -isysroot "$SDK" \
-            -miphoneos-version-min=13.0 \
+            -miphoneos-version-min=14.0 \
             -fobjc-arc -O0 \
             -Wno-incompatible-pointer-types \
             -Wno-implicit-function-declaration \
             -Wno-nullability-completeness \
+            -Wno-deprecated-declarations \
             -fsyntax-only \
-            -I deps \
             ShadowBypassXK.m
-            ShadowMonitorXK.m
 
-      - name: Build dylib
+      - name: Syntax check — ShadowMonitorXK.m
         run: |
-          set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -arch arm64 -arch arm64e \
+          clang -arch arm64 \
             -isysroot "$SDK" \
-            -miphoneos-version-min=13.0 \
-            -fobjc-arc -O2 -dynamiclib \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc -O0 \
             -Wno-incompatible-pointer-types \
             -Wno-implicit-function-declaration \
             -Wno-nullability-completeness \
-            -I deps \
-            ShadowBypassXK.m deps/fishhook/fishhook.c \
+            -Wno-deprecated-declarations \
+            -fsyntax-only \
+            ShadowMonitorXK.m
+
+      - name: Build ShadowBypassXK.dylib
+        run: |
+          set -Eeuo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc -fblocks -O2 -dynamiclib \
+            -Wno-incompatible-pointer-types \
+            -Wno-implicit-function-declaration \
+            -Wno-nullability-completeness \
+            -Wno-deprecated-declarations \
+            ShadowBypassXK.m \
             -framework Foundation -framework UIKit -framework Security \
             -framework AdSupport -framework AppTrackingTransparency \
             -o ShadowBypassXK.dylib
 
-      - name: Verify output
+      - name: Build ShadowMonitorXK.dylib
         run: |
-          file ShadowBypassXK.dylib
-          otool -L ShadowBypassXK.dylib
-          nm -u ShadowBypassXK.dylib | grep -E "fishhook|RSA_|AES_" || true
+          set -Eeuo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc -fblocks -O2 -dynamiclib \
+            -Wno-incompatible-pointer-types \
+            -Wno-implicit-function-declaration \
+            -Wno-nullability-completeness \
+            -Wno-deprecated-declarations \
+            ShadowMonitorXK.m \
+            -framework Foundation -framework UIKit -framework Security \
+            -o ShadowMonitorXK.dylib
 
-      - uses: actions/upload-artifact@v4
+      - name: Verify outputs
+        run: |
+          file ShadowBypassXK.dylib ShadowMonitorXK.dylib
+          echo "---"
+          otool -L ShadowBypassXK.dylib
+          echo "---"
+          otool -L ShadowMonitorXK.dylib
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: ShadowBypassXK
-          path: ShadowBypassXK.dylib
+          name: ShadowXK-dylibs
+          path: |
+            ShadowBypassXK.dylib
+            ShadowMonitorXK.dylib
+          if-no-files-found: error
