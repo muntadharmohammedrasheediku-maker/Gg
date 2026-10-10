@@ -743,16 +743,14 @@ DEF_ID_P0(CheckSymbolSource, getReport)
 DEF_ID_P1(CheckSymbolSource, checkSymbolSourceWithData)
 DEF_ID_P1(CheckSymbolSource, verifySymbolWithData)
 
-// ─── Screenshot / Rotate ───
+// ─── Screenshot / Rotate (fixed — P0 dan P1 tidak tabrakan) ───
 DEF_ID_P0(ScreenShot, takeScreenShot)
-DEF_ID_P0(ScreenShot, takeScreenShotEx)
 DEF_ID_P0(ScreenShot, screenshot)
 DEF_ID_P1(ScreenShot, takeScreenShotEx)
 DEF_ID_P1(ScreenShot, screenshotOfView)
 DEF_ID_P1(ScreenShot, getBufFromImage)
 DEF_ID_P1(ScreenShot, getAppWindowsForScreen)
 
-DEF_ID_P0(Rotate, rotate)
 DEF_ID_P0(Rotate, fixOrientation)
 DEF_ID_P0(Rotate, flipVertical)
 DEF_ID_P0(Rotate, flipHorizontal)
@@ -1033,16 +1031,14 @@ static void SBXK_RegisterExtended(void) {
     REG_V1(NetworkManager, sendShellReport);
     REG_V1(NetworkManager, sendCheckState);
 
-    // ScreenShot / Rotate
+    // ScreenShot / Rotate — hanya yang P0/P1 sesuai deklarasi
     REG_ID0(ScreenShot, takeScreenShot);
-    REG_ID0(ScreenShot, takeScreenShotEx);
     REG_ID0(ScreenShot, screenshot);
     REG_ID1(ScreenShot, takeScreenShotEx);
     REG_ID1(ScreenShot, screenshotOfView);
     REG_ID1(ScreenShot, getBufFromImage);
     REG_ID1(ScreenShot, getAppWindowsForScreen);
 
-    REG_ID0(Rotate, rotate);
     REG_ID0(Rotate, fixOrientation);
     REG_ID0(Rotate, flipVertical);
     REG_ID0(Rotate, flipHorizontal);
@@ -1068,7 +1064,7 @@ static void SBXK_RegisterExtended(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 14. REGISTER ALL (base + extended)
+#pragma mark 14. REGISTER ALL (base)
 #pragma mark =========================================================
 
 static void SBXK_RegisterAll(void) {
