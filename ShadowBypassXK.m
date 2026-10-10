@@ -1,21 +1,23 @@
 // ============================================================================
-// ShadowBypass XK v7.2 — inherited method safety, diagnostic clarity
+// ShadowBypass XK v7.3 — iOS 14+, arm64، بلا hooks كائنية
 //
-// Build (arm64 saja — tidak berasumsi arm64e/PAC sebagai penyebab crash):
+// سبب الانهيار السابق (مؤكد من sbxk_crash_prev.log):
+//   -[__NSCFConstantString UUIDString]: unrecognized selector
+//   الـ hook advertisingIdentifier كان يُرجع NSString بدلاً من NSUUID.
+//   الحل: أُزيل الـ hook — التطبيق سيحصل على IDFA الأصلي أو nil من iOS.
+//
+// ما هذا الملف:
+//   - معالج انهيار AS-safe (write() فقط)
+//   - عارض سجل داخلي (alert) — بلا حاجة لـ macOS
+//   - registry swizzle مع معالجة method الموروث
+//   - لا hooks كائنية. hooks لاحقة تُضاف يدوياً بعد التحقق.
+//
+// Build (GitHub Actions macOS runner):
 //   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
 //   clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=14.0 \
-//         -fobjc-arc -fblocks -O2 -dynamiclib \
-//         -Wno-nullability-completeness \
-//         ShadowBypassXK.m \
-//         -framework Foundation -framework UIKit \
+//         -fobjc-arc -fblocks -O2 -dynamiclib -Wno-nullability-completeness \
+//         ShadowBypassXK.m -framework Foundation -framework UIKit \
 //         -o ShadowBypassXK.dylib
-//
-// Catatan diagnostik:
-//   - رسائل [SBXK-diag] هي "نتائج فحوصات" فقط. ليست دليلاً على سبب الانهيار.
-//   - المصدر الوحيد لسبب الانهيار هو sbxk_crash_prev.log المولَّد من معالج
-//     الإشارة (SIGSEGV/ABRT/...). إذا لم يوجد الملف، لم يُنفَّذ المعالج.
-//   - لا تفترض أن ARM64e أو PAC هو السبب قبل رؤية si_addr وsignal في
-//     sbxk_crash_prev.log.
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -30,7 +32,7 @@
 #import <stdatomic.h>
 
 #pragma mark =========================================================
-#pragma mark 0. GLOBALS
+#pragma mark 0. حالة عامة
 #pragma mark =========================================================
 
 static atomic_int  g_phase    = 0;
@@ -38,7 +40,7 @@ static atomic_bool g_pending  = false;
 static atomic_int  g_crash_fd = -1;
 
 #pragma mark =========================================================
-#pragma mark 1. AS-SAFE WRITERS
+#pragma mark 1. كتابة AS-safe
 #pragma mark =========================================================
 
 #define SBXK_WLIT(fd, lit)  do { \
@@ -67,7 +69,7 @@ static void sbxk_whex(int fd, const void *p) {
 }
 
 #pragma mark =========================================================
-#pragma mark 2. CRASH HANDLER — AS-safe, SA_RESETHAND
+#pragma mark 2. معالج الانهيار
 #pragma mark =========================================================
 
 static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
@@ -75,14 +77,15 @@ static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
     int fd = atomic_load(&g_crash_fd);
     if (fd >= 0) {
         SBXK_WLIT(fd, "\n=== SBXK CRASH ===\n");
-        SBXK_WLIT(fd, "signal="); sbxk_wdec(fd, sig); SBXK_WLIT(fd, "\n");
-        SBXK_WLIT(fd, "phase=");  sbxk_wdec(fd, atomic_load(&g_phase)); SBXK_WLIT(fd, "\n");
+        SBXK_WLIT(fd, "signal=");  sbxk_wdec(fd, sig);                     SBXK_WLIT(fd, "\n");
+        SBXK_WLIT(fd, "phase=");   sbxk_wdec(fd, atomic_load(&g_phase));   SBXK_WLIT(fd, "\n");
         if (info) {
-            SBXK_WLIT(fd, "si_addr="); sbxk_whex(fd, info->si_addr); SBXK_WLIT(fd, "\n");
+            SBXK_WLIT(fd, "si_addr=");
+            sbxk_whex(fd, info->si_addr);
+            SBXK_WLIT(fd, "\n");
         }
         SBXK_WLIT(fd, "=== END CRASH ===\n");
     }
-    // لا signal/raise — SA_RESETHAND تكفّل
 }
 
 static void sbxk_on_exception(NSException *e) {
@@ -92,20 +95,24 @@ static void sbxk_on_exception(NSException *e) {
     @try {
         NSString *n = [e name];
         NSString *r = [e reason];
-        if (n) { SBXK_WLIT(fd, "name=");
-                 const char *s = n.UTF8String;
-                 if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; }
-                 SBXK_WLIT(fd, "\n"); }
-        if (r) { SBXK_WLIT(fd, "reason=");
-                 const char *s = r.UTF8String;
-                 if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; }
-                 SBXK_WLIT(fd, "\n"); }
+        if (n) {
+            SBXK_WLIT(fd, "name=");
+            const char *s = n.UTF8String;
+            if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; }
+            SBXK_WLIT(fd, "\n");
+        }
+        if (r) {
+            SBXK_WLIT(fd, "reason=");
+            const char *s = r.UTF8String;
+            if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; }
+            SBXK_WLIT(fd, "\n");
+        }
     } @catch (__unused NSException *ign) { }
     SBXK_WLIT(fd, "=== END EXCEPTION ===\n");
 }
 
 #pragma mark =========================================================
-#pragma mark 3. PATHS + INIT
+#pragma mark 3. مسارات + تهيئة
 #pragma mark =========================================================
 
 static char g_crash_path[512] = {0};
@@ -113,8 +120,8 @@ static char g_prev_path[512]  = {0};
 
 static void SBXK_InitPaths(void) {
     NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    NSString *c  = [docs stringByAppendingPathComponent:@"sbxk_crash.log"];
-    NSString *p  = [docs stringByAppendingPathComponent:@"sbxk_crash_prev.log"];
+    NSString *c = [docs stringByAppendingPathComponent:@"sbxk_crash.log"];
+    NSString *p = [docs stringByAppendingPathComponent:@"sbxk_crash_prev.log"];
     strncpy(g_crash_path, c.UTF8String, sizeof(g_crash_path) - 1);
     strncpy(g_prev_path,  p.UTF8String, sizeof(g_prev_path)  - 1);
 }
@@ -144,10 +151,8 @@ static void SBXK_RotateCrashLog(void) {
     NSString *c = [NSString stringWithUTF8String:g_crash_path];
     NSString *p = [NSString stringWithUTF8String:g_prev_path];
     if (![fm fileExistsAtPath:c]) return;
-
     [fm removeItemAtPath:p error:nil];
     [fm moveItemAtPath:c toPath:p error:nil];
-
     int old = atomic_exchange(&g_crash_fd, -1);
     if (old >= 0) close(old);
     int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -155,7 +160,7 @@ static void SBXK_RotateCrashLog(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 4. SWIZZLE REGISTRY
+#pragma mark 4. registry swizzle
 #pragma mark =========================================================
 
 static NSMutableDictionary<NSString *, NSValue *> *g_orig = nil;
@@ -166,28 +171,17 @@ static NSString *SBXK_Key(const char *cls, const char *sel) {
     return [NSString stringWithFormat:@"%s::%s", cls, sel];
 }
 
-// ---------------------------------------------------------------------------
-// [A] فحص ما إذا كان Selector مُعرَّفاً على الكلاس نفسه — وليس موروثاً.
-//     هذا يمنع لبس "c يعرّف s" مع "c يرث s من parent".
-// ---------------------------------------------------------------------------
 static BOOL SBXK_MethodIsOwn(Class c, SEL s) {
     if (!c || !s) return NO;
-    unsigned int count = 0;
-    Method *methods = class_copyMethodList(c, &count);
-    if (!methods) return NO;
+    unsigned int n = 0;
+    Method *list = class_copyMethodList(c, &n);
+    if (!list) return NO;
     BOOL found = NO;
-    for (unsigned int i = 0; i < count; i++) {
-        if (method_getName(methods[i]) == s) { found = YES; break; }
+    for (unsigned int i = 0; i < n; i++) {
+        if (method_getName(list[i]) == s) { found = YES; break; }
     }
-    free(methods);
+    free(list);
     return found;
-}
-
-// ---------------------------------------------------------------------------
-// [B] فحص ما إذا كان Selector معرَّفاً كـ class method على الميتاكلاس مباشرة.
-// ---------------------------------------------------------------------------
-static BOOL SBXK_ClassMethodIsOwn(Class metacls, SEL s) {
-    return SBXK_MethodIsOwn(metacls, s);
 }
 
 static BOOL SBXK_EncodingMatches(const char *actual, const char *expected) {
@@ -195,59 +189,46 @@ static BOOL SBXK_EncodingMatches(const char *actual, const char *expected) {
     return strcmp(actual, expected) == 0;
 }
 
-// ---------------------------------------------------------------------------
-// [C] منطق التثبيت: يفرّق بين method مُعرَّف على الكلاس نفسه (استبدال)
-//     وmethod موروث (إضافة override صريح عبر class_addMethod).
-//
-//     السبب: class_replaceMethod على كلاس لا يعرّف method يعمل كـ addMethod،
-//     وهذا سلوك صحيح — لكن يجب أن نكون واعين بأننا نضيف override وليس
-//     نُعدّل الأصل. الرسالة [SBXK-diag] توضح هذا.
-// ---------------------------------------------------------------------------
-static BOOL SBXK_SwizzleFull(const char *clsName,
-                             const char *selName,
-                             IMP         replacement,
-                             const char *expectedFullEncoding)
+// ترجع YES إن نجح التثبيت. الترميز المُتوقَّع كامل: مثال "@@:".
+static BOOL SBXK_SwizzleFull(const char *clsName, const char *selName,
+                             IMP replacement, const char *expectedEncoding)
 {
-    if (!clsName || !selName || !replacement || !expectedFullEncoding) return NO;
-
+    if (!clsName || !selName || !replacement || !expectedEncoding) return NO;
     NSString *key = SBXK_Key(clsName, selName);
     if ([g_done containsObject:key]) return YES;
     if ([g_skip containsObject:key]) return NO;
 
     Class c = objc_getClass(clsName);
-    if (!c) return NO;   // pending, bukan failed
+    if (!c) return NO;   // pending
 
     SEL s = sel_registerName(selName);
     if (!s) { [g_skip addObject:key]; return NO; }
 
-    // تحديد: instance أم class؟ وأين مُعرَّف؟
     Method instM = class_getInstanceMethod(c, s);
     Method clsM  = class_getClassMethod(c, s);
 
-    BOOL isClassMethod = NO;
+    BOOL isClass = NO;
     Method m = NULL;
-    BOOL ownOnTarget = NO;
+    BOOL own = NO;
     Class target = nil;
 
     if (instM && SBXK_MethodIsOwn(c, s)) {
-        m = instM; isClassMethod = NO; ownOnTarget = YES; target = c;
-    } else if (clsM && SBXK_ClassMethodIsOwn(object_getClass(c), s)) {
-        m = clsM; isClassMethod = YES; ownOnTarget = YES; target = object_getClass(c);
+        m = instM; isClass = NO; own = YES; target = c;
+    } else if (clsM && SBXK_MethodIsOwn(object_getClass(c), s)) {
+        m = clsM; isClass = YES; own = YES; target = object_getClass(c);
     } else if (instM) {
-        // وراثة من superclass — نضيف override على c نفسه
-        m = instM; isClassMethod = NO; ownOnTarget = NO; target = c;
+        m = instM; isClass = NO; own = NO; target = c;
     } else if (clsM) {
-        m = clsM; isClassMethod = YES; ownOnTarget = NO; target = object_getClass(c);
+        m = clsM; isClass = YES; own = NO; target = object_getClass(c);
     } else {
         [g_skip addObject:key];
         return NO;
     }
 
     const char *enc = method_getTypeEncoding(m);
-    if (!SBXK_EncodingMatches(enc, expectedFullEncoding)) {
-        // [SBXK-diag] رسالة تشخيصية — ليست سبب انهيار.
-        NSLog(@"[SBXK-diag] verify failed: %s %s — got '%s', want '%s'",
-              clsName, selName, enc ? enc : "(null)", expectedFullEncoding);
+    if (!SBXK_EncodingMatches(enc, expectedEncoding)) {
+        NSLog(@"[SBXK-diag] verify failed: %s %s — got '%s' want '%s'",
+              clsName, selName, enc ? enc : "(null)", expectedEncoding);
         [g_skip addObject:key];
         return NO;
     }
@@ -256,21 +237,16 @@ static BOOL SBXK_SwizzleFull(const char *clsName,
     g_orig[key] = [NSValue valueWithPointer:orig];
 
     @try {
-        if (ownOnTarget) {
-            // الطريقة مُعرَّفة على الكلاس — استبدال مباشر
+        if (own) {
             class_replaceMethod(target, s, replacement, enc);
         } else {
-            // وراثة — نضيف override على target فقط. الأصل في superclass لا يُلمس.
             if (!class_addMethod(target, s, replacement, enc)) {
-                // فشل الإضافة (سباق أو سبق): استبدال
                 class_replaceMethod(target, s, replacement, enc);
             }
-            NSLog(@"[SBXK-diag] added override for inherited %s %s on %s",
-                  clsName, selName, isClassMethod ? "metaclass" : "class");
         }
         [g_done addObject:key];
     } @catch (NSException *e) {
-        NSLog(@"[SBXK-diag] exception while swizzling %s %s: %@", clsName, selName, e);
+        NSLog(@"[SBXK-diag] exception: %s %s: %@", clsName, selName, e);
         [g_skip addObject:key];
         return NO;
     }
@@ -284,36 +260,24 @@ static IMP SBXK_Original(const char *cls, const char *sel) {
 }
 
 #pragma mark =========================================================
-#pragma mark 5. HOOK — advertisingIdentifier (مثال وحيد)
+#pragma mark 5. التسجيل — جدول فارغ عمداً
 #pragma mark =========================================================
-
-static id SBXK_ASIdentifier_advertisingIdentifier(id self, SEL _cmd) {
-    (void)self; (void)_cmd;
-    static NSUUID *zero = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        unsigned char b[16] = {0};
-        zero = [[NSUUID alloc] initWithUUIDBytes:b];
-    });
-    return zero;
-}
-
-#pragma mark =========================================================
-#pragma mark 6. REGISTER
-#pragma mark =========================================================
+//
+// لا hooks كائنية. السبب المؤكد من سجل الانهيار السابق:
+//   hook يُرجع NSString بدلاً من NSUUID → unrecognized selector → abort.
+//
+// القاعدة الصارمة لأي hook يُضاف لاحقاً:
+//   - إما BOOL (يقبل 'B' أو 'c')
+//   - إما void
+//   - إياك و id-returning إلا إن أرجعت نفس الفئة المُتوقَّعة بالضبط
+//     (أو nil) وأثبت ذلك باختبار منفصل.
 
 static void SBXK_RegisterAll(void) {
-    // الترميز الكامل لـ advertisingIdentifier على ASIdentifierManager هو "@@:"
-    SBXK_SwizzleFull("ASIdentifierManager",
-                     "advertisingIdentifier",
-                     (IMP)SBXK_ASIdentifier_advertisingIdentifier,
-                     "@@:");
-
-    // لا تضف صفوفاً قبل قراءة sbxk_crash_prev.log من نسخة مبنية بدونها.
+    // لا شيء.
 }
 
 #pragma mark =========================================================
-#pragma mark 7. LOG VIEWER — بدون macOS
+#pragma mark 6. عارض السجل
 #pragma mark =========================================================
 
 @interface SBXK_LogViewer : NSObject
@@ -340,7 +304,6 @@ static void SBXK_RegisterAll(void) {
                       stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
     NSData *d = [NSData dataWithContentsOfFile:path];
     if (!d || d.length == 0) return;
-
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
     if (!s || s.length == 0) return;
     if (s.length > 2500) s = [[s substringToIndex:2500] stringByAppendingString:@"…"];
@@ -379,7 +342,7 @@ static void SBXK_RegisterAll(void) {
 @end
 
 #pragma mark =========================================================
-#pragma mark 8. RETRY
+#pragma mark 7. إعادة محاولة
 #pragma mark =========================================================
 
 static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
@@ -396,16 +359,15 @@ static void SBXK_RetryPass(void) {
 }
 
 #pragma mark =========================================================
-#pragma mark 9. ENTRY
+#pragma mark 8. الدخول
 #pragma mark =========================================================
 
 static void SBXK_RunInstall(void) {
     atomic_store(&g_phase, 20);
     SBXK_RegisterAll();
     atomic_store(&g_phase, 30);
-    NSLog(@"[SBXK] v7.2 install: done=%lu skip=%lu",
+    NSLog(@"[SBXK] v7.3 install: done=%lu skip=%lu (id-hooks: 0)",
           (unsigned long)g_done.count, (unsigned long)g_skip.count);
-    NSLog(@"[SBXK] note: skip counts فحوصات فاشلة — ليست دليل انهيار");
 }
 
 __attribute__((constructor))
@@ -422,10 +384,9 @@ static void SBXK_Bootstrap(void) {
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
 
-        NSLog(@"[SBXK] v7.2 boot");
+        NSLog(@"[SBXK] v7.3 boot");
 
         [SBXK_LogViewer installObserver];
-
         _dyld_register_func_for_add_image(sbxk_on_image_added);
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
