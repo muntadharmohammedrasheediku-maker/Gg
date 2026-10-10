@@ -1,5 +1,5 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>  // تمت الإضافة لحل خطأ UIApplication
+#import <UIKit/UIKit.h>
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
@@ -12,13 +12,12 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #include <string.h>
 #include <errno.h>
-#include <unistd.h>     // تمت الإضافة لدالة access
+#include <unistd.h>
 
 #import "fishhook.h"
 
-#pragma mark - Cryptographic Hooks (Memory-Based, No Patching)
+#pragma mark - Cryptographic Hooks
 
-// ===== AES-128/256 CBC Encrypt =====
 int (*orig_AES_cbc_encrypt)(const unsigned char *in, unsigned char *out, size_t len, 
                              const void *key, unsigned char *ivec, int enc);
 int hooked_AES_cbc_encrypt(const unsigned char *in, unsigned char *out, size_t len,
@@ -26,45 +25,38 @@ int hooked_AES_cbc_encrypt(const unsigned char *in, unsigned char *out, size_t l
     return orig_AES_cbc_encrypt(in, out, len, key, ivec, enc);
 }
 
-// ===== AES_encrypt =====
 void (*orig_AES_encrypt)(const unsigned char *in, unsigned char *out, const void *key);
 void hooked_AES_encrypt(const unsigned char *in, unsigned char *out, const void *key) {
     orig_AES_encrypt(in, out, key);
 }
 
-// ===== AES_decrypt =====
 void (*orig_AES_decrypt)(const unsigned char *in, unsigned char *out, const void *key);
 void hooked_AES_decrypt(const unsigned char *in, unsigned char *out, const void *key) {
     orig_AES_decrypt(in, out, key);
 }
 
-// ===== AES_set_encrypt_key =====
 int (*orig_AES_set_encrypt_key)(const unsigned char *userKey, int bits, void *key);
 int hooked_AES_set_encrypt_key(const unsigned char *userKey, int bits, void *key) {
     int ret = orig_AES_set_encrypt_key(userKey, bits, key);
     return (ret != 0) ? 0 : ret;
 }
 
-// ===== AES_set_decrypt_key =====
 int (*orig_AES_set_decrypt_key)(const unsigned char *userKey, int bits, void *key);
 int hooked_AES_set_decrypt_key(const unsigned char *userKey, int bits, void *key) {
     int ret = orig_AES_set_decrypt_key(userKey, bits, key);
     return (ret != 0) ? 0 : ret;
 }
 
-// ===== DES_encrypt =====
 void (*orig_DES_encrypt)(unsigned long *input, void *schedule, int encrypting);
 void hooked_DES_encrypt(unsigned long *input, void *schedule, int encrypting) {
     orig_DES_encrypt(input, schedule, encrypting);
 }
 
-// ===== DES_decrypt =====
 void (*orig_DES_decrypt)(unsigned long *input, void *schedule, int encrypting);
 void hooked_DES_decrypt(unsigned long *input, void *schedule, int encrypting) {
     orig_DES_decrypt(input, schedule, encrypting);
 }
 
-// ===== DES_cbc_encrypt =====
 int (*orig_DES_cbc_encrypt)(const unsigned char *input, unsigned char *output,
                             long length, void *schedule, unsigned char *ivec, int enc);
 int hooked_DES_cbc_encrypt(const unsigned char *input, unsigned char *output,
@@ -72,7 +64,6 @@ int hooked_DES_cbc_encrypt(const unsigned char *input, unsigned char *output,
     return orig_DES_cbc_encrypt(input, output, length, schedule, ivec, enc);
 }
 
-// ===== DES_set_key =====
 int (*orig_DES_set_key)(const unsigned char *key, void *schedule);
 int hooked_DES_set_key(const unsigned char *key, void *schedule) {
     int ret = orig_DES_set_key(key, schedule);
@@ -465,7 +456,6 @@ BOOL hooked_integrity_detect(id self, SEL _cmd) {
     return NO;
 }
 
-// ===== Detection Bypasses =====
 BOOL (*orig_isJailbroken)(id self, SEL _cmd);
 BOOL hooked_isJailbroken(id self, SEL _cmd) {
     return NO;
@@ -792,105 +782,106 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 
 #pragma mark - Constructor (Main Hook Initialization)
 
-// تم استبدال %ctor بطريقة C++ القياسية لضمان العمل في جميع البيئات
+// ماكرو لتسهيل عملية الربط (يحل مشكلة التحويل في C++)
+#define REBIND(name) {(name), (void *)hooked_##name, (void **)&orig_##name}
+
 static __attribute__((constructor)) void initialize_hook() {
     @autoreleasepool {
         NSLog(@"[ShadowTrackerBypass] Loading bypass...");
         
-        void *libcrypto = dlopen("/usr/lib/libcrypto.dylib", RTLD_LAZY);
-        void *libssl = dlopen("/usr/lib/libssl.dylib", RTLD_LAZY);
+        // محاولة تحميل المكتبات (اختياري، مجرد محاولة لضمان وجودها في الذاكرة)
+        dlopen("/usr/lib/libcrypto.dylib", RTLD_LAZY);
+        dlopen("/usr/lib/libssl.dylib", RTLD_LAZY);
         
-        if (!libcrypto) {
-            libcrypto = dlopen("/usr/lib/libcrypto.1.1.dylib", RTLD_LAZY);
-        }
-        if (!libssl) {
-            libssl = dlopen("/usr/lib/libssl.1.1.dylib", RTLD_LAZY);
-        }
-        
-        // Fishhook rebindings
+        // مصفوفة الربط باستخدام الماكرو REBIND
         struct rebinding bindings[] = {
             // Crypto
-            {"AES_cbc_encrypt", hooked_AES_cbc_encrypt, (void *)&orig_AES_cbc_encrypt},
-            {"AES_encrypt", hooked_AES_encrypt, (void *)&orig_AES_encrypt},
-            {"AES_decrypt", hooked_AES_decrypt, (void *)&orig_AES_decrypt},
-            {"AES_set_encrypt_key", hooked_AES_set_encrypt_key, (void *)&orig_AES_set_encrypt_key},
-            {"AES_set_decrypt_key", hooked_AES_set_decrypt_key, (void *)&orig_AES_set_decrypt_key},
+            REBIND(AES_cbc_encrypt),
+            REBIND(AES_encrypt),
+            REBIND(AES_decrypt),
+            REBIND(AES_set_encrypt_key),
+            REBIND(AES_set_decrypt_key),
             
             // DES
-            {"DES_encrypt", hooked_DES_encrypt, (void *)&orig_DES_encrypt},
-            {"DES_decrypt", hooked_DES_decrypt, (void *)&orig_DES_decrypt},
-            {"DES_cbc_encrypt", hooked_DES_cbc_encrypt, (void *)&orig_DES_cbc_encrypt},
-            {"DES_set_key", hooked_DES_set_key, (void *)&orig_DES_set_key},
+            REBIND(DES_encrypt),
+            REBIND(DES_decrypt),
+            REBIND(DES_cbc_encrypt),
+            REBIND(DES_set_key),
             
             // RSA
-            {"RSA_public_encrypt", hooked_RSA_public_encrypt, (void *)&orig_RSA_public_encrypt},
-            {"RSA_private_decrypt", hooked_RSA_private_decrypt, (void *)&orig_RSA_private_decrypt},
-            {"RSA_private_encrypt", hooked_RSA_private_encrypt, (void *)&orig_RSA_private_encrypt},
-            {"RSA_public_decrypt", hooked_RSA_public_decrypt, (void *)&orig_RSA_public_decrypt},
-            {"RSA_sign", hooked_RSA_sign, (void *)&orig_RSA_sign},
-            {"RSA_verify", hooked_RSA_verify, (void *)&orig_RSA_verify},
-            {"RSA_check_key", hooked_RSA_check_key, (void *)&orig_RSA_check_key},
-            {"RSA_generate_key", hooked_RSA_generate_key, (void *)&orig_RSA_generate_key},
+            REBIND(RSA_public_encrypt),
+            REBIND(RSA_private_decrypt),
+            REBIND(RSA_private_encrypt),
+            REBIND(RSA_public_decrypt),
+            REBIND(RSA_sign),
+            REBIND(RSA_verify),
+            REBIND(RSA_check_key),
+            REBIND(RSA_generate_key),
+            REBIND(RSA_padding_add_PKCS1_type_1),
+            REBIND(RSA_padding_add_PKCS1_type_2),
+            REBIND(RSA_padding_add_SSLv23),
+            REBIND(RSA_padding_add_X931),
+            REBIND(RSA_padding_check_PKCS1_OAEP),
+            REBIND(RSA_padding_check_SSLv23),
             
             // Hash
-            {"MD5_Init", hooked_MD5_Init, (void *)&orig_MD5_Init},
-            {"MD5_Update", hooked_MD5_Update, (void *)&orig_MD5_Update},
-            {"MD5_Final", hooked_MD5_Final, (void *)&orig_MD5_Final},
-            {"SHA1_Init", hooked_SHA1_Init, (void *)&orig_SHA1_Init},
-            {"SHA1_Update", hooked_SHA1_Update, (void *)&orig_SHA1_Update},
-            {"SHA1_Final", hooked_SHA1_Final, (void *)&orig_SHA1_Final},
-            {"SHA256_Init", hooked_SHA256_Init, (void *)&orig_SHA256_Init},
-            {"SHA256_Update", hooked_SHA256_Update, (void *)&orig_SHA256_Update},
-            {"SHA256_Final", hooked_SHA256_Final, (void *)&orig_SHA256_Final},
-            {"SHA512_Init", hooked_SHA512_Init, (void *)&orig_SHA512_Init},
-            {"SHA512_Update", hooked_SHA512_Update, (void *)&orig_SHA512_Update},
-            {"SHA512_Final", hooked_SHA512_Final, (void *)&orig_SHA512_Final},
-            {"MD5", hooked_MD5, (void *)&orig_MD5},
-            
-            // HMAC
-            {"HMAC_Init", hooked_HMAC_Init, (void *)&orig_HMAC_Init},
-            {"HMAC_Update", hooked_HMAC_Update, (void *)&orig_HMAC_Update},
-            {"HMAC_Final", hooked_HMAC_Final, (void *)&orig_HMAC_Final},
+            REBIND(MD5_Init),
+            REBIND(MD5_Update),
+            REBIND(MD5_Final),
+            REBIND(SHA1_Init),
+            REBIND(SHA1_Update),
+            REBIND(SHA1_Final),
+            REBIND(SHA256_Init),
+            REBIND(SHA256_Update),
+            REBIND(SHA256_Final),
+            REBIND(SHA512_Init),
+            REBIND(SHA512_Update),
+            REBIND(SHA512_Final),
+            REBIND(MD5),
+            REBIND(HMAC_Init),
+            REBIND(HMAC_Update),
+            REBIND(HMAC_Final),
             
             // EVP
-            {"EVP_SignFinal", hooked_EVP_SignFinal, (void *)&orig_EVP_SignFinal},
-            {"EVP_VerifyFinal", hooked_EVP_VerifyFinal, (void *)&orig_EVP_VerifyFinal},
-            {"EVP_DigestSign", hooked_EVP_DigestSign, (void *)&orig_EVP_DigestSign},
-            {"EVP_DigestVerify", hooked_EVP_DigestVerify, (void *)&orig_EVP_DigestVerify},
-            {"EVP_PKEY_sign", hooked_EVP_PKEY_sign, (void *)&orig_EVP_PKEY_sign},
-            {"EVP_PKEY_verify", hooked_EVP_PKEY_verify, (void *)&orig_EVP_PKEY_verify},
+            REBIND(EVP_SignFinal),
+            REBIND(EVP_VerifyFinal),
+            REBIND(EVP_DigestSign),
+            REBIND(EVP_DigestVerify),
+            REBIND(EVP_PKEY_sign),
+            REBIND(EVP_PKEY_verify),
             
-            // SSL
-            {"SSL_CTX_set_verify", hooked_SSL_CTX_set_verify, (void *)&orig_SSL_CTX_set_verify},
-            {"SSL_CTX_set_cert_verify_callback", hooked_SSL_CTX_set_cert_verify_callback, (void *)&orig_SSL_CTX_set_cert_verify_callback},
-            {"SSL_get_verify_result", hooked_SSL_get_verify_result, (void *)&orig_SSL_get_verify_result},
-            {"SSL_read", hooked_SSL_read, (void *)&orig_SSL_read},
-            {"SSL_write", hooked_SSL_write, (void *)&orig_SSL_write},
-            {"SSL_set_verify", hooked_SSL_set_verify, (void *)&orig_SSL_set_verify},
-            
-            // X509
-            {"X509_verify_cert", hooked_X509_verify_cert, (void *)&orig_X509_verify_cert},
-            {"X509_check_private_key", hooked_X509_check_private_key, (void *)&orig_X509_check_private_key},
-            {"X509_STORE_CTX_verify", hooked_X509_STORE_CTX_verify, (void *)&orig_X509_STORE_CTX_verify},
+            // SSL / X509
+            REBIND(SSL_CTX_set_verify),
+            REBIND(SSL_CTX_set_cert_verify_callback),
+            REBIND(SSL_get_verify_result),
+            REBIND(SSL_read),
+            REBIND(SSL_write),
+            REBIND(SSL_set_verify),
+            REBIND(X509_verify_cert),
+            REBIND(X509_check_private_key),
+            REBIND(X509_STORE_CTX_verify),
             
             // System
-            {"access", hooked_access, (void *)&orig_access},
-            {"RAND_bytes", hooked_RAND_bytes, (void *)&orig_RAND_bytes},
+            REBIND(access),
+            REBIND(RAND_bytes),
+            REBIND(CRYPTO_memdup),
+            REBIND(EVP_PKEY_derive),
+            REBIND(SSL_set_session),
             
-            // Security
-            {"SecItemAdd", hooked_SecItemAdd, (void *)&orig_SecItemAdd},
-            {"SecItemUpdate", hooked_SecItemUpdate, (void *)&orig_SecItemUpdate},
-            {"SecItemCopyMatching", hooked_SecItemCopyMatching, (void *)&orig_SecItemCopyMatching},
-            {"SecItemDelete", hooked_SecItemDelete, (void *)&orig_SecItemDelete},
-            {"SecKeyEncrypt", hooked_SecKeyEncrypt, (void *)&orig_SecKeyEncrypt},
-            {"SecKeyDecrypt", hooked_SecKeyDecrypt, (void *)&orig_SecKeyDecrypt},
-            {"SecRandomCopyBytes", hooked_SecRandomCopyBytes, (void *)&orig_SecRandomCopyBytes},
+            // iOS Security Framework
+            REBIND(SecItemAdd),
+            REBIND(SecItemUpdate),
+            REBIND(SecItemCopyMatching),
+            REBIND(SecItemDelete),
+            REBIND(SecKeyEncrypt),
+            REBIND(SecKeyDecrypt),
+            REBIND(SecRandomCopyBytes),
             
             // PEM
-            {"PEM_read_PrivateKey", hooked_PEM_read_PrivateKey, (void *)&orig_PEM_read_PrivateKey},
-            {"PEM_read_PublicKey", hooked_PEM_read_PublicKey, (void *)&orig_PEM_read_PublicKey},
-            {"PEM_write_PrivateKey", hooked_PEM_write_PrivateKey, (void *)&orig_PEM_write_PrivateKey},
-            {"PEM_write_PublicKey", hooked_PEM_write_PublicKey, (void *)&orig_PEM_write_PublicKey},
+            REBIND(PEM_read_PrivateKey),
+            REBIND(PEM_read_PublicKey),
+            REBIND(PEM_write_PrivateKey),
+            REBIND(PEM_write_PublicKey),
         };
         
         rebind_symbols(bindings, sizeof(bindings)/sizeof(bindings[0]));
