@@ -782,14 +782,14 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 
 #pragma mark - Constructor (Main Hook Initialization)
 
-// ماكرو لتسهيل عملية الربط (يحل مشكلة التحويل في C++)
-#define REBIND(name) {(name), (void *)hooked_##name, (void **)&orig_##name}
+// ماكرو لتسهيل عملية الربط (تم إصلاح الخطأ بإضافة # قبل name)
+#define REBIND(name) {(#name), (void *)hooked_##name, (void **)&orig_##name}
 
 static __attribute__((constructor)) void initialize_hook() {
     @autoreleasepool {
         NSLog(@"[ShadowTrackerBypass] Loading bypass...");
         
-        // محاولة تحميل المكتبات (اختياري، مجرد محاولة لضمان وجودها في الذاكرة)
+        // محاولة تحميل المكتبات (اختياري، لضمان وجودها في الذاكرة قبل الربط)
         dlopen("/usr/lib/libcrypto.dylib", RTLD_LAZY);
         dlopen("/usr/lib/libssl.dylib", RTLD_LAZY);
         
