@@ -3,37 +3,45 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <Security/Security.h>
 #import <dlfcn.h>
 #import <mach-o/dyld.h>
 #import <sys/stat.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
-#import <sys/ptrace.h>
+#import <sys/syscall.h>
 #import <sys/mman.h>
+#import <sys/proc.h>
 #import <mach/mach.h>
 #import <mach-o/loader.h>
 #import <objc/runtime.h>
 #import <os/log.h>
-#import <os/proc.h>
 #import <signal.h>
 #import <unistd.h>
 #import <stdlib.h>
 #import <string.h>
 #import <notify.h>
 
-// ================================================
-// أدوات مساعدة
-// ================================================
+// ============ ptrace workaround for iOS SDK ============
+#ifndef PT_DENY_ATTACH
+#define PT_DENY_ATTACH 31
+#endif
 
-static NSString * const kLogPrefix = @"[EXTERNAL BYPASS]";
+#ifndef SYS_ptrace
+#define SYS_ptrace 26
+#endif
 
-static void BPLog(NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    NSLog(@"%@ %@", kLogPrefix, msg);
+extern int ptrace(int request, pid_t pid, caddr_t addr, int data);
+
+// أداة بديلة تعمل دائماً حتى لو فشل ptrace
+static inline void bp_deny_attach(void) {
+    // الطريقة 1: ptrace مباشر
+    ptrace(PT_DENY_ATTACH, 0, 0, 0);
+    
+    // الطريقة 2: syscall مباشر (أكثر موثوقية)
+    syscall(SYS_ptrace, PT_DENY_ATTACH, 0, 0, 0);
 }
+// =======================================================
 
 // ================================================
 // 🚫 1. نظام كشف وإخفاء التطبيقات الخارجية
