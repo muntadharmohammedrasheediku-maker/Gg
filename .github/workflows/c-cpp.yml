@@ -29,21 +29,68 @@ jobs:
             https://github.com/krzyzanowskim/OpenSSL/releases/download/3.3.2000/OpenSSL.xcframework.zip
           unzip -q openssl.zip
           rm -f openssl.zip
+          echo "=== Available slices ==="
+          ls -la OpenSSL.xcframework/
 
       - name: Prepare OpenSSL paths
         run: |
           set -Eeuo pipefail
           ROOT="$PWD/deps/OpenSSL.xcframework"
-          IOS_FW=$(find "$ROOT" -maxdepth 3 -type d -name 'OpenSSL.framework' -path '*ios-arm64*' ! -path '*simulator*' | head -1)
-          [ -n "$IOS_FW" ] || { echo "no ios-arm64 framework"; find "$ROOT" -maxdepth 2 -type d; exit 1; }
+
+          # ★ استبعد simulator و maccatalyst
+          IOS_FW=""
+          for d in "$ROOT"/*; do
+            [ -d "$d" ] || continue
+            name=$(basename "$d")
+            case "$name" in
+              *maccatalyst*) continue ;;
+              *simulator*)   continue ;;
+            esac
+            if [ -d "$d/OpenSSL.framework" ] && echo "$name" | grep -q '^ios-arm64'; then
+              IOS_FW="$d/OpenSSL.framework"
+              break
+            fi
+          done
+
+          if [ -z "$IOS_FW" ]; then
+            echo "FATAL: no iOS device framework found"
+            ls -la "$ROOT"
+            exit 1
+          fi
+          echo "Found: $IOS_FW"
+
           HEADERS_DIR="$IOS_FW/Headers"
           BINARY="$IOS_FW/OpenSSL"
-          [ -f "$HEADERS_DIR/evp.h" ] || { echo "no evp.h"; exit 1; }
-          [ ! -e "$HEADERS_DIR/openssl" ] && ln -s . "$HEADERS_DIR/openssl"
+
+          [ -f "$HEADERS_DIR/evp.h" ] || { echo "FATAL: evp.h missing"; exit 1; }
+          [ -f "$BINARY" ] || { echo "FATAL: binary missing"; exit 1; }
+
+          # symlink openssl -> . ليعمل #include <openssl/evp.h>
+          if [ ! -e "$HEADERS_DIR/openssl" ]; then
+            ln -s . "$HEADERS_DIR/openssl"
+            echo "Created symlink: openssl -> ."
+          fi
+          test -f "$HEADERS_DIR/openssl/evp.h" || { echo "FATAL: symlink broken"; exit 1; }
+
           echo "OSSL_INC=$HEADERS_DIR" >> $GITHUB_ENV
           echo "OSSL_FW=$IOS_FW" >> $GITHUB_ENV
           echo "OSSL_BIN=$BINARY" >> $GITHUB_ENV
-          ls -la "$HEADERS_DIR/openssl/" | head -5
+          echo "OSSL_FW_PARENT=$(dirname "$IOS_FW")" >> $GITHUB_ENV
+
+          echo "=== Paths ==="
+          echo "INC:         $HEADERS_DIR"
+          echo "FW:          $IOS_FW"
+          echo "FW_PARENT:   $(dirname "$IOS_FW")"
+          echo "BIN:         $BINARY"
+          file "$BINARY"
+
+      - name: Verify required headers
+        run: |
+          set -Eeuo pipefail
+          for h in evp.h kdf.h core_names.h param_build.h rand.h crypto.h; do
+            test -f "$OSSL_INC/openssl/$h" || { echo "missing: $h"; exit 1; }
+          done
+          echo "All required OpenSSL headers present"
 
       - name: Compile defcrypto.o
         run: |
@@ -96,27 +143,56 @@ jobs:
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+
+          # ★ ربط framework بشكل صحيح + rpath
           clang++ -arch arm64 -isysroot "$SDK" \
             -miphoneos-version-min=14.0 -dynamiclib -O2 \
             -o ShadowXK.dylib \
-            defcrypto.o defcrypto_bridge.o \
-            ShadowBypassXK.o ShadowMonitorXK.o \
-            "$OSSL_BIN" \
-            -framework Foundation -framework UIKit -framework Security \
-            -framework AdSupport -lz
+            defcrypto.o \
+            defcrypto_bridge.o \
+            ShadowBypassXK.o \
+            ShadowMonitorXK.o \
+            -F "$OSSL_FW_PARENT" -framework OpenSSL \
+            -framework Foundation \
+            -framework UIKit \
+            -framework Security \
+            -framework AdSupport \
+            -lz \
+            -Wl,-rpath,@executable_path/Frameworks \
+            -Wl,-rpath,@loader_path/Frameworks \
+            -Wl,-rpath,/usr/lib
+
           file ShadowXK.dylib
 
       - name: Verify
         run: |
           set -Eeuo pipefail
+          echo "=== File info ==="
           file ShadowXK.dylib
+          echo ""
+          echo "=== Linked libraries ==="
           otool -L ShadowXK.dylib
-          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || true
+          echo ""
+          echo "=== Bridge exports ==="
+          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw)" || echo "(no exports found)"
+          echo ""
+          echo "=== Size ==="
           ls -lh ShadowXK.dylib
 
-      - name: Upload
+      - name: Package with framework
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ShadowXK-pkg/Frameworks
+          cp ShadowXK.dylib ShadowXK-pkg/
+          cp -R "$OSSL_FW" ShadowXK-pkg/Frameworks/
+          echo "=== Package contents ==="
+          find ShadowXK-pkg -type f | head -20
+          du -sh ShadowXK-pkg
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ShadowXK-unified
-          path: ShadowXK.dylib
+          path: ShadowXK-pkg/
           if-no-files-found: error
+          retention-days: 30
