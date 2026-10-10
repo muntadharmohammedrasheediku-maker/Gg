@@ -1,252 +1,65 @@
-name: Build MyHook Dylib
+name: build-shadowbypass
 
-on:
-  push:
-    branches:
-      - main
-      - master
-  workflow_dispatch:
-
-env:
-  THEOS: /opt/theos
+on: [push, workflow_dispatch]
 
 jobs:
   build:
-    name: Build Dylib — arm64 + arm64e
     runs-on: macos-14
-    timeout-minutes: 30
-
     steps:
-
-      # ============================================================
-      # CHECKOUT
-      # ============================================================
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          submodules: recursive
           fetch-depth: 0
 
-      # ============================================================
-      # XCODE
-      # ============================================================
-      - name: Setup Xcode
-        shell: bash
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+
+      - name: Fetch fishhook (fallback if submodule missing)
         run: |
-          set -Eeuo pipefail
-
-          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
-
-          xcodebuild -version
-
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          test -d "$SDK"
-
-          echo "iPhoneOS SDK: $SDK"
-
-      # ============================================================
-      # CACHE THEOS
-      # ============================================================
-      - name: Cache Theos
-        id: cache-theos
-        uses: actions/cache@v4
-        with:
-          path: /opt/theos
-          key: ${{ runner.os }}-theos-v6
-
-      # ============================================================
-      # INSTALL THEOS
-      # ============================================================
-      - name: Install Theos
-        if: steps.cache-theos.outputs.cache-hit != 'true'
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          sudo mkdir -p "$THEOS"
-          sudo chown -R "$(id -u):$(id -g)" "$THEOS"
-
-          git clone \
-            --recursive \
-            --depth 1 \
-            https://github.com/theos/theos.git \
-            "$THEOS"
-
-          test -d "$THEOS/makefiles"
-          test -d "$THEOS/bin"
-
-          echo "Theos installed."
-
-      # ============================================================
-      # INSTALL LDID
-      # ============================================================
-      - name: Install ldid
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          mkdir -p "$THEOS/bin"
-
-          curl \
-            --fail \
-            --silent \
-            --show-error \
-            --location \
-            --retry 3 \
-            --output /tmp/ldid \
-            https://github.com/ProcursusTeam/ldid/releases/download/v2.1.5-procursus7/ldid_macosx_arm64
-
-          test -s /tmp/ldid
-
-          chmod +x /tmp/ldid
-          install -m 755 /tmp/ldid "$THEOS/bin/ldid"
-
-          test -x "$THEOS/bin/ldid"
-
-          echo "ldid installed."
-
-      # ============================================================
-      # CONFIGURE THEOS
-      # ============================================================
-      - name: Configure Theos
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-          echo "$THEOS/bin" >> "$GITHUB_PATH"
-
-          export PATH="$THEOS/bin:$PATH"
-
-          test -d "$THEOS/makefiles"
-          test -x "$THEOS/bin/ldid"
-
-      # ============================================================
-      # VERIFY PROJECT
-      # ============================================================
-      - name: Verify Project
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          test -f Makefile
-          test -f MyHook.mm
-          test -f dobby.h
-          test -f libdobby.a
-
-          echo "Project files OK."
-
-      # ============================================================
-      # VERIFY DOBBY
-      # ============================================================
-      - name: Verify libdobby.a
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          echo "=== libdobby.a ==="
-          lipo -info libdobby.a
-
-          ARCHS="$(lipo -archs libdobby.a)"
-
-          echo "$ARCHS" | grep -qw arm64 || {
-            echo "ERROR: arm64 missing"
-            exit 1
-          }
-
-          echo "$ARCHS" | grep -qw arm64e || {
-            echo "ERROR: arm64e missing"
-            exit 1
-          }
-
-          echo "libdobby.a: arm64 + arm64e"
-
-      # ============================================================
-      # THEOS BUILD
-      # ============================================================
-      - name: Build Dylib with Theos
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          export THEOS="$THEOS"
-          export PATH="$THEOS/bin:$PATH"
-
-          rm -f build.log
-
-          echo "=== CLEAN ==="
-          make clean
-
-          echo "=== BUILD DYLIB ==="
-
-          make \
-            package \
-            FINALPACKAGE=1 \
-            DEBUG=0 \
-            ARCHS="arm64 arm64e" \
-            -j"$(sysctl -n hw.ncpu)" \
-            2>&1 | tee build.log
-
-          echo "Theos build completed."
-
-      # ============================================================
-      # FIND ONLY DYLIB
-      # ============================================================
-      - name: Extract Dylib
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-
-          DYLIB=".theos/obj/MyHook.dylib"
-
-          if [ ! -f "$DYLIB" ]; then
-            echo "ERROR: MyHook.dylib not found"
-            echo "=== .theos/obj ==="
-            find .theos/obj -maxdepth 3 -type f -print
-            exit 1
+          if [ ! -f deps/fishhook/fishhook.h ]; then
+            mkdir -p deps/fishhook
+            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h -o deps/fishhook/fishhook.h
+            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c -o deps/fishhook/fishhook.c
           fi
 
-          echo "=== Dylib ==="
-          ls -lh "$DYLIB"
+      - name: Syntax check
+        run: |
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang -arch arm64 -arch arm64e \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc -O0 \
+            -Wno-incompatible-pointer-types \
+            -Wno-implicit-function-declaration \
+            -Wno-nullability-completeness \
+            -fsyntax-only \
+            -I deps \
+            ShadowBypassXK.m
 
-          echo "=== Architectures ==="
-          lipo -info "$DYLIB"
+      - name: Build dylib
+        run: |
+          set -Eeuo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          clang -arch arm64 -arch arm64e \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc -O2 -dynamiclib \
+            -Wno-incompatible-pointer-types \
+            -Wno-implicit-function-declaration \
+            -Wno-nullability-completeness \
+            -I deps \
+            ShadowBypassXK.m deps/fishhook/fishhook.c \
+            -framework Foundation -framework UIKit -framework Security \
+            -framework AdSupport -framework AppTrackingTransparency \
+            -o ShadowBypassXK.dylib
 
-          ARCHS="$(lipo -archs "$DYLIB")"
+      - name: Verify output
+        run: |
+          file ShadowBypassXK.dylib
+          otool -L ShadowBypassXK.dylib
+          nm -u ShadowBypassXK.dylib | grep -E "fishhook|RSA_|AES_" || true
 
-          echo "$ARCHS" | grep -qw arm64 || {
-            echo "ERROR: arm64 missing"
-            exit 1
-          }
-
-          echo "$ARCHS" | grep -qw arm64e || {
-            echo "ERROR: arm64e missing"
-            exit 1
-          }
-
-          echo "SUCCESS"
-          echo "MyHook.dylib contains:"
-          echo "  arm64"
-          echo "  arm64e"
-
-      # ============================================================
-      # UPLOAD ONLY DYLIB
-      # ============================================================
-      - name: Upload Dylib
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: MyHook-dylib-arm64-arm64e
-          path: .theos/obj/MyHook.dylib
-          if-no-files-found: error
-          retention-days: 30
-
-      # ============================================================
-      # BUILD LOG
-      # ============================================================
-      - name: Upload Build Log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: MyHook-build-log
-          path: build.log
-          if-no-files-found: ignore
-          retention-days: 30
+          name: ShadowBypassXK
+          path: ShadowBypassXK.dylib
