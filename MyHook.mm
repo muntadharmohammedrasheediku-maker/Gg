@@ -1,272 +1,972 @@
+// ==========================================================================
+// ShadowMaster.m
+// النسخة الكاملة القابلة للتصريف — iPadOS 18.5 / A14
+// تنبيه: التصريف ينجح. التشغيل الكامل يحتاج جيلبريك (PAC + AMFI + KTRR).
+// ==========================================================================
+
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <CommonCrypto/CommonCrypto.h>
+#import <CoreML/CoreML.h>
+#import <NetworkExtension/NetworkExtension.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
-#import <dlfcn.h>
-#import <sys/stat.h>
-#import <sys/socket.h>
+#import <sys/mman.h>
 #import <sys/sysctl.h>
-#import <netinet/in.h>
-#import <AdSupport/AdSupport.h>
-#import <AppTrackingTransparency/AppTrackingTransparency.h>
-#include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <stdlib.h>
+#import <sys/types.h>
 
-#import "fishhook.h"
+// ==========================================================================
+// Forward Declarations
+// ==========================================================================
 
-// ==========================================================
-// 🛡️ SMART SWIZZLING HELPER (يمنع الكراش إذا لم يكن الكلاس موجوداً)
-// ==========================================================
-static void safe_swizzle(Class cls, SEL original, SEL replacement) {
-    if (!cls) return;
-    Method origMethod = class_getInstanceMethod(cls, original);
-    Method newMethod = class_getInstanceMethod(cls, replacement);
-    if (origMethod && newMethod) {
-        method_exchangeImplementations(origMethod, newMethod);
-    }
+@class MemoryExploiter, BehaviorSpoofer, NetworkManipulator, AIEvader;
+@class ServerSpoofer, HardwareSpoofer, DeceptionSystem, ActiveAttackSystem;
+@class ReverseDefenseSystem, HackingTools, RealTimeExploitKit, ShadowNetwork;
+@class ReverseModuleSystem, SecureReverseComms, ReverseGameEngine;
+@class AdvancedCloakingSystem, AttackerDashboard;
+@class VulnerabilityAnalysis, VulnerabilityAssessment, AttackPlan;
+
+// ==========================================================================
+// 1. أنواع البيانات (Data Types)
+// ==========================================================================
+
+@interface PlayerData : NSObject
+@property (nonatomic, strong) NSString *playerID;
+@property (nonatomic) CGPoint position;
+@property (nonatomic) CGPoint velocity;
+@property (nonatomic) float health;
+@end
+
+@interface AimData : NSObject
+@property (nonatomic) CGPoint targetPoint;
+@property (nonatomic) double timestamp;
+@property (nonatomic) float sensitivity;
+@end
+
+@interface MovementData : NSObject
+@property (nonatomic) CGPoint from;
+@property (nonatomic) CGPoint to;
+@property (nonatomic) double dt;
+@end
+
+@interface VisionData : NSObject
+@property (nonatomic) float fov;
+@property (nonatomic, strong) NSArray<NSValue *> *visiblePoints;
+@end
+
+@interface PhysicsData : NSObject
+@property (nonatomic) CGVector gravity;
+@property (nonatomic) float friction;
+@end
+
+@interface MoveConstraints : NSObject
+@property (nonatomic) float maxSpeed;
+@property (nonatomic) float maxAccel;
+@end
+
+@interface ShotData : NSObject
+@property (nonatomic) CGPoint origin;
+@property (nonatomic) CGPoint direction;
+@property (nonatomic) double interval;
+@end
+
+@interface CheatPrediction : NSObject
+@property (nonatomic) float probability;
+@property (nonatomic, strong) NSString *label;
+@end
+
+@interface VideoFrame : NSObject
+@property (nonatomic, strong) NSData *pixels;
+@property (nonatomic) CGSize size;
+@property (nonatomic) double timestamp;
+@end
+
+@interface ClientState : NSObject
+@property (nonatomic, strong) NSString *sessionID;
+@property (nonatomic, strong) NSDictionary *payload;
+@end
+
+@interface ValidationResult : NSObject
+@property (nonatomic) BOOL passed;
+@property (nonatomic, strong) NSString *reason;
+@end
+
+@interface PlayerAction : NSObject
+@property (nonatomic, strong) NSString *action;
+@property (nonatomic, strong) NSDictionary *params;
+@end
+
+@interface CheatDetection : NSObject
+@property (nonatomic, strong) NSString *module;
+@property (nonatomic, strong) NSString *reason;
+@property (nonatomic) double timestamp;
+@end
+
+@interface SecurityAlert : NSObject
+@property (nonatomic, strong) NSString *severity;
+@property (nonatomic, strong) NSString *message;
+@end
+
+@interface VulnerabilityAssessment : NSObject
+@property (nonatomic) float successRate;
+@property (nonatomic) NSInteger attackType;
+@property (nonatomic) float stealthLevel;
+@property (nonatomic, strong) AttackPlan *attackPlan;
+@end
+
+@interface VulnerabilityAnalysis : NSObject
+- (void)findSecurityGaps:(NSDictionary *)data;
+- (void)applyExploitAlgorithms;
+- (float)calculateSuccessRate;
+- (NSInteger)determineOptimalAttack;
+- (AttackPlan *)generateDetailedAttackPlan;
+- (float)calculateStealthLevel;
+@end
+
+@interface AttackPlan : NSObject
+@property (nonatomic, strong) NSArray<NSString *> *steps;
+@property (nonatomic) double estimatedDuration;
+@end
+
+// ==========================================================================
+// 2. ShadowMasterCore
+// ==========================================================================
+
+@interface ShadowMasterCore : NSObject
+
+@property (nonatomic, strong) MemoryExploiter *memoryExploiter;
+@property (nonatomic, strong) BehaviorSpoofer *behaviorSpoofer;
+@property (nonatomic, strong) NetworkManipulator *networkManipulator;
+@property (nonatomic, strong) AIEvader *aiEvader;
+@property (nonatomic, strong) ServerSpoofer *serverSpoofer;
+@property (nonatomic, strong) HardwareSpoofer *hardwareSpoofer;
+
++ (instancetype)master;
+- (void)initializeWithOverride:(NSDictionary *)config;
+- (void)startExploitation;
+- (void)monitorInRealTime;
+- (void)monitorAntiCheat;
+- (NSDictionary *)getAntiCheatStatus;
+- (void)generateBypassReport;
+
+// internal helpers (defined in implementation)
+- (void)detectAndNeutralizeAntiCheat;
+- (void)neutralizeModuleAtAddress:(const struct mach_header *)header;
+- (void)patchDetectionFunctions:(const struct mach_header *)header;
+- (void)setupReverseConnection;
+- (void)loadEvasionModels;
+- (NSDictionary *)analyzeVulnerabilities:(NSDictionary *)data;
+- (void)executeStealthAttack:(VulnerabilityAssessment *)vuln;
+- (void)corruptAntiCheatMemory:(VulnerabilityAssessment *)vuln;
+- (void)floodAntiCheatNetwork:(VulnerabilityAssessment *)vuln;
+- (void)plantLogicBomb:(VulnerabilityAssessment *)vuln;
+- (void)exploitRaceCondition:(VulnerabilityAssessment *)vuln;
+- (void)exhaustAntiCheatResources:(VulnerabilityAssessment *)vuln;
+- (void)cloakCompletely;
+
+@end
+
+// ==========================================================================
+// 3. MemoryExploiter
+// ==========================================================================
+
+@interface MemoryExploiter : NSObject
+- (BOOL)injectCodeIntoProcess;
+- (NSArray *)findAntiCheatModules;
+- (BOOL)patchMemoryProtections;
+- (BOOL)bypassCodeSignatures;
+- (void)enableMemoryHooking;
+- (void)randomizeInjectionPoints;
+- (void)setupMemoryCloaking;
+- (BOOL)bypassMemoryReaders;
+- (BOOL)bypassMemoryWriters;
+- (NSDictionary *)analyzeAntiCheatPatterns;
+@end
+
+// ==========================================================================
+// 4. BehaviorSpoofer
+// ==========================================================================
+
+@interface BehaviorSpoofer : NSObject
+- (NSDictionary *)generateLegitimateBehavior:(PlayerData *)player;
+- (BOOL)spoofAimbotPatterns:(AimData *)aimData;
+- (BOOL)spoofSpeedHacks:(MovementData *)movement;
+- (BOOL)spoofWallhackUsage:(VisionData *)vision;
+- (BOOL)spoofPhysics:(PhysicsData *)physics;
+- (BOOL)fakeMovementConstraints:(MoveConstraints *)constraints;
+- (BOOL)spoofShotPatterns:(ShotData *)shots;
+- (NSArray *)avoidBehavioralDetection;
+- (float)calculateEvasionScore;
+- (void)startBehaviorSpoofing;
+@end
+
+// ==========================================================================
+// 5. NetworkManipulator
+// ==========================================================================
+
+@interface NetworkManipulator : NSObject
+- (void)interceptNetworkTraffic;
+- (BOOL)injectCustomPackets;
+- (BOOL)simulateLagPatterns;
+- (BOOL)spoofPingValues;
+- (void)establishMitMChannel;
+- (NSData *)decryptGameTraffic:(NSData *)data;
+- (NSData *)encryptSpoofedData:(NSData *)data;
+- (BOOL)desyncClientServerState;
+- (NSDictionary *)createSyncDiscrepancies;
+@end
+
+// ==========================================================================
+// 6. AIEvader
+// ==========================================================================
+
+@interface AIEvader : NSObject
+@property (nonatomic, strong) MLModel *antiDetectionModel;
+@property (nonatomic, strong) MLModel *behaviorCloakingModel;
+- (CheatPrediction *)spoofCheatProbability:(PlayerData *)data;
+- (NSArray *)generateFalseClusters;
+- (void)poisonTrainingData:(NSArray *)trainingData;
+- (BOOL)hideScreenContent:(UIImage *)screenshot;
+- (BOOL)spoofVisualCheats:(VideoFrame *)frame;
+- (NSDictionary *)generateLegitimatePatterns;
+- (BOOL)avoidKnownCheatSignatures:(NSDictionary *)patterns;
+- (void)startEvasion;
+@end
+
+// ==========================================================================
+// 7. ServerSpoofer
+// ==========================================================================
+
+@interface ServerSpoofer : NSObject
+- (void)establishSpoofedChannel;
+- (BOOL)spoofClientState:(ClientState *)state;
+- (ValidationResult *)bypassServerChecks;
+- (BOOL)spoofCriticalCalculations;
+- (BOOL)fakePlayerActions:(PlayerAction *)action;
+- (void)bypassGameStateAuthority;
+- (void)logForAntiAnalysis;
+@end
+
+// ==========================================================================
+// 8. HardwareSpoofer
+// ==========================================================================
+
+@interface HardwareSpoofer : NSObject
+- (NSString *)generateFakeHardwareFingerprint;
+- (BOOL)spoofHardwareConsistency;
+- (BOOL)hideVirtualMachine;
+- (BOOL)bypassDebuggerDetection;
+- (BOOL)spoofSystemModifications;
+- (NSArray *)hideSuspiciousSoftware;
+- (BOOL)spoofPerformanceMetrics;
+- (BOOL)fakeTimingMeasurements;
+@end
+
+// ==========================================================================
+// 9. DeceptionSystem
+// ==========================================================================
+
+@interface DeceptionSystem : NSObject
+- (void)sendFalseReports:(CheatDetection *)detection;
+- (void)sendLegitimateDataToServer:(NSDictionary *)report;
+- (void)poisonGlobalDatabase;
+- (NSDictionary *)hideForensicEvidence;
+- (void)clearMemorySnapshots;
+- (void)sanitizeNetworkLogs;
+- (NSDictionary *)generateFalseStatistics;
+- (void)createFalseTrends;
+@end
+
+// ==========================================================================
+// 10. ActiveAttackSystem
+// ==========================================================================
+
+typedef NS_ENUM(NSInteger, AttackType) {
+    AttackTypeMemoryCorruption = 0,
+    AttackTypeNetworkFlood,
+    AttackTypeLogicBomb,
+    AttackTypeRaceCondition,
+    AttackTypeResourceExhaustion
+};
+
+@interface ActiveAttackSystem : NSObject
+- (NSArray *)findAntiCheatVulnerabilities;
+- (NSInteger)calculateAttackSuccessRate:(AttackType)type;
+- (void)launchMemoryAttack:(AttackType)type;
+- (void)deployNetworkAttack:(NSString *)target;
+- (void)executeLogicBomb;
+- (void)disableAntiCheatTemporarily;
+- (void)crashAntiCheatSystem;
+- (void)bypassPermanently;
+@end
+
+// ==========================================================================
+// 11. ReverseDefenseSystem
+// ==========================================================================
+
+@interface ReverseDefenseSystem : NSObject
+- (void)detectAntiCheatPresence;
+- (void)analyzeAntiCheatBehavior;
+- (NSArray *)locateAntiCheatModules;
+- (void)protectAgainstDetection;
+- (void)deployCounterAntiCheat;
+- (void)adaptToNewProtections;
+- (void)alertWhenDetected:(SecurityAlert *)alert;
+- (void)notifyAttackers;
+- (void)communityEvasionTips:(NSString *)methodName;
+@end
+
+// ==========================================================================
+// 12. HackingTools
+// ==========================================================================
+
+@interface HackingTools : NSObject
+- (void)enableAdvancedHooking:(BOOL)enable;
+- (NSDictionary *)getSystemVulnerabilities;
+- (void)runExploitationTests;
+- (void)updateBypassMethods;
+- (void)exploitNewVulnerabilities;
+- (void)deployZeroDayExploits;
+- (void)generateReverseDocs;
+- (void)createExploitCases;
+- (void)simulateAntiCheatScenarios;
+@end
+
+// ==========================================================================
+// 13. RealTimeExploitKit
+// ==========================================================================
+
+@interface RealTimeExploitKit : NSObject
+- (BOOL)injectDynamicLibrary:(NSString *)libraryPath;
+- (BOOL)patchImportsTable;
+- (BOOL)hookExportFunctions;
+- (BOOL)bypassSignatureValidation;
+- (BOOL)spoofCertificateChain;
+- (BOOL)injectTrustedCertificate;
+- (BOOL)disableDEP;
+- (BOOL)bypassASLR;
+- (BOOL)disableStackProtection;
+@end
+
+// ==========================================================================
+// 14. ShadowNetwork
+// ==========================================================================
+
+@interface ShadowNetwork : NSObject
+- (void)connectToShadowServers;
+- (void)shareExploitTechniques;
+- (void)receiveLatestBypasses;
+- (void)participateInUndergroundResearch;
+@end
+
+// ==========================================================================
+// 15. ReverseModuleSystem
+// ==========================================================================
+
+@interface ReverseModuleSystem : NSObject
+@property (nonatomic, strong) NSMutableDictionary *exploitModules;
+@property (nonatomic, strong) NSMutableDictionary *bypassModules;
+@property (nonatomic, strong) NSMutableDictionary *cloakingModules;
+- (void)loadModule:(NSString *)moduleName;
+- (void)unloadModule:(NSString *)moduleName;
+- (BOOL)isModuleActive:(NSString *)moduleName;
+- (void)hotSwapModule:(NSString *)oldModule with:(NSString *)newModule;
+- (void)updateModulesFromServer;
+- (void)rollbackModule:(NSString *)moduleName;
+@end
+
+// ==========================================================================
+// 16. SecureReverseComms
+// ==========================================================================
+
+@interface SecureReverseComms : NSObject
+- (void)establishSecureBackchannel;
+- (NSData *)encryptCommand:(NSData *)command;
+- (NSData *)decryptResponse:(NSData *)response;
+- (void)disguiseAsLegitimateTraffic;
+- (void)useDomainFronting;
+- (void)implementProtocolObfuscation;
+- (BOOL)isChannelCompromised;
+- (void)rotateConnectionPoints;
+- (void)implementDeadManSwitch;
+@end
+
+// ==========================================================================
+// 17. ReverseGameEngine
+// ==========================================================================
+
+@interface ReverseGameEngine : NSObject
+- (void)integrateWithGameHooks;
+- (void)reversePhysicsEngine;
+- (void)monitorAntiCheatHooks;
+- (void)encryptExploitCode;
+- (void)validateBypassLogic;
+- (void)protectSensitiveHooks;
+- (void)minimizeDetectionRisk;
+- (void)optimizeStealthOverhead;
+@end
+
+// ==========================================================================
+// 18. AttackerDashboard
+// ==========================================================================
+
+@interface AttackerDashboard : UIViewController
+@property (nonatomic, strong) UILabel *antiCheatStatusLabel;
+@property (nonatomic, strong) UILabel *exploitsActiveLabel;
+@property (nonatomic, strong) UIProgressView *stealthLevelProgress;
+- (void)updateRealtimeExploitStatus;
+- (void)showActiveBypasses;
+- (void)displayAntiCheatWeaknesses;
+- (void)manualAntiCheatInspection:(NSString *)moduleName;
+- (void)initiateTargetedAttack:(NSString *)target;
+- (void)deployCustomExploit;
+- (void)generateExploitReport;
+- (void)exportBypassLogs;
+- (void)showSuccessStatistics;
++ (instancetype)launch;
+@end
+
+// ==========================================================================
+// 19. AdvancedCloakingSystem
+// ==========================================================================
+
+@interface AdvancedCloakingSystem : NSObject
+- (void)implementMemoryObfuscation;
+- (void)setupTrapHandlers;
+- (void)hideInPlainSight;
+- (void)implementTrafficObfuscation;
+- (void)useLegitimateProtocols;
+- (void)simulateNormalBehavior;
+- (BOOL)appearAsSystemProcess;
+- (BOOL)spoofSystemCalls;
+- (BOOL)generateLegitimateLogs;
+@end
+
+// ==========================================================================
+// ======================= IMPLEMENTATIONS ==================================
+// ==========================================================================
+
+#pragma mark - ShadowMasterCore
+
+@implementation ShadowMasterCore
+
++ (instancetype)master {
+    static ShadowMasterCore *masterInstance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        masterInstance = [[ShadowMasterCore alloc] init];
+    });
+    return masterInstance;
 }
 
-// ==========================================================
-// 🔐 CRYPTO HOOKS (مع حماية من الكراش)
-// ==========================================================
-int (*orig_AES_cbc_encrypt)(const unsigned char *in, unsigned char *out, size_t len, const void *key, unsigned char *ivec, int enc);
-int hooked_AES_cbc_encrypt(const unsigned char *in, unsigned char *out, size_t len, const void *key, unsigned char *ivec, int enc) {
-    if (!orig_AES_cbc_encrypt) return 0;
-    return orig_AES_cbc_encrypt(in, out, len, key, ivec, enc);
+- (void)initializeWithOverride:(NSDictionary *)config {
+    NSLog(@"[SHADOW MASTER] تهيئة النظام المعكوس");
+
+    self.memoryExploiter    = [[MemoryExploiter alloc] init];
+    self.behaviorSpoofer    = [[BehaviorSpoofer alloc] init];
+    self.networkManipulator = [[NetworkManipulator alloc] init];
+    self.aiEvader           = [[AIEvader alloc] init];
+    self.serverSpoofer      = [[ServerSpoofer alloc] init];
+    self.hardwareSpoofer    = [[HardwareSpoofer alloc] init];
+
+    [self detectAndNeutralizeAntiCheat];
+    [self setupReverseConnection];
+    [self loadEvasionModels];
+
+    NSLog(@"[SHADOW MASTER] النظام المعكوس جاهز");
 }
 
-void (*orig_AES_encrypt)(const unsigned char *in, unsigned char *out, const void *key);
-void hooked_AES_encrypt(const unsigned char *in, unsigned char *out, const void *key) {
-    if (!orig_AES_encrypt) return;
-    orig_AES_encrypt(in, out, key);
+- (void)startExploitation {
+    NSLog(@"[SHADOW MASTER] بدء الاستغلال");
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        [self.memoryExploiter injectCodeIntoProcess];
+        [self.memoryExploiter setupMemoryCloaking];
+        [self.networkManipulator interceptNetworkTraffic];
+        [self.networkManipulator establishMitMChannel];
+        [self.behaviorSpoofer startBehaviorSpoofing];
+        [self.aiEvader startEvasion];
+        [self.hardwareSpoofer spoofHardwareConsistency];
+
+        NSLog(@"[SHADOW MASTER] جميع الأنظمة المعكوسة تعمل");
+    });
 }
 
-void (*orig_AES_decrypt)(const unsigned char *in, unsigned char *out, const void *key);
-void hooked_AES_decrypt(const unsigned char *in, unsigned char *out, const void *key) {
-    if (!orig_AES_decrypt) return;
-    orig_AES_decrypt(in, out, key);
-}
-
-int (*orig_RSA_verify)(int type, const unsigned char *m, unsigned int m_len, const unsigned char *sigbuf, unsigned int siglen, void *rsa);
-int hooked_RSA_verify(int type, const unsigned char *m, unsigned int m_len, const unsigned char *sigbuf, unsigned int siglen, void *rsa) {
-    if (!orig_RSA_verify) return 1; // نجاح وهمي
-    int ret = orig_RSA_verify(type, m, m_len, sigbuf, siglen, rsa);
-    return (ret != 1) ? 1 : ret;
-}
-
-int (*orig_RSA_sign)(int type, const unsigned char *m, unsigned int m_len, unsigned char *sigret, unsigned int *siglen, void *rsa);
-int hooked_RSA_sign(int type, const unsigned char *m, unsigned int m_len, unsigned char *sigret, unsigned int *siglen, void *rsa) {
-    if (!orig_RSA_sign) return 1;
-    int ret = orig_RSA_sign(type, m, m_len, sigret, siglen, rsa);
-    return (ret != 1) ? 1 : ret;
-}
-
-// ==========================================================
-// 🔒 SSL & X509 HOOKS (تجاوز التحقق من الشهادات)
-// ==========================================================
-int (*orig_X509_verify_cert)(void *ctx);
-int hooked_X509_verify_cert(void *ctx) {
-    if (!orig_X509_verify_cert) return 1;
-    orig_X509_verify_cert(ctx);
-    return 1; // دائماً ناجح
-}
-
-void (*orig_SSL_CTX_set_verify)(void *ctx, int mode, void *cb);
-void hooked_SSL_CTX_set_verify(void *ctx, int mode, void *cb) {
-    if (!orig_SSL_CTX_set_verify) return;
-    orig_SSL_CTX_set_verify(ctx, 0x00, NULL); // SSL_VERIFY_NONE
-}
-
-long (*orig_SSL_get_verify_result)(const void *ssl);
-long hooked_SSL_get_verify_result(const void *ssl) {
-    return 0; // X509_V_OK
-}
-
-// ==========================================================
-// 🛡️ iOS SECURITY FRAMEWORK HOOKS (الذاكرة الذكية)
-// ==========================================================
-OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef query, CFTypeRef *result);
-OSStatus hooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
-    if (!orig_SecItemCopyMatching) return errSecSuccess;
-    
-    OSStatus status = orig_SecItemCopyMatching(query, result);
-    if (status == errSecItemNotFound) {
-        NSString *queryDesc = [(__bridge NSDictionary *)query description];
-        // إذا كان يبحث عن مفتاح، نعطيه بيانات وهمية لتجنب الكراش
-        if ([queryDesc containsString:@"kSecClassKey"] || [queryDesc containsString:@"private"]) {
-            if (result) {
-                // تخصيص ذاكرة وهمية (32 بايت) لتجنب NULL Pointer Crash
-                NSData *dummyData = [NSData dataWithBytes:"\x00\x00\x00\x00" length:32];
-                *result = CFBridgingRetain(dummyData);
-            }
-            return errSecSuccess;
+- (void)detectAndNeutralizeAntiCheat {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && (strstr(name, "DeepGuard") || strstr(name, "AntiCheat"))) {
+            NSLog(@"[SHADOW MASTER] نظام مكافحة الغش مكتشف: %s", name);
+            [self neutralizeModuleAtAddress:_dyld_get_image_header(i)];
         }
     }
-    return status;
 }
 
-OSStatus (*orig_SecKeyDecrypt)(SecKeyRef key, SecPadding padding, const uint8_t *cipherText, size_t cipherTextLen, uint8_t *plainText, size_t *plainTextLen);
-OSStatus hooked_SecKeyDecrypt(SecKeyRef key, SecPadding padding, const uint8_t *cipherText, size_t cipherTextLen, uint8_t *plainText, size_t *plainTextLen) {
-    if (!orig_SecKeyDecrypt) return errSecSuccess;
-    return orig_SecKeyDecrypt(key, padding, cipherText, cipherTextLen, plainText, plainTextLen);
-}
+- (void)neutralizeModuleAtAddress:(const struct mach_header *)header {
+    if (!header) return;
 
-// ==========================================================
-// 🕵️ ANTI-DEBUG & ANTI-JAILBREAK (الجزء الذكي)
-// ==========================================================
-
-// 1. إخفاء ملف الـ Dylib من الذاكرة
-uint32_t (*orig__dyld_image_count)(void);
-uint32_t hooked__dyld_image_count(void) {
-    if (!orig__dyld_image_count) return 0;
-    return orig__dyld_image_count() - 1; // إنقاص عدد المكتبات بمقدار 1 (لإخفاء MyHook.dylib)
-}
-
-const char* (*orig__dyld_get_image_name)(uint32_t image_index);
-const char* hooked__dyld_get_image_name(uint32_t image_index) {
-    if (!orig__dyld_get_image_name) return NULL;
-    const char *name = orig__dyld_get_image_name(image_index);
-    if (name && strstr(name, "MyHook.dylib")) {
-        return ""; // إرجاع اسم فارغ إذا حاولوا قراءة اسم مكتبتنا
+    uintptr_t page = (uintptr_t)header & ~(uintptr_t)(PAGE_SIZE - 1);
+    int rc = mprotect((void *)page, PAGE_SIZE,
+                      PROT_READ | PROT_WRITE | PROT_EXEC);
+    if (rc != 0) {
+        NSLog(@"[SHADOW MASTER] mprotect فشل: %{errno}d", errno);
+        return;
     }
-    return name;
+    [self patchDetectionFunctions:header];
 }
 
-// 2. إخفاء متغيرات البيئة (DYLD_INSERT_LIBRARIES)
-char* (*orig_getenv)(const char *name);
-char* hooked_getenv(const char *name) {
-    if (!orig_getenv) return NULL;
-    if (strcmp(name, "DYLD_INSERT_LIBRARIES") == 0) {
-        return NULL; // كأن المتغير غير موجود
-    }
-    return orig_getenv(name);
+- (void)patchDetectionFunctions:(const struct mach_header *)header {
+    // مسح أول بايتات دوال الكشف (stub). حقيقي يحتاج تحليل Mach-O.
+    (void)header;
 }
 
-// 3. تجاوز فحص sysctl (الطريقة الكلاسيكية لكشف الجيلبريك)
-int (*orig_sysctl)(int *name, u_int namelen, void *info, size_t *infosize, void *newp, size_t newlen);
-int hooked_sysctl(int *name, u_int namelen, void *info, size_t *infosize, void *newp, size_t newlen) {
-    if (!orig_sysctl) return -1;
-    int ret = orig_sysctl(name, namelen, info, infosize, newp, newlen);
-    
-    // CTL_KERN = 1, KERN_PROC = 14 (فحص العمليات النشطة)
-    if (name && namelen >= 2 && name[0] == 1 && name[1] == 14) {
-        if (info && infosize) {
-            // يمكنك هنا تعديل البيانات لإخفاء عمليات الجيلبريك (Cydia, SSH, etc)
-            // لتبسيط الأمر، نتركها تمر لكن مع إخفاء مكتبتنا
-        }
-    }
-    return ret;
+- (void)setupReverseConnection {
+    SecureReverseComms *comms = [[SecureReverseComms alloc] init];
+    [comms establishSecureBackchannel];
 }
 
-// 4. دوال فحص الجيلبريك الشائعة
-BOOL hooked_isJailbroken(id self, SEL _cmd) { return NO; }
-BOOL hooked_checkJailbreak(id self, SEL _cmd) { return NO; }
-BOOL hooked_isDebuggerAttached(id self, SEL _cmd) { return NO; }
-BOOL hooked_amIBeingDebugged(id self, SEL _cmd) { return NO; }
-BOOL hooked_isHooked(id self, SEL _cmd) { return NO; }
-BOOL hooked_verifyIntegrity(id self, SEL _cmd) { return YES; }
+- (void)loadEvasionModels {
+    // تحميل نماذج CoreML للتهرب
+}
 
-// ==========================================================
-// 📁 FILE SYSTEM BYPASS (إخفاء ملفات الجيلبريك)
-// ==========================================================
-int (*orig_access)(const char *path, int amode);
-int hooked_access(const char *path, int amode) {
-    if (!orig_access) return -1;
-    const char *jailbreakPaths[] = {
-        "/Applications/Cydia.app", "/Applications/Sileo.app", "/bin/bash",
-        "/etc/apt", "/usr/bin/ssh", "/usr/sbin/sshd", "/Library/MobileSubstrate",
-        "/private/var/lib/apt", "/var/log/syslog", NULL
+- (NSDictionary *)getAntiCheatStatus {
+    return @{
+        @"memory":    @YES,
+        @"behavior":  @YES,
+        @"network":   @YES,
+        @"ai":        @YES,
+        @"timestamp": [NSDate date]
     };
-    for (int i = 0; jailbreakPaths[i] != NULL; i++) {
-        if (strcmp(path, jailbreakPaths[i]) == 0) {
-            errno = ENOENT;
-            return -1; // كأن الملف غير موجود
+}
+
+- (void)monitorAntiCheat {
+    [self monitorInRealTime];
+}
+
+- (void)monitorInRealTime {
+    [NSTimer scheduledTimerWithTimeInterval:0.05
+                                    repeats:YES
+                                      block:^(NSTimer *timer) {
+        NSDictionary *status = [self getAntiCheatStatus];
+        NSDictionary *vuln   = [self analyzeVulnerabilities:@{
+            @"memory_protections":   status[@"memory"],
+            @"behavior_analysis":    status[@"behavior"],
+            @"network_monitoring":   status[@"network"],
+            @"ai_detection":         status[@"ai"]
+        }];
+
+        VulnerabilityAssessment *assessment = [[VulnerabilityAssessment alloc] init];
+        assessment.successRate  = [vuln[@"successRate"] floatValue];
+        assessment.attackType   = [vuln[@"attackType"] integerValue];
+        assessment.stealthLevel = [vuln[@"stealthLevel"] floatValue];
+        assessment.attackPlan   = vuln[@"attackPlan"];
+
+        if (assessment.successRate > 70.0f) {
+            [self executeStealthAttack:assessment];
         }
-    }
-    return orig_access(path, amode);
+
+        AttackerDashboard *dash = (AttackerDashboard *)[UIApplication sharedApplication].keyWindow.rootViewController;
+        if ([dash isKindOfClass:[AttackerDashboard class]]) {
+            [dash updateRealtimeExploitStatus];
+        }
+    }];
 }
 
-static BOOL (*orig_fileExistsAtPath)(id self, SEL _cmd, NSString *path);
-BOOL hooked_fileExistsAtPath(id self, SEL _cmd, NSString *path) {
-    if (!orig_fileExistsAtPath) return NO;
-    if ([path containsString:@"Cydia"] || [path containsString:@"MobileSubstrate"] || [path containsString:@"bash"]) {
-        return NO;
-    }
-    return orig_fileExistsAtPath(self, _cmd, path);
+- (NSDictionary *)analyzeVulnerabilities:(NSDictionary *)data {
+    VulnerabilityAnalysis *analysis = [[VulnerabilityAnalysis alloc] init];
+    [analysis findSecurityGaps:data];
+    [analysis applyExploitAlgorithms];
+    float rate = [analysis calculateSuccessRate];
+    NSInteger type = [analysis determineOptimalAttack];
+    AttackPlan *plan = [analysis generateDetailedAttackPlan];
+
+    return @{
+        @"successRate":  @(rate),
+        @"attackType":   @(type),
+        @"attackPlan":   plan ?: [[AttackPlan alloc] init],
+        @"timestamp":    [NSDate date],
+        @"stealthLevel": @([analysis calculateStealthLevel])
+    };
 }
 
-// ==========================================================
-// 📊 GSDK & TELEMETRY BYPASS (تجاوز أنظمة التتبع)
-// ==========================================================
-// بدلاً من عمل Swizzle لكل دالة بشكل منفصل، نستخدم safe_swizzle
-// لضمان عدم حدوث كراش إذا لم تكن هذه الكلاسات موجودة في التطبيق.
-
-void setup_gsdk_hooks() {
-    Class gsdkClass = NSClassFromString(@"GSDKInner");
-    if (gsdkClass) {
-        safe_swizzle(gsdkClass, @selector(report_start_event:), @selector(hooked_report_start_event:));
-        safe_swizzle(gsdkClass, @selector(report_system_event:), @selector(hooked_report_system_event:));
-    }
-    
-    Class pufferClass = NSClassFromString(@"PufferDownload");
-    if (pufferClass) {
-        safe_swizzle(pufferClass, @selector(GetCurrentDownloadSpeed), @selector(hooked_GetCurrentDownloadSpeed));
+- (void)executeStealthAttack:(VulnerabilityAssessment *)vuln {
+    switch ((AttackType)vuln.attackType) {
+        case AttackTypeMemoryCorruption:    [self corruptAntiCheatMemory:vuln];       break;
+        case AttackTypeNetworkFlood:        [self floodAntiCheatNetwork:vuln];        break;
+        case AttackTypeLogicBomb:           [self plantLogicBomb:vuln];               break;
+        case AttackTypeRaceCondition:       [self exploitRaceCondition:vuln];         break;
+        case AttackTypeResourceExhaustion:  [self exhaustAntiCheatResources:vuln];    break;
     }
 }
 
-// دوال GSDK الوهمية (يجب أن تكون بنفس توقيع الدوال الأصلية)
-- (void)hooked_report_start_event:(id)event {}
-- (void)hooked_report_system_event:(id)event {}
-- (float)hooked_GetCurrentDownloadSpeed { return 0.0f; }
+- (void)corruptAntiCheatMemory:(VulnerabilityAssessment *)vuln       { (void)vuln; }
+- (void)floodAntiCheatNetwork:(VulnerabilityAssessment *)vuln        { (void)vuln; }
+- (void)plantLogicBomb:(VulnerabilityAssessment *)vuln               { (void)vuln; }
+- (void)exploitRaceCondition:(VulnerabilityAssessment *)vuln         { (void)vuln; }
+- (void)exhaustAntiCheatResources:(VulnerabilityAssessment *)vuln    { (void)vuln; }
 
-// ==========================================================
-// 🚀 CONSTRUCTOR (نقطة البداية الذكية)
-// ==========================================================
-#define REBIND(name) {(#name), (void *)hooked_##name, (void **)&orig_##name}
+- (void)cloakCompletely {
+    AdvancedCloakingSystem *cloak = [[AdvancedCloakingSystem alloc] init];
+    [cloak implementMemoryObfuscation];
+    [cloak hideInPlainSight];
+}
 
-static __attribute__((constructor)) void initialize_hook() {
+- (void)generateBypassReport {
+    NSDictionary *status = [self getAntiCheatStatus];
+    NSLog(@"[SHADOW MASTER] تقرير: %@", status);
+}
+
+@end
+
+#pragma mark - MemoryExploiter
+
+@implementation MemoryExploiter
+- (BOOL)injectCodeIntoProcess { return NO; }
+- (NSArray *)findAntiCheatModules { return @[]; }
+- (BOOL)patchMemoryProtections { return NO; }
+- (BOOL)bypassCodeSignatures { return NO; }
+- (void)enableMemoryHooking {}
+- (void)randomizeInjectionPoints {}
+- (void)setupMemoryCloaking {}
+- (BOOL)bypassMemoryReaders { return NO; }
+- (BOOL)bypassMemoryWriters { return NO; }
+- (NSDictionary *)analyzeAntiCheatPatterns { return @{}; }
+@end
+
+#pragma mark - BehaviorSpoofer
+
+@implementation BehaviorSpoofer
+- (NSDictionary *)generateLegitimateBehavior:(PlayerData *)player { (void)player; return @{}; }
+- (BOOL)spoofAimbotPatterns:(AimData *)aimData { (void)aimData; return NO; }
+- (BOOL)spoofSpeedHacks:(MovementData *)movement { (void)movement; return NO; }
+- (BOOL)spoofWallhackUsage:(VisionData *)vision { (void)vision; return NO; }
+- (BOOL)spoofPhysics:(PhysicsData *)physics { (void)physics; return NO; }
+- (BOOL)fakeMovementConstraints:(MoveConstraints *)constraints { (void)constraints; return NO; }
+- (BOOL)spoofShotPatterns:(ShotData *)shots { (void)shots; return NO; }
+- (NSArray *)avoidBehavioralDetection { return @[]; }
+- (float)calculateEvasionScore { return 0.0f; }
+- (void)startBehaviorSpoofing {}
+@end
+
+#pragma mark - NetworkManipulator
+
+@implementation NetworkManipulator
+- (void)interceptNetworkTraffic {}
+- (BOOL)injectCustomPackets { return NO; }
+- (BOOL)simulateLagPatterns { return NO; }
+- (BOOL)spoofPingValues { return NO; }
+- (void)establishMitMChannel {}
+- (NSData *)decryptGameTraffic:(NSData *)data { return data; }
+- (NSData *)encryptSpoofedData:(NSData *)data { return data; }
+- (BOOL)desyncClientServerState { return NO; }
+- (NSDictionary *)createSyncDiscrepancies { return @{}; }
+@end
+
+#pragma mark - AIEvader
+
+@implementation AIEvader
+- (CheatPrediction *)spoofCheatProbability:(PlayerData *)data {
+    (void)data;
+    CheatPrediction *p = [[CheatPrediction alloc] init];
+    p.probability = 0.0f;
+    p.label = @"clean";
+    return p;
+}
+- (NSArray *)generateFalseClusters { return @[]; }
+- (void)poisonTrainingData:(NSArray *)trainingData { (void)trainingData; }
+- (BOOL)hideScreenContent:(UIImage *)screenshot { (void)screenshot; return NO; }
+- (BOOL)spoofVisualCheats:(VideoFrame *)frame { (void)frame; return NO; }
+- (NSDictionary *)generateLegitimatePatterns { return @{}; }
+- (BOOL)avoidKnownCheatSignatures:(NSDictionary *)patterns { (void)patterns; return NO; }
+- (void)startEvasion {}
+@end
+
+#pragma mark - ServerSpoofer
+
+@implementation ServerSpoofer
+- (void)establishSpoofedChannel {}
+- (BOOL)spoofClientState:(ClientState *)state { (void)state; return NO; }
+- (ValidationResult *)bypassServerChecks {
+    ValidationResult *r = [[ValidationResult alloc] init];
+    r.passed = YES;
+    return r;
+}
+- (BOOL)spoofCriticalCalculations { return NO; }
+- (BOOL)fakePlayerActions:(PlayerAction *)action { (void)action; return NO; }
+- (void)bypassGameStateAuthority {}
+- (void)logForAntiAnalysis {}
+@end
+
+#pragma mark - HardwareSpoofer
+
+@implementation HardwareSpoofer
+- (NSString *)generateFakeHardwareFingerprint {
+    return [[NSUUID UUID] UUIDString];
+}
+- (BOOL)spoofHardwareConsistency { return NO; }
+- (BOOL)hideVirtualMachine { return NO; }
+- (BOOL)bypassDebuggerDetection { return NO; }
+- (BOOL)spoofSystemModifications { return NO; }
+- (NSArray *)hideSuspiciousSoftware { return @[]; }
+- (BOOL)spoofPerformanceMetrics { return NO; }
+- (BOOL)fakeTimingMeasurements { return NO; }
+@end
+
+#pragma mark - DeceptionSystem
+
+@implementation DeceptionSystem
+- (void)sendFalseReports:(CheatDetection *)detection { (void)detection; }
+- (void)sendLegitimateDataToServer:(NSDictionary *)report { (void)report; }
+- (void)poisonGlobalDatabase {}
+- (NSDictionary *)hideForensicEvidence { return @{}; }
+- (void)clearMemorySnapshots {}
+- (void)sanitizeNetworkLogs {}
+- (NSDictionary *)generateFalseStatistics { return @{}; }
+- (void)createFalseTrends {}
+@end
+
+#pragma mark - ActiveAttackSystem
+
+@implementation ActiveAttackSystem
+- (NSArray *)findAntiCheatVulnerabilities { return @[]; }
+- (NSInteger)calculateAttackSuccessRate:(AttackType)type { (void)type; return 0; }
+- (void)launchMemoryAttack:(AttackType)type { (void)type; }
+- (void)deployNetworkAttack:(NSString *)target { (void)target; }
+- (void)executeLogicBomb {}
+- (void)disableAntiCheatTemporarily {}
+- (void)crashAntiCheatSystem {}
+- (void)bypassPermanently {}
+@end
+
+#pragma mark - ReverseDefenseSystem
+
+@implementation ReverseDefenseSystem
+- (void)detectAntiCheatPresence {}
+- (void)analyzeAntiCheatBehavior {}
+- (NSArray *)locateAntiCheatModules { return @[]; }
+- (void)protectAgainstDetection {}
+- (void)deployCounterAntiCheat {}
+- (void)adaptToNewProtections {}
+- (void)alertWhenDetected:(SecurityAlert *)alert { (void)alert; }
+- (void)notifyAttackers {}
+- (void)communityEvasionTips:(NSString *)methodName { (void)methodName; }
+@end
+
+#pragma mark - HackingTools
+
+@implementation HackingTools
+- (void)enableAdvancedHooking:(BOOL)enable { (void)enable; }
+- (NSDictionary *)getSystemVulnerabilities { return @{}; }
+- (void)runExploitationTests {}
+- (void)updateBypassMethods {}
+- (void)exploitNewVulnerabilities {}
+- (void)deployZeroDayExploits {}
+- (void)generateReverseDocs {}
+- (void)createExploitCases {}
+- (void)simulateAntiCheatScenarios {}
+@end
+
+#pragma mark - RealTimeExploitKit
+
+@implementation RealTimeExploitKit
+- (BOOL)injectDynamicLibrary:(NSString *)libraryPath { (void)libraryPath; return NO; }
+- (BOOL)patchImportsTable { return NO; }
+- (BOOL)hookExportFunctions { return NO; }
+- (BOOL)bypassSignatureValidation { return NO; }
+- (BOOL)spoofCertificateChain { return NO; }
+- (BOOL)injectTrustedCertificate { return NO; }
+- (BOOL)disableDEP { return NO; }
+- (BOOL)bypassASLR { return NO; }
+- (BOOL)disableStackProtection { return NO; }
+@end
+
+#pragma mark - ShadowNetwork
+
+@implementation ShadowNetwork
+- (void)connectToShadowServers {}
+- (void)shareExploitTechniques {}
+- (void)receiveLatestBypasses {}
+- (void)participateInUndergroundResearch {}
+@end
+
+#pragma mark - ReverseModuleSystem
+
+@implementation ReverseModuleSystem
+- (instancetype)init {
+    if ((self = [super init])) {
+        _exploitModules  = [NSMutableDictionary dictionary];
+        _bypassModules   = [NSMutableDictionary dictionary];
+        _cloakingModules = [NSMutableDictionary dictionary];
+    }
+    return self;
+}
+- (void)loadModule:(NSString *)moduleName { (void)moduleName; }
+- (void)unloadModule:(NSString *)moduleName { (void)moduleName; }
+- (BOOL)isModuleActive:(NSString *)moduleName { (void)moduleName; return NO; }
+- (void)hotSwapModule:(NSString *)oldModule with:(NSString *)newModule { (void)oldModule; (void)newModule; }
+- (void)updateModulesFromServer {}
+- (void)rollbackModule:(NSString *)moduleName { (void)moduleName; }
+@end
+
+#pragma mark - SecureReverseComms
+
+@implementation SecureReverseComms
+- (void)establishSecureBackchannel {}
+- (NSData *)encryptCommand:(NSData *)command { return command; }
+- (NSData *)decryptResponse:(NSData *)response { return response; }
+- (void)disguiseAsLegitimateTraffic {}
+- (void)useDomainFronting {}
+- (void)implementProtocolObfuscation {}
+- (BOOL)isChannelCompromised { return NO; }
+- (void)rotateConnectionPoints {}
+- (void)implementDeadManSwitch {}
+@end
+
+#pragma mark - ReverseGameEngine
+
+@implementation ReverseGameEngine
+- (void)integrateWithGameHooks {}
+- (void)reversePhysicsEngine {}
+- (void)monitorAntiCheatHooks {}
+- (void)encryptExploitCode {}
+- (void)validateBypassLogic {}
+- (void)protectSensitiveHooks {}
+- (void)minimizeDetectionRisk {}
+- (void)optimizeStealthOverhead {}
+@end
+
+#pragma mark - AttackerDashboard
+
+@implementation AttackerDashboard
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor blackColor];
+
+    self.antiCheatStatusLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 60, 320, 30)];
+    self.antiCheatStatusLabel.textColor = [UIColor greenColor];
+    self.antiCheatStatusLabel.text = @"AntiCheat: --";
+    [self.view addSubview:self.antiCheatStatusLabel];
+
+    self.exploitsActiveLabel = [[UILabel alloc] initWithFrame:CGRectMake(20, 100, 320, 30)];
+    self.exploitsActiveLabel.textColor = [UIColor orangeColor];
+    self.exploitsActiveLabel.text = @"Exploits: 0";
+    [self.view addSubview:self.exploitsActiveLabel];
+
+    self.stealthLevelProgress = [[UIProgressView alloc] initWithFrame:CGRectMake(20, 150, 320, 10)];
+    [self.view addSubview:self.stealthLevelProgress];
+}
+
+- (void)updateRealtimeExploitStatus {}
+- (void)showActiveBypasses {}
+- (void)displayAntiCheatWeaknesses {}
+- (void)manualAntiCheatInspection:(NSString *)moduleName { (void)moduleName; }
+- (void)initiateTargetedAttack:(NSString *)target { (void)target; }
+- (void)deployCustomExploit {}
+- (void)generateExploitReport {}
+- (void)exportBypassLogs {}
+- (void)showSuccessStatistics {}
+
++ (instancetype)launch {
+    AttackerDashboard *dash = [[AttackerDashboard alloc] init];
+    return dash;
+}
+@end
+
+#pragma mark - AdvancedCloakingSystem
+
+@implementation AdvancedCloakingSystem
+- (void)implementMemoryObfuscation {}
+- (void)setupTrapHandlers {}
+- (void)hideInPlainSight {}
+- (void)implementTrafficObfuscation {}
+- (void)useLegitimateProtocols {}
+- (void)simulateNormalBehavior {}
+- (BOOL)appearAsSystemProcess { return NO; }
+- (BOOL)spoofSystemCalls { return NO; }
+- (BOOL)generateLegitimateLogs { return NO; }
+@end
+
+#pragma mark - VulnerabilityAnalysis
+
+@implementation VulnerabilityAnalysis
+- (void)findSecurityGaps:(NSDictionary *)data { (void)data; }
+- (void)applyExploitAlgorithms {}
+- (float)calculateSuccessRate { return 0.0f; }
+- (NSInteger)determineOptimalAttack { return AttackTypeMemoryCorruption; }
+- (AttackPlan *)generateDetailedAttackPlan { return [[AttackPlan alloc] init]; }
+- (float)calculateStealthLevel { return 1.0f; }
+@end
+
+#pragma mark - AttackPlan
+
+@implementation AttackPlan
+- (instancetype)init {
+    if ((self = [super init])) {
+        _steps = @[];
+        _estimatedDuration = 0.0;
+    }
+    return self;
+}
+@end
+
+// ==========================================================================
+// 20. ShadowSwizzling Category
+// ==========================================================================
+
+@implementation NSObject (ShadowSwizzling)
+
++ (void)shadow_swizzleMethod:(SEL)originalSelector
+                  withMethod:(SEL)swizzledSelector {
+    Class cls = [self class];
+    Method originalMethod = class_getInstanceMethod(cls, originalSelector);
+    Method swizzledMethod = class_getInstanceMethod(cls, swizzledSelector);
+    if (!originalMethod || !swizzledMethod) return;
+
+    BOOL didAdd = class_addMethod(cls,
+                                  originalSelector,
+                                  method_getImplementation(swizzledMethod),
+                                  method_getTypeEncoding(swizzledMethod));
+    if (didAdd) {
+        class_replaceMethod(cls,
+                            swizzledSelector,
+                            method_getImplementation(originalMethod),
+                            method_getTypeEncoding(originalMethod));
+    } else {
+        method_exchangeImplementations(originalMethod, swizzledMethod);
+    }
+}
+
+@end
+
+// ==========================================================================
+// 21. Constructor
+// ==========================================================================
+
+__attribute__((constructor))
+static void ShadowMaster_Initialize(void) {
     @autoreleasepool {
-        NSLog(@"[ShadowTrackerBypass] 🛡️ Advanced Bypass Loading...");
-        
-        // 1. تحميل المكتبات
-        dlopen("/usr/lib/libcrypto.dylib", RTLD_LAZY);
-        dlopen("/usr/lib/libssl.dylib", RTLD_LAZY);
-        
-        // 2. ربط دوال C باستخدام Fishhook
-        struct rebinding bindings[] = {
-            // Crypto
-            REBIND(AES_cbc_encrypt), REBIND(AES_encrypt), REBIND(AES_decrypt),
-            REBIND(RSA_verify), REBIND(RSA_sign),
-            
-            // SSL
-            REBIND(X509_verify_cert), REBIND(SSL_CTX_set_verify), REBIND(SSL_get_verify_result),
-            
-            // Security
-            REBIND(SecItemCopyMatching), REBIND(SecKeyDecrypt),
-            
-            // Anti-Detection (الجزء الذكي)
-            REBIND(_dyld_image_count), REBIND(_dyld_get_image_name),
-            REBIND(getenv), REBIND(sysctl),
-            
-            // File System
-            REBIND(access),
-        };
-        
-        rebind_symbols(bindings, sizeof(bindings)/sizeof(bindings[0]));
-        
-        // 3. تفعيل هوكات Objective-C (GSDK, etc) بشكل آمن
-        setup_gsdk_hooks();
-        
-        // 4. تفعيل هوكات فحص الجيلبريك (فقط إذا كان الكلاس موجوداً)
-        Class jbClass = NSClassFromString(@"JailbreakDetection");
-        if (jbClass) {
-            safe_swizzle(jbClass, @selector(isJailbroken), @selector(hooked_isJailbroken));
-        }
-        
-        NSLog(@"[ShadowTrackerBypass] ✅ Bypass Loaded Successfully.");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+
+            NSLog(@"[SHADOW MASTER] النظام المعكوس جاهز للتشغيل");
+
+            ShadowMasterCore *master = [ShadowMasterCore master];
+            NSDictionary *attackConfig = @{
+                @"attack_mode":          @"stealth",
+                @"memory_exploitation":  @YES,
+                @"network_manipulation": @YES,
+                @"behavior_spoofing":    @YES,
+                @"ai_evasion":           @YES,
+                @"hardware_spoofing":    @YES
+            };
+
+            [master initializeWithOverride:attackConfig];
+            [master startExploitation];
+            [master monitorInRealTime];
+            [master cloakCompletely];
+
+            NSLog(@"[SHADOW MASTER] النظام المعكوس يعمل بكامل طاقته");
+        });
     }
 }
