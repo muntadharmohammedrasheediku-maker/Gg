@@ -1,19 +1,5 @@
 // ============================================================================
-// ShadowMonitor XK v1.1.1 — iOS 14+ arm64 — ملف واحد كامل
-//
-// تصحيح v1.1.1:
-//   - @available(iOS 16.0, *) حول detentWithIdentifier:resolver:
-//   - fallback إلى largeDetent لـiOS 15
-//   - يجمع كل إصلاحات v1.1 (11 خطأ + 4 حمايات)
-//
-// البناء:
-//   SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-//   clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=14.0 \
-//         -fobjc-arc -fblocks -O2 -dynamiclib \
-//         -Wno-nullability-completeness -Wno-deprecated-declarations \
-//         ShadowMonitorXK.m \
-//         -framework Foundation -framework UIKit -framework Security \
-//         -o ShadowMonitorXK.dylib
+// ShadowMonitor XK v2.0 — iOS 14+ arm64 — تشفير مدمج
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -30,10 +16,7 @@
 #import <sys/mman.h>
 #import <unistd.h>
 #import <sys/socket.h>
-
-// ============================================================================
-// 0. ثوابت
-// ============================================================================
+#import "defcrypto_bridge.h"
 
 static const NSInteger kSMMaxEntries    = 800;
 static const NSInteger kSMSockSampleCap = 80;
@@ -41,7 +24,32 @@ static const NSInteger kSMDyldSampleCap = 60;
 static const NSInteger kSMMaxDetail     = 220;
 
 // ============================================================================
-// 1. fishhook مصغّر — rebind C symbols via GOT
+// 0b. مساعد التشفير
+// ============================================================================
+
+static NSString *SMEncryptText(NSString *text) {
+    if (!text.length || text.length > 4000) return text;
+    const char *bid = [[NSBundle mainBundle].bundleIdentifier ?: @"sbxk"] UTF8String;
+    const uint8_t *pwd = (const uint8_t *)bid;
+    size_t pwd_len = strlen(bid);
+    const uint8_t *pt = (const uint8_t *)text.UTF8String;
+    size_t pt_len = strlen((const char *)pt);
+    uint8_t buf[8192];
+    size_t blen = 0;
+    if (sbxk_encrypt_pwd(pt, pt_len, pwd, pwd_len, NULL, 0,
+                         buf, sizeof(buf), &blen) == 0) {
+        NSMutableString *hex = [NSMutableString stringWithCapacity:blen * 2];
+        for (size_t i = 0; i < blen && i < 24; i++) {
+            [hex appendFormat:@"%02x", buf[i]];
+        }
+        return [NSString stringWithFormat:@"[🔒 %luB %@…]",
+                (unsigned long)blen, hex];
+    }
+    return @"[enc-fail]";
+}
+
+// ============================================================================
+// 1. fishhook مصغّر
 // ============================================================================
 
 struct sm_rb { const char *name; void *repl; void **replaced; };
@@ -139,6 +147,7 @@ typedef NS_ENUM(NSInteger, SMKind) {
 @property (nonatomic, copy)   NSString *detail;
 @property (nonatomic, strong) NSDate *time;
 @property (nonatomic, assign) BOOL flagged;
+@property (nonatomic, assign) BOOL encrypted;
 @end
 @implementation SMEntry @end
 
@@ -199,11 +208,24 @@ typedef NS_ENUM(NSInteger, SMKind) {
 
 - (void)add:(SMKind)k text:(NSString *)t detail:(NSString *)d flagged:(BOOL)f {
     if (self.paused) return;
+
+    // تشفير النص الحساس
+    NSString *storedDetail = d ?: @"";
+    BOOL encrypted = NO;
+    if (d.length > 0 && d.length < 4000) {
+        NSString *enc = SMEncryptText(d);
+        if (![enc hasPrefix:@"[enc-fail]"]) {
+            storedDetail = enc;
+            encrypted = YES;
+        }
+    }
+
     SMEntry *e = [SMEntry new];
     e.kind = k;
     e.text = t ?: @"";
-    e.detail = d ?: @"";
+    e.detail = storedDetail;
     e.flagged = f;
+    e.encrypted = encrypted;
     e.time = [NSDate date];
     @synchronized (self) {
         [_entries insertObject:e atIndex:0];
@@ -258,7 +280,6 @@ static BOOL sm_isAntiCheatPath(NSString *path) {
     if (path.length > 70) path = [[path substringToIndex:70] stringByAppendingString:@"…"];
 
     BOOL isAC = sm_isAntiCheatPath(path);
-
     NSString *line = [NSString stringWithFormat:@"%@ %@", method, path];
     NSString *det  = [NSString stringWithFormat:@"host=%@", host];
 
@@ -302,8 +323,7 @@ static atomic_int g_sockSample = 0;
 static atomic_int g_sslSample  = 0;
 
 static BOOL sm_isTCP(int fd) {
-    int type = 0;
-    socklen_t len = sizeof(type);
+    int type = 0; socklen_t len = sizeof(type);
     if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) != 0) return NO;
     return type == SOCK_STREAM;
 }
@@ -323,7 +343,6 @@ static OSStatus SM_SSLWrite(void *ctx, const void *data, size_t len, size_t *pro
         NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
         if (!s) s = [[NSString alloc] initWithData:d encoding:NSISOLatin1StringEncoding];
         if (!s) s = @"";
-
         NSString *clean = [[s stringByReplacingOccurrencesOfString:@"\n" withString:@" "]
                               stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
         NSString *low = clean.lowercaseString;
@@ -334,11 +353,9 @@ static OSStatus SM_SSLWrite(void *ctx, const void *data, size_t len, size_t *pro
             if ([low containsString:kw]) { sens = YES; break; }
         }
         if (clean.length > kSMMaxDetail) clean = [clean substringToIndex:kSMMaxDetail];
-
         [[SMLog shared] add:SMKindSSL
                        text:[NSString stringWithFormat:@"SSLWrite %zu bytes", len]
-                     detail:clean
-                    flagged:sens];
+                     detail:clean flagged:sens];
     }
     return orig_SSLWrite(ctx, data, len, processed);
 }
@@ -349,8 +366,7 @@ static ssize_t SM_write(int fd, const void *buf, size_t n) {
         if (sm_isTCP(fd)) {
             [[SMLog shared] add:SMKindSock
                            text:[NSString stringWithFormat:@"write fd=%d n=%zu", fd, n]
-                         detail:@"TCP stream"
-                        flagged:NO];
+                         detail:@"TCP stream" flagged:NO];
         }
     }
     return orig_write(fd, buf, n);
@@ -362,15 +378,14 @@ static ssize_t SM_send(int fd, const void *buf, size_t n, int flags) {
         if (sm_isTCP(fd)) {
             [[SMLog shared] add:SMKindSock
                            text:[NSString stringWithFormat:@"send fd=%d n=%zu", fd, n]
-                         detail:@"TCP stream"
-                        flagged:NO];
+                         detail:@"TCP stream" flagged:NO];
         }
     }
     return orig_send(fd, buf, n, flags);
 }
 
 // ============================================================================
-// 5. اعتراض dyld image APIs
+// 5. dyld image APIs
 // ============================================================================
 
 typedef uint32_t (*dyld_count_t)(void);
@@ -380,16 +395,14 @@ typedef const struct mach_header *(*dyld_hdr_t)(uint32_t);
 static dyld_count_t orig_dyld_count;
 static dyld_name_t  orig_dyld_name;
 static dyld_hdr_t   orig_dyld_hdr;
-
-static atomic_int g_dyldSample = 0;
+static atomic_int   g_dyldSample = 0;
 
 static uint32_t SM_dyld_count(void) {
     uint32_t r = orig_dyld_count ? orig_dyld_count() : 0;
     if (sm_shouldSample(&g_dyldSample, kSMDyldSampleCap)) {
         [[SMLog shared] add:SMKindDyld
                        text:[NSString stringWithFormat:@"_dyld_image_count → %u", r]
-                     detail:@"فحص قائمة الصور"
-                    flagged:NO];
+                     detail:@"فحص قائمة الصور" flagged:NO];
     }
     return r;
 }
@@ -407,8 +420,7 @@ static const char *SM_dyld_name(uint32_t idx) {
         }
         [[SMLog shared] add:SMKindDyld
                        text:[NSString stringWithFormat:@"_dyld_get_image_name(%u)", idx]
-                     detail:nm
-                    flagged:sus];
+                     detail:nm flagged:sus];
     }
     return r;
 }
@@ -418,15 +430,10 @@ static const struct mach_header *SM_dyld_hdr(uint32_t idx) {
     if (r && sm_shouldSample(&g_dyldSample, kSMDyldSampleCap * 3)) {
         [[SMLog shared] add:SMKindDyld
                        text:[NSString stringWithFormat:@"_dyld_get_image_header(%u)", idx]
-                     detail:@"قراءة بنية Mach-O"
-                    flagged:NO];
+                     detail:@"قراءة بنية Mach-O" flagged:NO];
     }
     return r;
 }
-
-// ============================================================================
-// 6. قائمة الدوال المعترَضة
-// ============================================================================
 
 static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     return @[
@@ -437,11 +444,13 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
         @{@"name": @"_dyld_image_count",                 @"lib": @"dyld",       @"cat": @"dyld"},
         @{@"name": @"_dyld_get_image_name",              @"lib": @"dyld",       @"cat": @"dyld"},
         @{@"name": @"_dyld_get_image_header",            @"lib": @"dyld",       @"cat": @"dyld"},
+        @{@"name": @"defcrypto.sbxk_encrypt_pwd",        @"lib": @"OpenSSL",    @"cat": @"Crypto"},
+        @{@"name": @"defcrypto.sbxk_decrypt_pwd",        @"lib": @"OpenSSL",    @"cat": @"Crypto"},
     ];
 }
 
 // ============================================================================
-// 7. الخلية
+// 6. الخلية
 // ============================================================================
 
 @interface SMCell : UITableViewCell
@@ -457,7 +466,6 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
     if (!self) return nil;
-
     self.backgroundColor = [UIColor clearColor];
     self.selectionStyle = UITableViewCellSelectionStyleNone;
 
@@ -529,6 +537,13 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
         default:         c = [UIColor colorWithWhite:0.5 alpha:1]; break;
     }
     _dot.backgroundColor = c;
+
+    if (e.encrypted) {
+        _detailLbl.textColor = [UIColor colorWithRed:0.40 green:0.90 blue:0.90 alpha:1];
+    } else {
+        _detailLbl.textColor = [UIColor colorWithWhite:0.65 alpha:1];
+    }
+
     if (e.flagged) {
         _textLbl.textColor = [UIColor colorWithRed:1.0 green:0.36 blue:0.32 alpha:1];
     } else {
@@ -538,7 +553,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 @end
 
 // ============================================================================
-// 8. الزر العائم
+// 7. الزر العائم
 // ============================================================================
 
 @interface SMFab : UIView
@@ -555,7 +570,6 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (!self) return nil;
-
     self.backgroundColor = [UIColor clearColor];
 
     _inner = [UIView new];
@@ -595,10 +609,8 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
         [_inner.bottomAnchor   constraintEqualToAnchor:self.bottomAnchor],
         [_inner.leadingAnchor  constraintEqualToAnchor:self.leadingAnchor],
         [_inner.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
-
         [_glyph.centerXAnchor constraintEqualToAnchor:_inner.centerXAnchor],
         [_glyph.centerYAnchor constraintEqualToAnchor:_inner.centerYAnchor],
-
         [_badge.topAnchor       constraintEqualToAnchor:self.topAnchor constant:-4],
         [_badge.trailingAnchor  constraintEqualToAnchor:self.trailingAnchor constant:4],
         [_badge.heightAnchor     constraintEqualToConstant:18],
@@ -608,7 +620,6 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc]
                                     initWithTarget:self action:@selector(_handleTap)];
     [self addGestureRecognizer:tap];
-
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
                                     initWithTarget:self action:@selector(_handlePan:)];
     [self addGestureRecognizer:pan];
@@ -622,18 +633,14 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 }
 
 - (void)_handlePan:(UIPanGestureRecognizer *)g {
-    UIView *sv = self.superview;
-    if (!sv) return;
+    UIView *sv = self.superview; if (!sv) return;
     CGPoint t = [g translationInView:sv];
     CGPoint c = self.center;
-    c.x += t.x;
-    c.y += t.y;
-
+    c.x += t.x; c.y += t.y;
     CGFloat hw = self.bounds.size.width / 2;
     CGFloat hh = self.bounds.size.height / 2;
     c.x = MAX(hw + 8, MIN(sv.bounds.size.width - hw - 8, c.x));
     c.y = MAX(hh + 80, MIN(sv.bounds.size.height - hh - 40, c.y));
-
     self.center = c;
     [g setTranslation:CGPointZero inView:sv];
 }
@@ -645,11 +652,10 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 @end
 
 // ============================================================================
-// 9. اللوحة الرئيسية
+// 8. اللوحة الرئيسية
 // ============================================================================
 
 @interface SMPanel : UIViewController <UITableViewDataSource, UITableViewDelegate, SMLogObserver>
-
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) UIVisualEffectView *blur;
 @property (nonatomic, strong) UILabel *titleLbl;
@@ -661,14 +667,11 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 @property (nonatomic, strong) UILabel *cntSockLbl;
 @property (nonatomic, strong) UIButton *pauseBtn;
 @property (nonatomic, assign) NSInteger filterIdx;
-
 @end
 
 @implementation SMPanel
 
-- (void)dealloc {
-    [[SMLog shared] removeObserver:self];
-}
+- (void)dealloc { [[SMLog shared] removeObserver:self]; }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -755,8 +758,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
                                    action:@selector(_clear)];
     _pauseBtn = [self _toolButton:@"إيقاف" color:[UIColor colorWithRed:1.0 green:0.58 blue:0.00 alpha:1]
                            action:@selector(_pause)];
-    UIButton *copyB = [self _toolButton:@"نسخ JSON" color:[UIColor colorWithRed:0.04 green:0.52 blue:1.0 alpha:1]
-                                 action:@selector(_copy)];
+    UIButton *copyB = [self _toolButton:@"نسخ JSON" color:cURL action:@selector(_copy)];
     [toolStack addArrangedSubview:clearB];
     [toolStack addArrangedSubview:_pauseBtn];
     [toolStack addArrangedSubview:copyB];
@@ -767,37 +769,29 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
         [_blur.bottomAnchor   constraintEqualToAnchor:self.view.bottomAnchor],
         [_blur.leadingAnchor  constraintEqualToAnchor:self.view.leadingAnchor],
         [_blur.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-
         [bg.topAnchor      constraintEqualToAnchor:_blur.contentView.topAnchor],
         [bg.bottomAnchor   constraintEqualToAnchor:_blur.contentView.bottomAnchor],
         [bg.leadingAnchor  constraintEqualToAnchor:_blur.contentView.leadingAnchor],
         [bg.trailingAnchor constraintEqualToAnchor:_blur.contentView.trailingAnchor],
-
         [_titleLbl.topAnchor     constraintEqualToAnchor:safe.topAnchor constant:16],
         [_titleLbl.leadingAnchor constraintEqualToAnchor:_blur.contentView.leadingAnchor constant:20],
-
         [_statusLbl.topAnchor     constraintEqualToAnchor:_titleLbl.bottomAnchor constant:2],
         [_statusLbl.leadingAnchor constraintEqualToAnchor:_titleLbl.leadingAnchor],
-
         [close.topAnchor     constraintEqualToAnchor:_titleLbl.topAnchor],
         [close.trailingAnchor constraintEqualToAnchor:_blur.contentView.trailingAnchor constant:-16],
         [close.widthAnchor   constraintEqualToConstant:36],
         [close.heightAnchor  constraintEqualToConstant:36],
-
         [statStack.topAnchor      constraintEqualToAnchor:_statusLbl.bottomAnchor constant:16],
         [statStack.leadingAnchor  constraintEqualToAnchor:_blur.contentView.leadingAnchor constant:16],
         [statStack.trailingAnchor constraintEqualToAnchor:_blur.contentView.trailingAnchor constant:-16],
         [statStack.heightAnchor   constraintEqualToConstant:64],
-
         [_filter.topAnchor      constraintEqualToAnchor:statStack.bottomAnchor constant:12],
         [_filter.leadingAnchor  constraintEqualToAnchor:_blur.contentView.leadingAnchor constant:16],
         [_filter.trailingAnchor constraintEqualToAnchor:_blur.contentView.trailingAnchor constant:-16],
-
         [_table.topAnchor      constraintEqualToAnchor:_filter.bottomAnchor constant:8],
         [_table.leadingAnchor  constraintEqualToAnchor:_blur.contentView.leadingAnchor],
         [_table.trailingAnchor constraintEqualToAnchor:_blur.contentView.trailingAnchor],
         [_table.bottomAnchor   constraintEqualToAnchor:toolStack.topAnchor constant:-8],
-
         [toolStack.leadingAnchor   constraintEqualToAnchor:_blur.contentView.leadingAnchor constant:16],
         [toolStack.trailingAnchor  constraintEqualToAnchor:_blur.contentView.trailingAnchor constant:-16],
         [toolStack.bottomAnchor    constraintEqualToAnchor:safe.bottomAnchor constant:-12],
@@ -840,14 +834,11 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
         [dot.topAnchor     constraintEqualToAnchor:pill.topAnchor constant:12],
         [dot.widthAnchor   constraintEqualToConstant:8],
         [dot.heightAnchor  constraintEqualToConstant:8],
-
         [t.leadingAnchor constraintEqualToAnchor:dot.trailingAnchor constant:6],
         [t.centerYAnchor constraintEqualToAnchor:dot.centerYAnchor],
-
         [v.leadingAnchor constraintEqualToAnchor:pill.leadingAnchor constant:10],
         [v.topAnchor     constraintEqualToAnchor:dot.bottomAnchor constant:6],
     ]];
-
     [stack addArrangedSubview:pill];
     return v;
 }
@@ -866,9 +857,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     return b;
 }
 
-- (void)smLogDidChange {
-    [self _refresh];
-}
+- (void)smLogDidChange { [self _refresh]; }
 
 - (void)_refresh {
     SMLog *L = [SMLog shared];
@@ -876,29 +865,18 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     _cntSSLLbl.text  = [NSString stringWithFormat:@"%ld", (long)L.cntSSL];
     _cntDyldLbl.text = [NSString stringWithFormat:@"%ld", (long)L.cntDyld];
     _cntSockLbl.text = [NSString stringWithFormat:@"%ld", (long)L.cntSock];
-
     _statusLbl.text = L.paused
         ? @"◉ موقوف مؤقتاً"
         : [NSString stringWithFormat:@"● نشط — %lu حدث", (unsigned long)L.entries.count];
     _statusLbl.textColor = L.paused
         ? [UIColor colorWithRed:1.0 green:0.58 blue:0.00 alpha:1]
         : [UIColor colorWithRed:0.20 green:0.85 blue:0.35 alpha:1];
-
     [_table reloadData];
 }
 
-- (void)_filterChanged {
-    _filterIdx = _filter.selectedSegmentIndex;
-    [_table reloadData];
-}
-
-- (void)_close {
-    [self dismissViewControllerAnimated:YES completion:nil];
-}
-
-- (void)_clear {
-    [[SMLog shared] clear];
-}
+- (void)_filterChanged { _filterIdx = _filter.selectedSegmentIndex; [_table reloadData]; }
+- (void)_close { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (void)_clear { [[SMLog shared] clear]; }
 
 - (void)_pause {
     SMLog *L = [SMLog shared];
@@ -919,11 +897,11 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
             @"x":  e.text,
             @"d":  e.detail,
             @"f":  @(e.flagged),
+            @"e":  @(e.encrypted),
         }];
     }
     NSData *d = [NSJSONSerialization dataWithJSONObject:arr
-                                                 options:NSJSONWritingPrettyPrinted
-                                                   error:nil];
+                                                 options:NSJSONWritingPrettyPrinted error:nil];
     NSString *s = d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"[]";
     [UIPasteboard generalPasteboard].string = s;
     UINotificationFeedbackGenerator *h = [UINotificationFeedbackGenerator new];
@@ -959,7 +937,7 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 @end
 
 // ============================================================================
-// 10. مدير الواجهة
+// 9. مدير الواجهة
 // ============================================================================
 
 @interface SMManager : NSObject <SMLogObserver>
@@ -992,7 +970,6 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 - (void)install {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ [self _installNow]; });
-
     [[NSNotificationCenter defaultCenter] addObserver:self
         selector:@selector(_sceneChanged)
             name:UIApplicationDidBecomeActiveNotification object:nil];
@@ -1004,7 +981,6 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 
 - (void)_installNow {
     if (self.overlay) return;
-
     UIWindowScene *scene = [self _activeScene];
     if (!scene) return;
 
@@ -1054,7 +1030,6 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
     if (@available(iOS 15.0, *)) {
         UISheetPresentationController *sc = p.sheetPresentationController;
         if (sc) {
-            // ★ التصحيح: detentWithIdentifier:resolver: متاح من iOS 16+
             if (@available(iOS 16.0, *)) {
                 UISheetPresentationControllerDetent *big =
                     [UISheetPresentationControllerDetent
@@ -1064,7 +1039,6 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
                         }];
                 sc.detents = @[big];
             } else {
-                // iOS 15 — نستخدم largeDetent الافتراضي
                 sc.detents = @[UISheetPresentationControllerDetent.largeDetent];
             }
             sc.prefersGrabberVisible = YES;
@@ -1080,18 +1054,15 @@ static NSArray<NSDictionary *> *SMHookedFunctions(void) {
 @end
 
 // ============================================================================
-// 11. نقطة الدخول
+// 10. نقطة الدخول
 // ============================================================================
 
 __attribute__((constructor))
 static void SM_Boot(void) {
     @autoreleasepool {
-        NSLog(@"[SM-XK] v1.1.1 boot");
-
-        // 1) تسجيل NSURLProtocol
+        NSLog(@"[SM-XK] v2.0 boot");
         [NSURLProtocol registerClass:[SMURLProtocol class]];
 
-        // 2) fishhook على C symbols
         struct sm_rb rb[] = {
             { "SSLWrite",                (void *)SM_SSLWrite,    (void **)&orig_SSLWrite    },
             { "write",                   (void *)SM_write,       (void **)&orig_write       },
@@ -1103,15 +1074,12 @@ static void SM_Boot(void) {
         int n = sm_rebind_all(rb, (int)(sizeof(rb)/sizeof(rb[0])));
         NSLog(@"[SM-XK] hooked %d/%zu C symbols", n, sizeof(rb)/sizeof(rb[0]));
 
-        // 3) سطر معلومات لكل دالة معترَضة
         for (NSDictionary *d in SMHookedFunctions()) {
             [[SMLog shared] add:SMKindInfo
                            text:d[@"name"]
                          detail:[NSString stringWithFormat:@"من %@ (%@)", d[@"lib"], d[@"cat"]]
                         flagged:NO];
         }
-
-        // 4) تثبيت الواجهة
         [[SMManager shared] install];
     }
 }
