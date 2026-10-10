@@ -120,8 +120,6 @@ void SecureBuffer::lock_memory() noexcept {
 #if defined(_WIN32) || defined(_WIN64)
     VirtualLock(ptr_, size_);
 #elif defined(__APPLE__) && TARGET_OS_IPHONE
-    // في بيئة iOS Sandbox قد تمنع النواة قفل الصفحات بالكامل بحسب سياسة التطبيق.
-    // يتم التنفيذ بدون الاكتراث بقيمة الإرجاع (void) لمنع انهيار (Crash) التطبيق في iOS.
     (void)mlock(ptr_, size_);
 #else
     #if defined(MCL_CURRENT) || defined(__unix__) || defined(__APPLE__)
@@ -221,7 +219,6 @@ void SecureBuffer::wipe() noexcept {
 // ============================================================================
 
 bool CryptoBox::has_hardware_aes() noexcept {
-    // في iOS ARM64 يعتمد OpenSSL تلقائياً على تعليمات ARMv8 Crypto Extensions
     ScopedCipher cipher(EVP_CIPHER_fetch(nullptr, "AES-256-GCM", nullptr));
     return cipher != nullptr;
 }
@@ -279,16 +276,34 @@ SecureBuffer derive_key_from_password(
             ScopedKdfCtx ctx(EVP_KDF_CTX_new(kdf.get()));
             if (ctx) {
                 OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
-                uint64_t mem_kb = options.memory_cost_mb * 1024;
+                uint64_t mem_kb  = options.memory_cost_mb * 1024;
                 uint64_t threads = 4;
-                uint64_t iter = options.iterations;
+                uint64_t iter    = options.iterations;
 
-                OSSL_PARAM_BLD_push_octet_string(bld, OSSL_KDF_PARAM_PASSWORD, password.data(), password.size());
-                OSSL_PARAM_BLD_push_octet_string(bld, OSSL_KDF_PARAM_SALT, salt.data(), salt.size());
+                OSSL_PARAM_BLD_push_octet_string(bld, OSSL_KDF_PARAM_PASSWORD,
+                                                 password.data(), password.size());
+                OSSL_PARAM_BLD_push_octet_string(bld, OSSL_KDF_PARAM_SALT,
+                                                 salt.data(), salt.size());
+#if defined(OSSL_KDF_PARAM_ARGON2_MEMCOST)
                 OSSL_PARAM_BLD_push_uint64(bld, OSSL_KDF_PARAM_ARGON2_MEMCOST, mem_kb);
+#else
+                OSSL_PARAM_BLD_push_uint64(bld, "memcost", mem_kb);
+#endif
+#if defined(OSSL_KDF_PARAM_ARGON2_LANES)
                 OSSL_PARAM_BLD_push_uint64(bld, OSSL_KDF_PARAM_ARGON2_LANES, threads);
-                OSSL_PARAM_BLD_push_uint64(bld, OSSL_KDF_PARAM_ARGON2_THREADS, threads);
-                OSSL_PARAM_BLD_push_uint64(bld, OSSL_KDF_PARAM_ARGON2_ITER, iter);
+#else
+                OSSL_PARAM_BLD_push_uint64(bld, "lanes", threads);
+#endif
+#if defined(OSSL_KDF_PARAM_THREADS)
+                OSSL_PARAM_BLD_push_uint64(bld, OSSL_KDF_PARAM_THREADS, threads);
+#else
+                OSSL_PARAM_BLD_push_uint64(bld, "threads", threads);
+#endif
+#if defined(OSSL_KDF_PARAM_ITER)
+                OSSL_PARAM_BLD_push_uint64(bld, OSSL_KDF_PARAM_ITER, iter);
+#else
+                OSSL_PARAM_BLD_push_uint64(bld, "iter", iter);
+#endif
 
                 OSSL_PARAM* params = OSSL_PARAM_BLD_to_param(bld);
                 OSSL_PARAM_BLD_free(bld);
@@ -315,7 +330,7 @@ SecureBuffer derive_key_from_password(
             ScopedKdfCtx ctx(EVP_KDF_CTX_new(kdf.get()));
             if (ctx) {
                 OSSL_PARAM_BLD* bld = OSSL_PARAM_BLD_new();
-                uint64_t N = 1ULL << 15; // N=32768 (~32MB RAM لتناسب أجهزة iOS)
+                uint64_t N = 1ULL << 15; // N=32768 (~32MB RAM)
                 uint64_t r = 8;
                 uint64_t p = 1;
 
@@ -427,7 +442,9 @@ SecureBuffer CryptoBox::encrypt_message(
     }
 
     const char* hkdf_info = "DEFX-V1-MESSAGE-KEY";
-    SecureBuffer enc_key = hkdf_expand(master_key.span(), salt, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)), KEY_SIZE);
+    SecureBuffer enc_key = hkdf_expand(master_key.span(), salt,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)),
+        KEY_SIZE);
 
     uint8_t nonce[IV_SIZE];
     generate_random(nonce);
@@ -474,12 +491,14 @@ SecureBuffer CryptoBox::encrypt_message(
 
     std::span<const uint8_t> header_aad(packet.data(), header_size);
     int out_len = 0;
-    if (EVP_EncryptUpdate(ctx.get(), nullptr, &out_len, header_aad.data(), static_cast<int>(header_aad.size())) != 1) {
+    if (EVP_EncryptUpdate(ctx.get(), nullptr, &out_len, header_aad.data(),
+                          static_cast<int>(header_aad.size())) != 1) {
         throw CryptoException("Failed to process header AAD.");
     }
 
     if (!plaintext.empty()) {
-        if (EVP_EncryptUpdate(ctx.get(), ciphertext_ptr, &out_len, plaintext.data(), static_cast<int>(plaintext.size())) != 1) {
+        if (EVP_EncryptUpdate(ctx.get(), ciphertext_ptr, &out_len, plaintext.data(),
+                              static_cast<int>(plaintext.size())) != 1) {
             throw CryptoException("Encryption update failed.");
         }
     }
@@ -560,7 +579,8 @@ SecureBuffer CryptoBox::decrypt_message(
         if (!(flags & FLAG_PASSWORD)) {
             throw CryptoException("Authentication failed: Key/Password configuration mismatch.");
         }
-        master_key = derive_key_from_password(key_or_password, std::span<const uint8_t>(salt, SALT_SIZE), kdf_type, {});
+        master_key = derive_key_from_password(key_or_password,
+            std::span<const uint8_t>(salt, SALT_SIZE), kdf_type, {});
     } else {
         if (key_or_password.size() != KEY_SIZE) {
             throw CryptoException("Raw encryption key must be exactly 32 bytes.");
@@ -569,7 +589,10 @@ SecureBuffer CryptoBox::decrypt_message(
     }
 
     const char* hkdf_info = "DEFX-V1-MESSAGE-KEY";
-    SecureBuffer enc_key = hkdf_expand(master_key.span(), std::span<const uint8_t>(salt, SALT_SIZE), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)), KEY_SIZE);
+    SecureBuffer enc_key = hkdf_expand(master_key.span(),
+        std::span<const uint8_t>(salt, SALT_SIZE),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)),
+        KEY_SIZE);
 
     ScopedCipher cipher = get_cipher_obj(alg);
     ScopedCipherCtx ctx(EVP_CIPHER_CTX_new());
@@ -586,20 +609,23 @@ SecureBuffer CryptoBox::decrypt_message(
 
     std::span<const uint8_t> header_aad(packet.data(), header_size);
     int out_len = 0;
-    if (EVP_DecryptUpdate(ctx.get(), nullptr, &out_len, header_aad.data(), static_cast<int>(header_aad.size())) != 1) {
+    if (EVP_DecryptUpdate(ctx.get(), nullptr, &out_len, header_aad.data(),
+                          static_cast<int>(header_aad.size())) != 1) {
         throw CryptoException("Failed to verify header AAD.");
     }
 
     SecureBuffer plaintext(ct_len);
 
     if (ct_len > 0) {
-        if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &out_len, ciphertext_ptr, static_cast<int>(ct_len)) != 1) {
+        if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &out_len, ciphertext_ptr,
+                              static_cast<int>(ct_len)) != 1) {
             throw CryptoException("Failed during decryption update.");
         }
     }
 
     OSSL_PARAM tag_params[2];
-    tag_params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG, const_cast<uint8_t*>(tag_ptr), TAG_SIZE);
+    tag_params[0] = OSSL_PARAM_construct_octet_string(OSSL_CIPHER_PARAM_AEAD_TAG,
+                                                     const_cast<uint8_t*>(tag_ptr), TAG_SIZE);
     tag_params[1] = OSSL_PARAM_construct_end();
 
     if (EVP_CIPHER_CTX_set_params(ctx.get(), tag_params) != 1) {
@@ -629,7 +655,8 @@ void CryptoBox::encrypt_stream(
 {
     if (key_or_password.empty()) throw CryptoException("Key or password cannot be empty.");
 
-    Algorithm selected_alg = (options.algorithm == Algorithm::Auto) ? Algorithm::AES_256_GCM : options.algorithm;
+    Algorithm selected_alg = (options.algorithm == Algorithm::Auto)
+                             ? Algorithm::AES_256_GCM : options.algorithm;
     uint8_t flags = FLAG_STREAMING;
     KdfType selected_kdf = KdfType::None;
     uint8_t salt[SALT_SIZE] = {0};
@@ -646,7 +673,9 @@ void CryptoBox::encrypt_stream(
     }
 
     const char* hkdf_info = "DEFX-V1-STREAM-KEY";
-    SecureBuffer enc_key = hkdf_expand(master_key.span(), salt, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)), KEY_SIZE);
+    SecureBuffer enc_key = hkdf_expand(master_key.span(), salt,
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)),
+        KEY_SIZE);
 
     uint8_t master_iv[IV_SIZE];
     generate_random(master_iv);
@@ -684,7 +713,6 @@ void CryptoBox::encrypt_stream(
             is_final = true;
         }
 
-        // اشتقاق Nonce فريد لكل قطعة: Chunk IV = Master IV XOR SeqNum
         uint8_t chunk_iv[IV_SIZE];
         std::memcpy(chunk_iv, master_iv, IV_SIZE);
         uint64_t current_seq_be = 0;
@@ -709,7 +737,8 @@ void CryptoBox::encrypt_stream(
         EVP_EncryptUpdate(ctx.get(), nullptr, &out_len, chunk_aad, 9);
 
         if (bytes_read > 0) {
-            EVP_EncryptUpdate(ctx.get(), cipher_buf.data(), &out_len, read_buf.data(), static_cast<int>(bytes_read));
+            EVP_EncryptUpdate(ctx.get(), cipher_buf.data(), &out_len, read_buf.data(),
+                              static_cast<int>(bytes_read));
         }
 
         int final_len = 0;
@@ -782,14 +811,18 @@ void CryptoBox::decrypt_stream(
 
     SecureBuffer master_key;
     if (is_password) {
-        master_key = derive_key_from_password(key_or_password, std::span<const uint8_t>(salt, SALT_SIZE), kdf_type, {});
+        master_key = derive_key_from_password(key_or_password,
+            std::span<const uint8_t>(salt, SALT_SIZE), kdf_type, {});
     } else {
         if (key_or_password.size() != KEY_SIZE) throw CryptoException("Raw key must be 32 bytes.");
         master_key = SecureBuffer(key_or_password);
     }
 
     const char* hkdf_info = "DEFX-V1-STREAM-KEY";
-    SecureBuffer enc_key = hkdf_expand(master_key.span(), std::span<const uint8_t>(salt, SALT_SIZE), std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)), KEY_SIZE);
+    SecureBuffer enc_key = hkdf_expand(master_key.span(),
+        std::span<const uint8_t>(salt, SALT_SIZE),
+        std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(hkdf_info), std::strlen(hkdf_info)),
+        KEY_SIZE);
 
     ScopedCipher cipher = get_cipher_obj(alg);
     uint64_t seq_num = 0;
@@ -843,7 +876,8 @@ void CryptoBox::decrypt_stream(
 
         SecureBuffer pt_buf(chunk_ct_len);
         if (chunk_ct_len > 0) {
-            EVP_DecryptUpdate(ctx.get(), pt_buf.data(), &out_len, ct_buf.data(), static_cast<int>(chunk_ct_len));
+            EVP_DecryptUpdate(ctx.get(), pt_buf.data(), &out_len, ct_buf.data(),
+                              static_cast<int>(chunk_ct_len));
         }
 
         OSSL_PARAM tag_params[2];
@@ -874,7 +908,7 @@ void CryptoBox::decrypt_stream(
 }
 
 // ============================================================================
-// ★ جديد: wrapper عام للدالة المشتقة من كلمة المرور (يستخدم من الجسر)
+// wrapper عام للدالة المشتقة من كلمة المرور (يستخدم من الجسر)
 // ============================================================================
 
 SecureBuffer CryptoBox::derive_from_password_direct(
