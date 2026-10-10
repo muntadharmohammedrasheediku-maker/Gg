@@ -1,6 +1,12 @@
 // ============================================================================
-// ShadowBypass XK v7.10.1 — iOS 14+ arm64 — ملف واحد جاهز للبناء
-// إصلاح: تعريف relocation_info + فواصل منقوطة بعد كل REG_*
+// ShadowBypass XK v7.10.2 — iOS 14+ arm64 — ملف واحد مصحح
+//
+// إصلاح v7.10.2:
+//   - indirectsymoff يُقرأ كـ uint32_t[] وليس relocation_info
+//   - حماية حدود على فهرس الرمز (si < nsyms)
+//   - حماية vm_protect failure
+//   - حماية crash-loop عبر NSUserDefaults
+//   - @try حول كل مرحلة تثبيت
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -149,7 +155,7 @@ static void sbxk_whex(int fd, const void *p) {
 }
 
 // ============================================================================
-// القسم 2: معالج الأعطال
+// القسم 2: معالج الأعطال + حماية crash-loop
 // ============================================================================
 
 static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
@@ -162,6 +168,12 @@ static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
         if (info) { SBXK_WLIT(fd, "si_addr="); sbxk_whex(fd, info->si_addr); SBXK_WLIT(fd, "\n"); }
         SBXK_WLIT(fd, "=== END CRASH ===\n");
     }
+    // حفظ المرحلة لحماية crash-loop
+    @try {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setInteger:(NSInteger)atomic_load(&g_phase) forKey:@"sbxk_last_phase"];
+        [d synchronize];
+    } @catch (__unused NSException *e) {}
 }
 
 static void sbxk_on_exception(NSException *e) {
@@ -215,6 +227,31 @@ static void SBXK_RotateCrashLog(void) {
     if (old >= 0) close(old);
     int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     atomic_store(&g_crash_fd, fd);
+}
+
+// حماية crash-loop
+static BOOL sbxk_should_run(void) {
+    @try {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        NSInteger attempts   = [d integerForKey:@"sbxk_boot_attempts"];
+        NSInteger last_phase = [d integerForKey:@"sbxk_last_phase"];
+        if (last_phase == 20 && attempts >= 3) {
+            NSLog(@"[SBXK] 3 crashes at phase 20 — disabled this boot");
+            return NO;
+        }
+        [d setInteger:attempts + 1 forKey:@"sbxk_boot_attempts"];
+        [d synchronize];
+    } @catch (__unused NSException *e) {}
+    return YES;
+}
+
+static void sbxk_mark_ok(void) {
+    @try {
+        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+        [d setInteger:0 forKey:@"sbxk_boot_attempts"];
+        [d setInteger:0 forKey:@"sbxk_last_phase"];
+        [d synchronize];
+    } @catch (__unused NSException *e) {}
 }
 
 // ============================================================================
@@ -465,7 +502,6 @@ DEF_ID_P0(AudioDeviceMgr, GetAudioDeviceConnectState)
 DEF_ID_P0(VKAuth, logout)
 DEF_ID_P0(SCSDKLoginClient, logout)
 
-// Extended
 DEF_NO(AntiDataProxy, checkIntegrity)
 DEF_NO(AntiDataProxy, isIntegrityOK)
 DEF_NO(AntiDataProxy, verifyData)
@@ -729,7 +765,6 @@ DEF_ID_P0(AceMsgBoxImp, viewContent)
 DEF_ID_P0(AceMsgBoxImp, leftBtnContent)
 DEF_ID_P0(AceMsgBoxImp, rightBtnContent)
 
-// حقن قاتلة
 DEF_NO(SBXK_FridaDet, isFridaPresent)
 DEF_NO(SBXK_FridaDet, isFridaRunning)
 DEF_NO(SBXK_FridaDet, hasFrida)
@@ -810,7 +845,6 @@ DEF_V1(SBXK_InjectDet, alertUser)
 DEF_V1(SBXK_InjectDet, blockGame)
 DEF_V1(SBXK_InjectDet, kickPlayer)
 
-// أصناف حقيقية
 DEF_NO(QAPMReport, isEnabled)
 DEF_NO(QAPMReport, isRunning)
 DEF_NO(QAPMReport, shouldReport)
@@ -956,18 +990,11 @@ static void sbxk_disable_all(void) {
 }
 
 // ============================================================================
-// القسم 11: fishhook مدمج — مع تعريف relocation_info الصحيح
+// القسم 11: fishhook مدمج — ★ مصحح
 // ============================================================================
-
-// تعريف بنية relocation_info — غير متوفرة مباشرة في iOS SDK
-struct sbxk_reloc_info {
-    int32_t  r_address;
-    uint32_t r_symbolnum:24,
-             r_pcrel:1,
-             r_length:2,
-             r_extern:1,
-             r_type:4;
-};
+//
+// indirectsymoff في dysymtab_command يشير لمصفوفة uint32_t (فهارس فقط)،
+// وليس مصفوفة relocation_info. هذا كان سبب الـcrash.
 
 struct sbxk_rb { const char *name; void *repl; void **replaced; };
 
@@ -989,12 +1016,15 @@ static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
         lc = (const struct load_command *)((uint8_t *)lc + lc->cmdsize);
     }
     if (!le || !st || !dy) return 0;
+
     uintptr_t sl = (uintptr_t)slide;
     intptr_t lb = (intptr_t)(slide + le->vmaddr - le->fileoff);
     const struct nlist_64 *sym = (const struct nlist_64 *)(lb + st->symoff);
     const char *str = (const char *)(lb + st->stroff);
-    const struct sbxk_reloc_info *ind =
-        (const struct sbxk_reloc_info *)(lb + dy->indirectsymoff);
+    // ★ indirectsymoff يشير لمصفوفة uint32_t — وليس relocation_info
+    const uint32_t *ind = (const uint32_t *)(lb + dy->indirectsymoff);
+    uint32_t nsyms = st->nsyms;
+
     int done = 0;
     lc = (const struct load_command *)(h + 1);
     for (uint32_t i = 0; i < h->ncmds; i++) {
@@ -1007,8 +1037,9 @@ static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
                 uint32_t cnt = (uint32_t)(sec->size / sizeof(void *));
                 uint32_t start = sec->reserved1;
                 for (uint32_t k = 0; k < cnt; k++) {
-                    uint32_t si = ind[start + k].r_symbolnum;
-                    if (si == (uint32_t)-1 || si == 0) continue;
+                    uint32_t si = ind[start + k];            // ★ قراءة uint32 مباشرة
+                    if (si == 0 || si == 0x80000000u) continue;
+                    if (si >= nsyms) continue;               // ★ حماية الحدود
                     const char *nm = str + sym[si].n_un.n_strx;
                     if (!nm || nm[0] != '_') continue;
                     const char *cl = nm + 1;
@@ -1017,7 +1048,9 @@ static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
                         void **slot = (void **)(sl + sec->addr + k * sizeof(void *));
                         if (b[x].replaced && *b[x].replaced == NULL) *b[x].replaced = *slot;
                         uintptr_t pg = (uintptr_t)slot & ~(PAGE_SIZE - 1);
-                        vm_protect(mach_task_self_, pg, PAGE_SIZE, false, VM_PROT_READ | VM_PROT_WRITE);
+                        kern_return_t kr = vm_protect(mach_task_self_, pg, PAGE_SIZE,
+                                                      false, VM_PROT_READ | VM_PROT_WRITE);
+                        if (kr != KERN_SUCCESS) continue;    // ★ فشل → تجاهل هذا الرمز
                         *slot = b[x].repl;
                         vm_protect(mach_task_self_, pg, PAGE_SIZE, false, VM_PROT_READ);
                         done++;
@@ -1033,8 +1066,14 @@ static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
 static int sbxk_rebind(struct sbxk_rb *b, int nb) {
     int t = 0;
     uint32_t c = _dyld_image_count();
-    for (uint32_t i = 0; i < c; i++)
-        t += sbxk_rebind_image(_dyld_get_image_header(i), _dyld_get_image_vmaddr_slide(i), b, nb);
+    for (uint32_t i = 0; i < c; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh) continue;
+        intptr_t sl = _dyld_get_image_vmaddr_slide(i);
+        @try {
+            t += sbxk_rebind_image(mh, sl, b, nb);
+        } @catch (__unused NSException *e) {}
+    }
     return t;
 }
 
@@ -1147,7 +1186,7 @@ static void SBXK_RegisterFishhook(void) {
 }
 
 // ============================================================================
-// القسم 12: ماكرو التسجيل — مع فاصلة منقوطة إلزامية
+// القسم 12: ماكرو التسجيل
 // ============================================================================
 
 #define REG_B(cls, name)   (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "B@:")
@@ -1834,11 +1873,11 @@ static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
 }
 
 static void SBXK_FullInstall(void) {
-    SBXK_RegBase();
-    SBXK_RegExtended();
-    SBXK_RegInjectionKill();
-    SBXK_RegReal();
-    SBXK_RegisterFishhook();
+    @try { SBXK_RegBase();          } @catch (NSException *e) { NSLog(@"[SBXK] RegBase: %@", e); }
+    @try { SBXK_RegExtended();      } @catch (NSException *e) { NSLog(@"[SBXK] RegExtended: %@", e); }
+    @try { SBXK_RegInjectionKill(); } @catch (NSException *e) { NSLog(@"[SBXK] RegInject: %@", e); }
+    @try { SBXK_RegReal();          } @catch (NSException *e) { NSLog(@"[SBXK] RegReal: %@", e); }
+    @try { SBXK_RegisterFishhook(); } @catch (NSException *e) { NSLog(@"[SBXK] Fishhook: %@", e); }
 }
 
 static void SBXK_Retry(void) {
@@ -1850,6 +1889,7 @@ static void SBXK_Retry(void) {
 }
 
 static void SBXK_Run(void) {
+    if (!sbxk_should_run()) return;
     atomic_store(&g_phase, 20);
     SBXK_FullInstall();
     atomic_store(&g_phase, 30);
@@ -1858,7 +1898,9 @@ static void SBXK_Run(void) {
         sbxk_disable_all();
         return;
     }
-    NSLog(@"[SBXK] v7.10 done=%lu skip=%lu", (unsigned long)g_done.count, (unsigned long)g_skip.count);
+    sbxk_mark_ok();
+    NSLog(@"[SBXK] v7.10.2 done=%lu skip=%lu",
+          (unsigned long)g_done.count, (unsigned long)g_skip.count);
 }
 
 __attribute__((constructor))
@@ -1873,7 +1915,7 @@ static void SBXK_Boot(void) {
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
         SBXK_ANTIDEBUG();
-        NSLog(@"[SBXK] v7.10 boot");
+        NSLog(@"[SBXK] v7.10.2 boot");
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
