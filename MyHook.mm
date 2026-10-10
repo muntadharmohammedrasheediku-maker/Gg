@@ -21,6 +21,7 @@
 #import <stdlib.h>
 #import <string.h>
 #import <notify.h>
+#import <stdarg.h>
 
 // ============ ptrace workaround for iOS SDK ============
 #ifndef PT_DENY_ATTACH
@@ -33,21 +34,29 @@
 
 extern int ptrace(int request, pid_t pid, caddr_t addr, int data);
 
-// أداة بديلة تعمل دائماً حتى لو فشل ptrace
+// ================================================
+// أداة التسجيل (يجب أن تكون قبل أي استخدام)
+// ================================================
+
+static void BPLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *msg = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSLog(@"[EXTERNAL BYPASS] %@", msg);
+}
+
 static inline void bp_deny_attach(void) {
-    // الطريقة 1: ptrace مباشر
     ptrace(PT_DENY_ATTACH, 0, 0, 0);
-    
-    // الطريقة 2: syscall مباشر (أكثر موثوقية)
     syscall(SYS_ptrace, PT_DENY_ATTACH, 0, 0, 0);
 }
-// =======================================================
 
 // ================================================
 // 🚫 1. نظام كشف وإخفاء التطبيقات الخارجية
 // ================================================
 
 @interface ExternalAppDetector : NSObject
+// ... باقي الكود كما هو
 
 @property (strong, nonatomic) NSArray<NSString *> *forbiddenAppIdentifiers;
 @property (strong, nonatomic) NSArray<NSString *> *forbiddenProcessNames;
