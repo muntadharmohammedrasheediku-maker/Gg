@@ -1,4 +1,5 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>  // تمت الإضافة لحل خطأ UIApplication
 #import <CommonCrypto/CommonCrypto.h>
 #import <Security/Security.h>
 #import <objc/runtime.h>
@@ -11,8 +12,8 @@
 #import <AppTrackingTransparency/AppTrackingTransparency.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>     // تمت الإضافة لدالة access
 
-// تم تصحيح المسار هنا
 #import "fishhook.h"
 
 #pragma mark - Cryptographic Hooks (Memory-Based, No Patching)
@@ -791,7 +792,8 @@ didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
 
 #pragma mark - Constructor (Main Hook Initialization)
 
-%ctor {
+// تم استبدال %ctor بطريقة C++ القياسية لضمان العمل في جميع البيئات
+static __attribute__((constructor)) void initialize_hook() {
     @autoreleasepool {
         NSLog(@"[ShadowTrackerBypass] Loading bypass...");
         
