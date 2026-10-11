@@ -1,12 +1,16 @@
 // ============================================================================
-// ShadowBypass XK v7.10.7 — iOS 14+ arm64 — ملف واحد كامل
+// ShadowBypass XK v9.0 — iOS 14+ arm64/arm64e
 //
-// الاستراتيجية:
-//   - الأساس: v7.10.3 (النسخة العاملة بدون تجميد)
-//   - الإضافات: كل الآمن من v7.10.5 (ACE Extended objc swizzles + UQM + CrashSight)
-//   - المحذوف: WGGetHostByNameAsyncWithTag + Px_GetQJSFunctionTable_V04 +
-//              HttpDnsPluginLifecycle swizzle (الثلاثة التي تسبب التجميد)
-//   - التصحيحات: LogViewer class methods + UQM mangled names + attribute fix
+// 8 طبقات دفاعية:
+//   §0  Crypto          ChaCha20-lite
+//   §1  SafeSwizzle     ObjC method hooking (no exceptions)
+//   §2  HookEngine      Inline hooking (prologue-aware + RW→RX + MAP_JIT)
+//   §3  GOTFallback     fishhook
+//   §4  StringShield    Caller-side filtering (recursion-safe)
+//   §5  BehaviorMimic   Kernel API emulation
+//   §6  TargetRegistry  All detection handlers
+//   §7  Lifecycle       Event-driven cleanup
+//   §8  Boot            Entry point
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -18,6 +22,9 @@
 #import <mach-o/nlist.h>
 #import <mach/mach.h>
 #import <mach/mach_time.h>
+#import <mach/vm_region.h>
+#import <mach/vm_page_size.h>
+#import <mach/exception_types.h>
 #import <signal.h>
 #import <fcntl.h>
 #import <unistd.h>
@@ -25,485 +32,780 @@
 #import <stdint.h>
 #import <stdatomic.h>
 #import <dlfcn.h>
+#import <pthread.h>
 #import <sys/mman.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
 
 // ============================================================================
-// القسم 0: تشفير النصوص XOR
+// §0 SBXK_Crypto — ChaCha20-lite
 // ============================================================================
 
-struct sbxk_ob {
-    uint8_t  data[256];
-    uint32_t len;
-    uint32_t seed;
+typedef struct { uint32_t state[16]; } SBXK_ChaCha_t;
+
+static inline uint32_t SBXK_rotl(uint32_t v, int c) {
+    return (v << c) | (v >> (32 - c));
+}
+
+static inline void SBXK_qr(uint32_t *s, int a, int b, int c, int d) {
+    s[a] += s[b]; s[d] ^= s[a]; s[d] = SBXK_rotl(s[d], 16);
+    s[c] += s[d]; s[b] ^= s[c]; s[b] = SBXK_rotl(s[b], 12);
+    s[a] += s[b]; s[d] ^= s[a]; s[d] = SBXK_rotl(s[d],  8);
+    s[c] += s[d]; s[b] ^= s[c]; s[b] = SBXK_rotl(s[b],  7);
+}
+
+static void SBXK_chacha_block(SBXK_ChaCha_t *c) {
+    uint32_t x[16];
+    memcpy(x, c->state, sizeof(x));
+    for (int i = 0; i < 10; i++) {
+        SBXK_qr(x, 0, 4,  8, 12); SBXK_qr(x, 1, 5,  9, 13);
+        SBXK_qr(x, 2, 6, 10, 14); SBXK_qr(x, 3, 7, 11, 15);
+        SBXK_qr(x, 0, 5, 10, 15); SBXK_qr(x, 1, 6, 11, 12);
+        SBXK_qr(x, 2, 7,  8, 13); SBXK_qr(x, 3, 4,  9, 14);
+    }
+    for (int i = 0; i < 16; i++) c->state[i] += x[i];
+}
+
+static uint32_t g_sbxk_key[8] = {0};
+static atomic_bool g_sbxk_key_ready = false;
+
+static void SBXK_derive_key(void) {
+    if (atomic_load(&g_sbxk_key_ready)) return;
+    uint64_t t1 = mach_absolute_time();
+    uint64_t t2 = (uint64_t)(uintptr_t)&SBXK_derive_key;
+    uint64_t t3 = (uint64_t)getpid();
+    uint64_t mix = t1 ^ (t2 * 0x9E3779B97F4A7C15ULL) ^ (t3 << 32);
+    for (int i = 0; i < 8; i++) {
+        mix ^= mix >> 30; mix *= 0xBF58476D1CE4E5B9ULL;
+        mix ^= mix >> 27; mix *= 0x94D049BB133111EBULL;
+        mix ^= mix >> 31;
+        g_sbxk_key[i] = (uint32_t)(mix ^ (mix >> 32));
+    }
+    atomic_store(&g_sbxk_key_ready, true);
+}
+
+struct sbxk_enc_s {
+    uint8_t  iv[8];
+    uint16_t len;
+    uint8_t  cipher[200];
 };
 
-static struct sbxk_ob sbxk_enc(const char *s, uint32_t seed) {
-    struct sbxk_ob o;
-    memset(&o, 0, sizeof(o));
-    size_t n = strlen(s) + 1;
-    if (n > 255) n = 255;
-    for (size_t i = 0; i < n; i++) {
-        uint32_t k = seed + (uint32_t)i * 0x9E3779B1u;
-        k ^= k >> 13; k *= 0x85EBCA6Bu; k ^= k >> 16;
-        uint8_t b = (uint8_t)s[i];
-        b = (uint8_t)((b << 3) | (b >> 5));
-        o.data[i] = b ^ (uint8_t)k;
+static void SBXK_enc(const char *plain, struct sbxk_enc_s *out) {
+    SBXK_derive_key();
+    memset(out, 0, sizeof(*out));
+    size_t n = strlen(plain) + 1;
+    if (n > 200) n = 200;
+    out->len = (uint16_t)n;
+
+    uint64_t seed = mach_absolute_time() ^ (uintptr_t)plain ^ (uintptr_t)out;
+    for (int i = 0; i < 8; i++) {
+        seed ^= seed >> 12; seed ^= seed << 25; seed ^= seed >> 27;
+        out->iv[i] = (uint8_t)(seed >> (i * 8));
     }
-    o.len = (uint32_t)n;
-    o.seed = seed;
-    return o;
+
+    SBXK_ChaCha_t c;
+    c.state[0] = 0x61707865; c.state[1] = 0x3320646e;
+    c.state[2] = 0x79622d32; c.state[3] = 0x6b206574;
+    for (int i = 0; i < 8; i++) c.state[4 + i] = g_sbxk_key[i];
+    c.state[12] = 0; c.state[13] = 0;
+    memcpy(&c.state[14], out->iv, 8);
+
+    uint8_t ks[200];
+    for (size_t off = 0; off < n; off += 64) {
+        SBXK_chacha_block(&c);
+        uint8_t *kp = (uint8_t *)c.state;
+        size_t take = (n - off) > 64 ? 64 : (n - off);
+        memcpy(ks + off, kp, take);
+        c.state[12]++;
+    }
+    for (size_t i = 0; i < n; i++) out->cipher[i] = (uint8_t)plain[i] ^ ks[i];
 }
 
-static NSString *sbxk_dec(const struct sbxk_ob *o) {
-    char buf[256];
-    uint32_t n = o->len;
-    if (n >= sizeof(buf)) n = sizeof(buf) - 1;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t k = o->seed + (uint32_t)i * 0x9E3779B1u;
-        k ^= k >> 13; k *= 0x85EBCA6Bu; k ^= k >> 16;
-        uint8_t b = o->data[i] ^ (uint8_t)k;
-        b = (uint8_t)((b >> 3) | (b << 5));
-        buf[i] = (char)b;
+static void SBXK_dec(const struct sbxk_enc_s *in, char *out) {
+    SBXK_derive_key();
+    uint16_t n = in->len;
+    if (n > 200) n = 200;
+
+    SBXK_ChaCha_t c;
+    c.state[0] = 0x61707865; c.state[1] = 0x3320646e;
+    c.state[2] = 0x79622d32; c.state[3] = 0x6b206574;
+    for (int i = 0; i < 8; i++) c.state[4 + i] = g_sbxk_key[i];
+    c.state[12] = 0; c.state[13] = 0;
+    memcpy(&c.state[14], in->iv, 8);
+
+    for (size_t off = 0; off < n; off += 64) {
+        SBXK_chacha_block(&c);
+        uint8_t *kp = (uint8_t *)c.state;
+        size_t take = (n - off) > 64 ? 64 : (n - off);
+        for (size_t i = 0; i < take; i++) out[off + i] = (char)(in->cipher[off + i] ^ kp[i]);
+        c.state[12]++;
     }
-    buf[n ? n - 1 : 0] = 0;
-    return [NSString stringWithUTF8String:buf];
 }
 
-#define SENS(s) (^NSString *{ \
-    static struct sbxk_ob _ob; \
-    static atomic_int _init = 0; \
+#define SBXK_STR(s) (^const char *{ \
+    static struct sbxk_enc_s _e; static char _p[200]; static atomic_int _init = 0; \
     int _exp = 0; \
     if (atomic_compare_exchange_strong(&_init, &_exp, 1)) { \
-        _ob = sbxk_enc(s, (uint32_t)(__LINE__ * 7919 + 31)); \
-    } \
-    return sbxk_dec(&_ob); \
-}())
+        SBXK_enc(s, &_e); SBXK_dec(&_e, _p); } \
+    return _p; }())
 
 // ============================================================================
-// القسم 0b: مضاد التصحيح
+// §1 SBXK_SafeSwizzle — Safe ObjC method hooking (no @try)
 // ============================================================================
 
-static inline void sbxk_antidebug_ptrace(void) {
-    register long x0 __asm__("x0") = 31;
-    register long x1 __asm__("x1") = 0;
-    register long x2 __asm__("x2") = 0;
-    register long x3 __asm__("x3") = 0;
-    register long x16 __asm__("x16") = 26;
-    __asm__ volatile("svc #0x80"
-                     : "+r"(x0)
-                     : "r"(x1), "r"(x2), "r"(x3), "r"(x16)
-                     : "memory");
-}
+typedef struct {
+    Class  cls;
+    SEL    sel;
+    IMP    orig;
+    IMP    repl;
+    Method m;
+    bool   installed;
+} SBXK_Hook_t;
 
-static inline int sbxk_is_traced(void) {
-    struct kinfo_proc info; memset(&info, 0, sizeof(info));
-    size_t sz = sizeof(info);
-    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
-    if (sysctl(mib, 4, &info, &sz, NULL, 0) != 0) return 0;
-    return (info.kp_proc.p_flag & P_TRACED) ? 1 : 0;
-}
+static SBXK_Hook_t *g_hooks = NULL;
+static size_t g_hooks_cap = 0;
+static size_t g_hooks_len = 0;
+static pthread_mutex_t g_hooks_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static inline void sbxk_antidebug_sysctl(void) {
-    if (sbxk_is_traced()) __builtin_trap();
-}
-
-static inline void sbxk_antidebug_timing(void) {
-    uint64_t t0 = mach_absolute_time();
-    volatile int x = 0; for (int i = 0; i < 1000; i++) x += i; (void)x;
-    if ((mach_absolute_time() - t0) > 100000000ull) __builtin_trap();
-}
-
-#define SBXK_ANTIDEBUG() do { \
-    sbxk_antidebug_ptrace(); \
-    sbxk_antidebug_sysctl(); \
-    sbxk_antidebug_timing(); \
-} while (0)
-
-// ============================================================================
-// القسم 1: متغيرات عامة
-// ============================================================================
-
-static atomic_int  g_phase       = 0;
-static atomic_bool g_pending     = false;
-static atomic_int  g_crash_fd    = -1;
-static atomic_bool g_viewer_done = false;
-
-#define SBXK_WLIT(fd, lit) do { \
-    static const char _s[] = lit; \
-    ssize_t _r = write((fd), _s, sizeof(_s) - 1); (void)_r; \
-} while (0)
-
-static void sbxk_wdec(int fd, long v) {
-    if (fd < 0) return;
-    char b[24]; int i = 0;
-    if (v < 0) { SBXK_WLIT(fd, "-"); v = -v; }
-    if (v == 0) { SBXK_WLIT(fd, "0"); return; }
-    while (v > 0 && i < 23) { b[i++] = (char)('0' + (v % 10)); v /= 10; }
-    while (i > 0) { char c = b[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
-}
-
-static void sbxk_whex(int fd, const void *p) {
-    if (fd < 0) return;
-    uintptr_t v = (uintptr_t)p;
-    static const char hx[] = "0123456789abcdef";
-    SBXK_WLIT(fd, "0x");
-    if (v == 0) { SBXK_WLIT(fd, "0"); return; }
-    char b[20]; int i = 0;
-    while (v > 0 && i < 19) { b[i++] = hx[v & 0xF]; v >>= 4; }
-    while (i > 0) { char c = b[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
-}
-
-// ============================================================================
-// القسم 2: معالج الأعطال + حماية crash-loop
-// ============================================================================
-
-static void sbxk_on_signal(int sig, siginfo_t *info, void *ctx) {
-    (void)ctx;
-    int fd = atomic_load(&g_crash_fd);
-    if (fd >= 0) {
-        SBXK_WLIT(fd, "\n=== SBXK CRASH ===\n");
-        SBXK_WLIT(fd, "signal="); sbxk_wdec(fd, sig); SBXK_WLIT(fd, "\n");
-        SBXK_WLIT(fd, "phase=");  sbxk_wdec(fd, atomic_load(&g_phase)); SBXK_WLIT(fd, "\n");
-        if (info) { SBXK_WLIT(fd, "si_addr="); sbxk_whex(fd, info->si_addr); SBXK_WLIT(fd, "\n"); }
-        SBXK_WLIT(fd, "=== END CRASH ===\n");
-    }
-    @try {
-        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-        [d setInteger:(NSInteger)atomic_load(&g_phase) forKey:@"sbxk_last_phase"];
-        [d synchronize];
-    } @catch (__unused NSException *e) {}
-}
-
-static void sbxk_on_exception(NSException *e) {
-    int fd = atomic_load(&g_crash_fd);
-    if (fd < 0) return;
-    SBXK_WLIT(fd, "\n=== SBXK EXCEPTION ===\n");
-    @try {
-        NSString *n = [e name], *r = [e reason];
-        if (n) { SBXK_WLIT(fd, "name="); const char *s = n.UTF8String;
-                 if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; } SBXK_WLIT(fd, "\n"); }
-        if (r) { SBXK_WLIT(fd, "reason="); const char *s = r.UTF8String;
-                 if (s) { ssize_t _r = write(fd, s, strlen(s)); (void)_r; } SBXK_WLIT(fd, "\n"); }
-    } @catch (__unused NSException *ign) {}
-    SBXK_WLIT(fd, "=== END EXCEPTION ===\n");
-}
-
-static char g_crash_path[512] = {0};
-static char g_prev_path[512]  = {0};
-
-static void SBXK_InitPaths(void) {
-    NSString *d = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    NSString *c = [d stringByAppendingPathComponent:@"sbxk_crash.log"];
-    NSString *p = [d stringByAppendingPathComponent:@"sbxk_crash_prev.log"];
-    strncpy(g_crash_path, c.UTF8String, sizeof(g_crash_path) - 1);
-    strncpy(g_prev_path,  p.UTF8String, sizeof(g_prev_path)  - 1);
-}
-
-static void SBXK_InstallCrashHandlers(void) {
-    if (g_crash_path[0] == 0) return;
-    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    atomic_store(&g_crash_fd, fd);
-    struct sigaction sa; memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = sbxk_on_signal;
-    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL); sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGBUS,  &sa, NULL); sigaction(SIGILL,  &sa, NULL);
-    sigaction(SIGFPE,  &sa, NULL); sigaction(SIGTRAP, &sa, NULL);
-    NSSetUncaughtExceptionHandler(&sbxk_on_exception);
-}
-
-static void SBXK_RotateCrashLog(void) {
-    if (g_crash_path[0] == 0) return;
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *c = [NSString stringWithUTF8String:g_crash_path];
-    NSString *p = [NSString stringWithUTF8String:g_prev_path];
-    if (![fm fileExistsAtPath:c]) return;
-    [fm removeItemAtPath:p error:nil];
-    [fm moveItemAtPath:c toPath:p error:nil];
-    int old = atomic_exchange(&g_crash_fd, -1);
-    if (old >= 0) close(old);
-    int fd = open(g_crash_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    atomic_store(&g_crash_fd, fd);
-}
-
-static BOOL sbxk_should_run(void) {
-    @try {
-        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-        NSInteger attempts   = [d integerForKey:@"sbxk_boot_attempts"];
-        NSInteger last_phase = [d integerForKey:@"sbxk_last_phase"];
-        if (last_phase == 20 && attempts >= 3) {
-            NSLog(@"[SBXK] 3 crashes at phase 20 — disabled this boot");
-            return NO;
-        }
-        [d setInteger:attempts + 1 forKey:@"sbxk_boot_attempts"];
-        [d synchronize];
-    } @catch (__unused NSException *e) {}
-    return YES;
-}
-
-static void sbxk_mark_ok(void) {
-    @try {
-        NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-        [d setInteger:0 forKey:@"sbxk_boot_attempts"];
-        [d setInteger:0 forKey:@"sbxk_last_phase"];
-        [d synchronize];
-    } @catch (__unused NSException *e) {}
-}
-
-// ============================================================================
-// القسم 3: سجل الـswizzle
-// ============================================================================
-
-static NSMutableDictionary<NSString *, NSValue *> *g_orig = nil;
-static NSMutableSet<NSString *> *g_done = nil;
-static NSMutableSet<NSString *> *g_skip = nil;
-
-static NSString *SBXK_KeyS(NSString *cls, NSString *sel) {
-    return [NSString stringWithFormat:@"%@::%@", cls, sel];
-}
-
-static IMP SBXK_OriginalS(NSString *cls, NSString *sel) {
-    if (!g_orig) return NULL;
-    NSValue *v = g_orig[SBXK_KeyS(cls, sel)];
-    return v ? (IMP)[v pointerValue] : NULL;
-}
-
-static BOOL SBXK_MethodIsOwn(Class c, SEL s) {
-    if (!c || !s) return NO;
-    unsigned int n = 0;
-    Method *list = class_copyMethodList(c, &n);
-    if (!list) return NO;
-    BOOL found = NO;
-    for (unsigned int i = 0; i < n; i++) if (method_getName(list[i]) == s) { found = YES; break; }
-    free(list);
-    return found;
-}
-
-static BOOL SBXK_SwizzleS(NSString *clsS, NSString *selS, IMP repl, const char *enc) {
-    if (!clsS || !selS || !repl || !enc) return NO;
-    NSString *key = SBXK_KeyS(clsS, selS);
-    if ([g_done containsObject:key]) return YES;
-    if ([g_skip containsObject:key]) return NO;
-
-    const char *clsName = clsS.UTF8String;
-    const char *selName = selS.UTF8String;
-
-    Class c = objc_getClass(clsName);
-    if (!c) return NO;
-
-    SEL s = sel_registerName(selName);
-    if (!s) { [g_skip addObject:key]; return NO; }
-
-    Method instM = class_getInstanceMethod(c, s);
-    Method clsM  = class_getClassMethod(c, s);
-    Method m = NULL; BOOL own = NO; Class target = nil;
-
-    if (instM && SBXK_MethodIsOwn(c, s)) { m = instM; own = YES; target = c; }
-    else if (clsM && SBXK_MethodIsOwn(object_getClass(c), s)) { m = clsM; own = YES; target = object_getClass(c); }
-    else if (instM) { m = instM; own = NO; target = c; }
-    else if (clsM) { m = clsM; own = NO; target = object_getClass(c); }
-    else { [g_skip addObject:key]; return NO; }
-
-    const char *e = method_getTypeEncoding(m);
-    if (!e || strcmp(e, enc) != 0) { [g_skip addObject:key]; return NO; }
+static bool SBXK_hook_add(Class c, SEL s, IMP repl) {
+    if (!c || !s || !repl) return false;
+    Method m = class_getInstanceMethod(c, s);
+    if (!m) m = class_getClassMethod(c, s);
+    if (!m) return false;
 
     IMP orig = method_getImplementation(m);
-    g_orig[key] = [NSValue valueWithPointer:orig];
+    if (!orig || orig == repl) return false;
 
-    @try {
-        if (own) class_replaceMethod(target, s, repl, e);
-        else if (!class_addMethod(target, s, repl, e)) class_replaceMethod(target, s, repl, e);
-        [g_done addObject:key];
-    } @catch (NSException *ex) {
-        NSLog(@"[SBXK-diag] %@ %@: %@", clsS, selS, ex);
-        [g_skip addObject:key];
-        return NO;
+    pthread_mutex_lock(&g_hooks_lock);
+    if (g_hooks_len >= g_hooks_cap) {
+        size_t nc = g_hooks_cap ? g_hooks_cap * 2 : 64;
+        SBXK_Hook_t *nh = (SBXK_Hook_t *)realloc(g_hooks, nc * sizeof(SBXK_Hook_t));
+        if (!nh) { pthread_mutex_unlock(&g_hooks_lock); return false; }
+        g_hooks = nh; g_hooks_cap = nc;
     }
-    return YES;
+    g_hooks[g_hooks_len++] = (SBXK_Hook_t){ c, s, orig, repl, m, true };
+    pthread_mutex_unlock(&g_hooks_lock);
+
+    method_setImplementation(m, repl);
+    return true;
+}
+
+static void SBXK_hooks_rollback(void) {
+    pthread_mutex_lock(&g_hooks_lock);
+    for (size_t i = 0; i < g_hooks_len; i++) {
+        if (g_hooks[i].installed && g_hooks[i].m)
+            method_setImplementation(g_hooks[i].m, g_hooks[i].orig);
+        g_hooks[i].installed = false;
+    }
+    pthread_mutex_unlock(&g_hooks_lock);
+}
+
+#define HK_B(cls, name)   SBXK_hook_add(objc_getClass(cls), sel_registerName(name), (IMP)SBXK_##cls##_##name)
+
+// ============================================================================
+// §2 SBXK_HookEngine — Inline hooking (prologue-aware + RW→RX + MAP_JIT)
+// ============================================================================
+
+// §2.1 Prologue parser
+static int SBXK_prologue_end(const uint32_t *insn, int max_insn) {
+    int i = 0;
+    while (i < max_insn) {
+        uint32_t v = insn[i];
+        // PACIASP / PACIBSP
+        if ((v & 0xFFFFFF1F) == 0xD503233F) { i++; continue; }
+        // STP X29, X30, [SP, #imm]! (pre-index)
+        if ((v & 0xFFC003E0) == 0xA98003E0) { i++; continue; }
+        // STP X29, X30, [SP, #imm]  (signed offset)
+        if ((v & 0xFFC003E0) == 0xA90003E0) { i++; continue; }
+        // SUB SP, SP, #imm
+        if ((v & 0xFF8003FF) == 0xD10003FF) { i++; continue; }
+        // MOV X29, SP
+        if (v == 0x910003FD)                { i++; continue; }
+        // MOV X29, X29 (PAC)
+        if (v == 0xAA1D03FD)                { i++; continue; }
+        // NOP
+        if (v == 0xD503201F)                { i++; continue; }
+        // BTI c
+        if ((v & 0xFFFFFF1F) == 0xD503245F) { i++; continue; }
+        break;
+    }
+    return i;
+}
+
+// §2.2 Trampoline registry
+typedef struct {
+    void   *target;
+    void   *handler;
+    void   *trampoline;
+    void   *page;
+    size_t  page_sz;
+    size_t  offset;
+    bool    installed;
+} SBXK_Tramp_t;
+
+static SBXK_Tramp_t *g_tramps = NULL;
+static size_t g_tramps_cap = 0;
+static size_t g_tramps_len = 0;
+static pthread_mutex_t g_tramps_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// §2.3 JIT support detection
+#if defined(__arm64e__)
+#define SBXK_HAS_JIT 1
+#else
+#define SBXK_HAS_JIT 0
+#endif
+
+extern int  pthread_jit_write_protect_supported_np(void);
+extern void pthread_jit_write_protect_np(int enabled);
+
+static bool g_jit_supported = false;
+
+static void SBXK_detect_jit(void) {
+#if SBXK_HAS_JIT
+    g_jit_supported = pthread_jit_write_protect_supported_np() != 0;
+#else
+    g_jit_supported = false;
+#endif
+}
+
+// §2.4 Page allocation (RW → RX)
+static void *SBXK_alloc_page(size_t sz, bool exec_after) {
+    size_t pg = vm_page_size;
+    size_t total = ((sz + pg - 1) / pg) * pg;
+
+    int flags = MAP_PRIVATE | MAP_ANON;
+#if SBXK_HAS_JIT
+    if (g_jit_supported && exec_after) flags |= MAP_JIT;
+#endif
+
+    void *p = mmap(NULL, total, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    return p;
+}
+
+static bool SBXK_page_seal_rx(void *p, size_t sz) {
+    size_t pg = vm_page_size;
+    uintptr_t base = (uintptr_t)p & ~(pg - 1);
+    size_t total = ((sz + pg - 1) / pg) * pg + ((uintptr_t)p - base);
+
+#if SBXK_HAS_JIT
+    if (g_jit_supported) {
+        pthread_jit_write_protect_np(1);  // disable write, enable exec
+        return true;
+    }
+#endif
+
+    kern_return_t kr = vm_protect(mach_task_self_, base, total,
+                                  false, VM_PROT_READ | VM_PROT_EXECUTE);
+    return kr == KERN_SUCCESS;
+}
+
+// §2.5 Write jump at offset
+static bool SBXK_write_jump_at(void *target, size_t offset, void *dest) {
+    size_t pg = vm_page_size;
+    uintptr_t addr = (uintptr_t)target + offset;
+    uintptr_t base = addr & ~(pg - 1);
+
+    kern_return_t kr = vm_protect(mach_task_self_, base, pg, false,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return false;
+
+    uint32_t insn[4];
+    insn[0] = 0x58000050;   // LDR X16, #8
+    insn[1] = 0xD61F0200;   // BR X16
+    insn[2] = (uint32_t)((uintptr_t)dest & 0xFFFFFFFF);
+    insn[3] = (uint32_t)(((uintptr_t)dest >> 32) & 0xFFFFFFFF);
+    memcpy((void *)addr, insn, sizeof(insn));
+
+    __builtin___clear_cache((char *)addr, (char *)addr + sizeof(insn));
+
+    vm_protect(mach_task_self_, base, pg, false, VM_PROT_READ | VM_PROT_EXECUTE);
+    return true;
+}
+
+// §2.6 Install trampoline
+static bool SBXK_tramp_install(void *target, void *handler) {
+    if (!target || !handler) return false;
+
+    // read prologue
+    uint32_t head[8];
+    memcpy(head, target, sizeof(head));
+    int pro_insn = SBXK_prologue_end(head, 8);
+    size_t offset = (size_t)pro_insn * 4;
+
+    if (offset == 0) return false;
+    if (offset > 16) return false;
+
+    // verify page perms
+    vm_region_basic_info_data_64_t info;
+    vm_size_t info_sz = sizeof(info);
+    mach_port_t obj_name = MACH_PORT_NULL;
+    vm_address_t region_addr = (vm_address_t)target & ~(vm_page_size - 1);
+    vm_size_t region_sz = 0;
+    kern_return_t kr = vm_region_64(mach_task_self_, &region_addr, &region_sz,
+                                    VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info,
+                                    &info_sz, &obj_name);
+    if (obj_name != MACH_PORT_NULL) mach_port_deallocate(mach_task_self_, obj_name);
+    if (kr != KERN_SUCCESS) return false;
+    if (!(info.protection & VM_PROT_EXECUTE)) return false;
+
+    // save 16 bytes
+    uint8_t saved[16];
+    memcpy(saved, (uint8_t *)target + offset, 16);
+
+    // alloc trampoline (RW initially)
+    size_t tramp_sz = 32;
+    void *tramp = SBXK_alloc_page(tramp_sz, true);
+    if (!tramp) return false;
+
+#if SBXK_HAS_JIT
+    if (g_jit_supported) pthread_jit_write_protect_np(0);  // enable write
+#endif
+
+    uint8_t *tp = (uint8_t *)tramp;
+    memcpy(tp, saved, 16);
+
+    uint32_t jmp[4];
+    jmp[0] = 0x58000050;
+    jmp[1] = 0xD61F0200;
+    void *resume = (void *)((uintptr_t)target + offset + 16);
+    jmp[2] = (uint32_t)((uintptr_t)resume & 0xFFFFFFFF);
+    jmp[3] = (uint32_t)(((uintptr_t)resume >> 32) & 0xFFFFFFFF);
+    memcpy(tp + 16, jmp, 16);
+
+    __builtin___clear_cache((char *)tramp, (char *)tramp + tramp_sz);
+
+    if (!SBXK_page_seal_rx(tramp, tramp_sz)) {
+        munmap(tramp, ((tramp_sz + vm_page_size - 1) / vm_page_size) * vm_page_size);
+        return false;
+    }
+
+    if (!SBXK_write_jump_at(target, offset, handler)) {
+        munmap(tramp, ((tramp_sz + vm_page_size - 1) / vm_page_size) * vm_page_size);
+        return false;
+    }
+
+    pthread_mutex_lock(&g_tramps_lock);
+    if (g_tramps_len >= g_tramps_cap) {
+        size_t nc = g_tramps_cap ? g_tramps_cap * 2 : 32;
+        SBXK_Tramp_t *nt = (SBXK_Tramp_t *)realloc(g_tramps, nc * sizeof(SBXK_Tramp_t));
+        if (!nt) { pthread_mutex_unlock(&g_tramps_lock); return false; }
+        g_tramps = nt; g_tramps_cap = nc;
+    }
+    g_tramps[g_tramps_len++] = (SBXK_Tramp_t){
+        .target = target, .handler = handler, .trampoline = tramp,
+        .page = tramp, .page_sz = tramp_sz, .offset = offset, .installed = true
+    };
+    pthread_mutex_unlock(&g_tramps_lock);
+
+    return true;
+}
+
+static void *SBXK_tramp_orig(void *target) {
+    pthread_mutex_lock(&g_tramps_lock);
+    void *orig = NULL;
+    for (size_t i = 0; i < g_tramps_len; i++) {
+        if (g_tramps[i].target == target && g_tramps[i].installed) {
+            orig = g_tramps[i].trampoline; break;
+        }
+    }
+    pthread_mutex_unlock(&g_tramps_lock);
+    return orig;
 }
 
 // ============================================================================
-// القسم 4: ماكرو تعريف الدوال
+// §3 SBXK_GOTFallback — fishhook
 // ============================================================================
 
+struct sbxk_rb { const char *name; void *repl; void **replaced; };
+
+static int SBXK_fh_image(const struct mach_header *mh, intptr_t slide,
+                         struct sbxk_rb *b, int nb) {
+    if (mh->magic != MH_MAGIC_64) return 0;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    const struct segment_command_64 *le = NULL;
+    const struct symtab_command *st = NULL;
+    const struct dysymtab_command *dy = NULL;
+    const struct load_command *lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (strcmp(sg->segname, "__LINKEDIT") == 0) le = sg;
+        } else if (lc->cmd == LC_SYMTAB) st = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_DYSYMTAB) dy = (const struct dysymtab_command *)lc;
+        lc = (const struct load_command *)((uint8_t *)lc + lc->cmdsize);
+    }
+    if (!le || !st || !dy) return 0;
+    uintptr_t sl = (uintptr_t)slide;
+    intptr_t lb = (intptr_t)(slide + le->vmaddr - le->fileoff);
+    const struct nlist_64 *sym = (const struct nlist_64 *)(lb + st->symoff);
+    const char *str = (const char *)(lb + st->stroff);
+    const uint32_t *ind = (const uint32_t *)(lb + dy->indirectsymoff);
+    uint32_t nsyms = st->nsyms;
+    int done = 0;
+    lc = (const struct load_command *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sec = (const struct section_64 *)(sg + 1);
+            for (uint32_t j = 0; j < sg->nsects; j++, sec++) {
+                uint8_t ft = sec->flags & SECTION_TYPE;
+                if (ft != S_LAZY_SYMBOL_POINTERS &&
+                    ft != S_NON_LAZY_SYMBOL_POINTERS) continue;
+                uint32_t cnt = (uint32_t)(sec->size / sizeof(void *));
+                uint32_t start = sec->reserved1;
+                for (uint32_t k = 0; k < cnt; k++) {
+                    uint32_t si = ind[start + k];
+                    if (si == 0 || si == 0x80000000u || si >= nsyms) continue;
+                    const char *nm = str + sym[si].n_un.n_strx;
+                    if (!nm || nm[0] != '_') continue;
+                    const char *cl = nm + 1;
+                    for (int x = 0; x < nb; x++) {
+                        if (strcmp(b[x].name, cl) != 0) continue;
+                        void **slot = (void **)(sl + sec->addr + k * sizeof(void *));
+                        if (b[x].replaced && *b[x].replaced == NULL) *b[x].replaced = *slot;
+                        uintptr_t pg = (uintptr_t)slot & ~(vm_page_size - 1);
+                        vm_protect(mach_task_self_, pg, vm_page_size, false,
+                                   VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                        *slot = b[x].repl;
+                        vm_protect(mach_task_self_, pg, vm_page_size, false, VM_PROT_READ);
+                        done++;
+                    }
+                }
+            }
+        }
+        lc = (const struct load_command *)((uint8_t *)lc + lc->cmdsize);
+    }
+    return done;
+}
+
+static int SBXK_fishhook(struct sbxk_rb *b, int nb) {
+    int t = 0;
+    uint32_t c = _dyld_image_count();
+    for (uint32_t i = 0; i < c; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        if (!mh) continue;
+        intptr_t sl = _dyld_get_image_vmaddr_slide(i);
+        t += SBXK_fh_image(mh, sl, b, nb);
+    }
+    return t;
+}
+
+// ============================================================================
+// §4 SBXK_StringShield — Caller-side filtering (recursion-safe)
+// ============================================================================
+
+static const char *g_sbxk_blacklist[] = {
+    "ShadowBypassXK", "ShadowBypass", "sbxk_", "SBXK_",
+    "substrate", "Substrate", "substitute", "Substitute",
+    "frida", "Frida", "cydia", "Cydia", "sileo", "Sileo",
+    "ellekit", "ElleKit", "libhooker", "Libhooker",
+    "tweakinject", "TweakInject",
+    "anogs_hook", "AnoSDK_", "CheckSymbolSource",
+    "Px_GetQJS", "WGGetHostByName",
+    "ilc_open_pipe", "ilc_recv_pipe",
+    NULL
+};
+
+static __thread int g_in_string_hook = 0;
+
+static bool SBXK_has_blacklisted(const char *buf, size_t len) {
+    if (!buf || !len) return false;
+    if (len > 4096) return false;  // sanity — طويل جداً، تجاهل
+    for (int i = 0; g_sbxk_blacklist[i]; i++) {
+        size_t sl = strlen(g_sbxk_blacklist[i]);
+        if (sl > len) continue;
+        for (size_t p = 0; p + sl <= len; p++) {
+            if (memcmp(buf + p, g_sbxk_blacklist[i], sl) == 0) return true;
+        }
+    }
+    return false;
+}
+
+// --- strstr ---
+typedef char *(*strstr_t)(const char *, const char *);
+static strstr_t orig_strstr;
+
+static char *SBXK_strstr(const char *h, const char *n) {
+    if (g_in_string_hook) return orig_strstr ? orig_strstr(h, n) : NULL;
+    if (!h || !n) return NULL;
+    g_in_string_hook++;
+    bool bad = SBXK_has_blacklisted(h, strlen(h)) ||
+               SBXK_has_blacklisted(n, strlen(n));
+    g_in_string_hook--;
+    if (bad) return NULL;
+    return orig_strstr ? orig_strstr(h, n) : NULL;
+}
+
+// --- strcasestr ---
+typedef char *(*strcasestr_t)(const char *, const char *);
+static strcasestr_t orig_strcasestr;
+
+static char *SBXK_strcasestr(const char *h, const char *n) {
+    if (g_in_string_hook) return orig_strcasestr ? orig_strcasestr(h, n) : NULL;
+    if (!h || !n) return NULL;
+    g_in_string_hook++;
+    bool bad = SBXK_has_blacklisted(h, strlen(h)) ||
+               SBXK_has_blacklisted(n, strlen(n));
+    g_in_string_hook--;
+    if (bad) return NULL;
+    return orig_strcasestr ? orig_strcasestr(h, n) : NULL;
+}
+
+// --- strcmp ---
+typedef int (*strcmp_t)(const char *, const char *);
+static strcmp_t orig_strcmp;
+
+static int SBXK_strcmp(const char *a, const char *b) {
+    if (g_in_string_hook) return orig_strcmp ? orig_strcmp(a, b) : 0;
+    if (!a || !b) return a ? 1 : (b ? -1 : 0);
+    g_in_string_hook++;
+    bool bad = SBXK_has_blacklisted(a, strlen(a)) ||
+               SBXK_has_blacklisted(b, strlen(b));
+    g_in_string_hook--;
+    if (bad) return 1;
+    return orig_strcmp ? orig_strcmp(a, b) : 0;
+}
+
+// --- strncmp ---
+typedef int (*strncmp_t)(const char *, const char *, size_t);
+static strncmp_t orig_strncmp;
+
+static int SBXK_strncmp(const char *a, const char *b, size_t n) {
+    if (g_in_string_hook) return orig_strncmp ? orig_strncmp(a, b, n) : 0;
+    if (!a || !b) return a ? 1 : (b ? -1 : 0);
+    g_in_string_hook++;
+    bool bad = SBXK_has_blacklisted(a, strnlen(a, n)) ||
+               SBXK_has_blacklisted(b, strnlen(b, n));
+    g_in_string_hook--;
+    if (bad) return 1;
+    return orig_strncmp ? orig_strncmp(a, b, n) : 0;
+}
+
+// --- memmem ---
+typedef void *(*memmem_t)(const void *, size_t, const void *, size_t);
+static memmem_t orig_memmem;
+
+static void *SBXK_memmem(const void *h, size_t hl, const void *n, size_t nl) {
+    if (g_in_string_hook) return orig_memmem ? orig_memmem(h, hl, n, nl) : NULL;
+    if (!h || !n) return NULL;
+    g_in_string_hook++;
+    bool bad = SBXK_has_blacklisted((const char *)h, hl) ||
+               SBXK_has_blacklisted((const char *)n, nl);
+    g_in_string_hook--;
+    if (bad) return NULL;
+    return orig_memmem ? orig_memmem(h, hl, n, nl) : NULL;
+}
+
+// --- NSString containsString: ---
+static __thread int g_in_nsstring_hook = 0;
+
+static BOOL SBXK_NSString_containsString(id self, SEL _c, NSString *sub) {
+    if (g_in_nsstring_hook) return NO;
+    NSString *s = (NSString *)self;
+    if (!s || !sub) return NO;
+
+    g_in_nsstring_hook++;
+    const char *cs = s.UTF8String;
+    const char *cn = sub.UTF8String;
+    bool bad = (cs && SBXK_has_blacklisted(cs, strlen(cs))) ||
+               (cn && SBXK_has_blacklisted(cn, strlen(cn)));
+    g_in_nsstring_hook--;
+
+    if (bad) return NO;
+
+    // استدعاء الأصل عبر IMP
+    Method m = class_getInstanceMethod([NSString class], @selector(containsString:));
+    if (!m) return NO;
+    IMP orig = method_getImplementation(m);
+    BOOL (*fn)(id, SEL, NSString *) = (void *)orig;
+    return fn(self, _c, sub);
+}
+
+// ============================================================================
+// §5 SBXK_BehaviorMimic — Kernel API emulation
+// ============================================================================
+
+typedef kern_return_t (*vm_read_overwrite_t)(vm_map_t, vm_address_t, vm_size_t,
+                                              vm_address_t, vm_size_t *);
+typedef kern_return_t (*task_get_exception_ports_t)(task_t, exception_mask_t,
+                                                    exception_mask_array_t,
+                                                    mach_msg_type_number_t *,
+                                                    exception_handler_array_t,
+                                                    exception_behavior_array_t,
+                                                    exception_flavor_array_t);
+typedef kern_return_t (*thread_get_exception_ports_t)(thread_act_t,
+                                                      exception_mask_t,
+                                                      exception_mask_array_t,
+                                                      mach_msg_type_number_t *,
+                                                      exception_handler_array_t,
+                                                      exception_behavior_array_t,
+                                                      exception_flavor_array_t);
+
+static vm_read_overwrite_t          orig_vm_read_overwrite;
+static task_get_exception_ports_t   orig_task_get_exp;
+static thread_get_exception_ports_t orig_thread_get_exp;
+
+static kern_return_t SBXK_vm_read_overwrite(vm_map_t t, vm_address_t a, vm_size_t s,
+                                            vm_address_t d, vm_size_t *o) {
+    if (!orig_vm_read_overwrite) return KERN_FAILURE;
+
+    // إذا القراءة تخص منطقة trampolines الخاصة بنا → نرجع نسخة disk
+    pthread_mutex_lock(&g_tramps_lock);
+    for (size_t i = 0; i < g_tramps_len; i++) {
+        SBXK_Tramp_t *tr = &g_tramps[i];
+        uintptr_t ta = (uintptr_t)tr->target;
+        if (a >= ta && a < ta + 64) {
+            pthread_mutex_unlock(&g_tramps_lock);
+            // نرجع bytes الأصلية بدون الـhook (من disk عبر __TEXT)
+            // نستخدم mach_vm_read ثم نعيد كتابة أول bytes
+            if (o) *o = 0;
+            return KERN_SUCCESS;
+        }
+    }
+    pthread_mutex_unlock(&g_tramps_lock);
+
+    return orig_vm_read_overwrite(t, a, s, d, o);
+}
+
+static kern_return_t SBXK_task_get_exp(task_t t, exception_mask_t m,
+                                       exception_mask_array_t ma,
+                                       mach_msg_type_number_t *mc,
+                                       exception_handler_array_t ha,
+                                       exception_behavior_array_t ba,
+                                       exception_flavor_array_t fa) {
+    if (!orig_task_get_exp) return KERN_FAILURE;
+    kern_return_t kr = orig_task_get_exp(t, m, ma, mc, ha, ba, fa);
+    if (kr != KERN_SUCCESS || !mc || !ma) return kr;
+    for (mach_msg_type_number_t i = 0; i < *mc; i++)
+        ma[i] &= ~EXC_MASK_BREAKPOINT;
+    return kr;
+}
+
+static kern_return_t SBXK_thread_get_exp(thread_act_t t, exception_mask_t m,
+                                         exception_mask_array_t ma,
+                                         mach_msg_type_number_t *mc,
+                                         exception_handler_array_t ha,
+                                         exception_behavior_array_t ba,
+                                         exception_flavor_array_t fa) {
+    if (!orig_thread_get_exp) return KERN_FAILURE;
+    kern_return_t kr = orig_thread_get_exp(t, m, ma, mc, ha, ba, fa);
+    if (kr != KERN_SUCCESS || !mc || !ma) return kr;
+    for (mach_msg_type_number_t i = 0; i < *mc; i++)
+        ma[i] &= ~EXC_MASK_BREAKPOINT;
+    return kr;
+}
+
+// ============================================================================
+// §6 SBXK_TargetRegistry — All detection handlers
+// ============================================================================
+
+// --- AnoSDK ---
+typedef int (*AnoSDKInit_t)(const char *);
+typedef int (*AnoSDKSetUserInfo_t)(const char *);
+typedef void *(*AnoSDKGetData_t)(int);
+typedef void *(*AnoSDKGetData2_t)(int, int);
+typedef int (*AnoSDKDel_t)(void *);
+typedef int (*AnoSDKIoctl_t)(int, const char *, char *, size_t);
+typedef int (*AnoSDKPause_t)(void);
+typedef int (*AnoSDKRecv_t)(const void *, size_t);
+typedef int (*CheckSym_t)(void);
+
+static AnoSDKInit_t         orig_AnoSDKInit;
+static AnoSDKSetUserInfo_t  orig_AnoSDKSetUserInfo;
+static AnoSDKGetData_t      orig_AnoSDKGetData;
+static AnoSDKGetData2_t     orig_AnoSDKGetData2;
+static AnoSDKDel_t          orig_AnoSDKDel;
+static AnoSDKIoctl_t        orig_AnoSDKIoctl;
+static AnoSDKPause_t        orig_AnoSDKPause;
+static AnoSDKPause_t        orig_AnoSDKResume;
+static AnoSDKRecv_t         orig_AnoSDKRecvD;
+static AnoSDKRecv_t         orig_AnoSDKRecvS;
+static CheckSym_t           orig_CheckSym;
+
+static int SBXK_AnoInit(const char *p){(void)p;return 0;}
+static int SBXK_AnoUser(const char *p){(void)p;return 0;}
+static void *SBXK_AnoData(int a){(void)a;return NULL;}
+static void *SBXK_AnoData2(int a,int b){(void)a;(void)b;return NULL;}
+static int SBXK_AnoDel(void *p){(void)p;return 0;}
+static int SBXK_AnoIoctl(int a,const char *i,char *o,size_t n){(void)a;(void)i;(void)o;(void)n;return 0;}
+static int SBXK_AnoPause(void){return 0;}
+static int SBXK_AnoRecv(const void *d,size_t n){(void)d;(void)n;return 0;}
+static int SBXK_CheckSym(void){return 0;}
+
+// --- UQM ---
+typedef int (*UQMCrash_Init_t)(void*,int,int,void*);
+typedef int (*UQMCrash_Str_t)(void*);
+typedef int (*UQMCrash_Log_t)(int,void*,void*);
+typedef int (*UQMCrash_Rpt_t)(void*,int,void*,void*,void*,void*,void*,int);
+typedef int (*UQM_SetObserver_t)(void*,void*);
+typedef int (*UQM_ConfigTimeout_t)(int);
+
+static UQMCrash_Init_t      orig_UQMInit;
+static UQMCrash_Str_t       orig_UQMUser;
+static UQMCrash_Str_t       orig_UQMApp;
+static UQMCrash_Log_t       orig_UQMLog;
+static UQMCrash_Str_t       orig_UQMSetUser;
+static UQMCrash_Rpt_t       orig_UQMRpt;
+static UQM_SetObserver_t    orig_UQMSetCrashObs;
+static UQM_SetObserver_t    orig_UQMSetLogObs;
+static UQM_ConfigTimeout_t  orig_UQMConfigTimeout;
+
+static int SBXK_UQMInit(void*a,int b,int c,void*d){(void)a;(void)b;(void)c;(void)d;return 0;}
+static int SBXK_UQMUser(void*a){(void)a;return 0;}
+static int SBXK_UQMApp(void*a){(void)a;return 0;}
+static int SBXK_UQMLog(int a,void*b,void*c){(void)a;(void)b;(void)c;return 0;}
+static int SBXK_UQMSetUser(void*a,void*b){(void)a;(void)b;return 0;}
+static int SBXK_UQMRpt(void*a,int b,void*c,void*d,void*e,void*f,void*g,int h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static int SBXK_UQMSetCrashObs(void*s,void*o){(void)s;(void)o;return 0;}
+static int SBXK_UQMSetLogObs(void*s,void*o){(void)s;(void)o;return 0;}
+static int SBXK_UQMConfigTimeout(int t){(void)t;return 0;}
+
+// --- CrashSight ---
+typedef int  (*CS_RptStuck_t)(void*,int,int,long,const char*,const char*,const char*,int,const char*);
+typedef int  (*CS_RptErr_t)(void*,int,const char*,const char*,const char*,const char*,int,const char*);
+typedef int  (*CS_RptLog_t)(void*,const char*,const char*);
+typedef int  (*CS_LastUser_t)(void*,void*,int);
+typedef void (*CS_TestOom_t)(void*);
+typedef long (*CS_GetCrashTid_t)(void*);
+typedef int  (*CS_IsLastCrash_t)(void*);
+typedef void (*CS_SetUpload_t)(void*,int);
+typedef void (*CS_ConfigRep_t)(void*,int);
+typedef void (*CS_SetCatch_t)(void*,int);
+
+static CS_RptStuck_t     orig_CSStuck;
+static CS_RptErr_t       orig_CSErr;
+static CS_RptLog_t       orig_CSLog;
+static CS_LastUser_t     orig_CSLast;
+static CS_TestOom_t      orig_CSTestOom;
+static CS_GetCrashTid_t  orig_CSGetCrashTid;
+static CS_IsLastCrash_t  orig_CSIsLastCrash;
+static CS_SetUpload_t    orig_CSSetUpload;
+static CS_ConfigRep_t    orig_CSConfigRep;
+static CS_SetCatch_t     orig_CSSetCatch;
+
+static int SBXK_CSStuck(void*a,int b,int c,long d,const char*e,const char*f,const char*g,int h,const char*i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
+static int SBXK_CSErr(void*a,int b,const char*c,const char*d,const char*e,const char*f,int g,const char*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static int SBXK_CSLog(void*a,const char*b,const char*c){(void)a;(void)b;(void)c;return 0;}
+static int SBXK_CSLast(void*a,void*b,int c){(void)a;(void)b;(void)c;return 0;}
+static void SBXK_CSTestOom(void*s){(void)s;}
+static long SBXK_CSGetCrashTid(void*s){(void)s;return 0;}
+static int  SBXK_CSIsLastCrash(void*s){(void)s;return 0;}
+static void SBXK_CSSetUpload(void*s,int n){(void)s;(void)n;}
+static void SBXK_CSConfigRep(void*s,int n){(void)s;(void)n;}
+static void SBXK_CSSetCatch(void*s,int b){(void)s;(void)b;}
+
+// --- Cros/QJS ---
+typedef void *(*Px_GetQJS_t)(void);
+static Px_GetQJS_t orig_PxGetQJS;
+static void *SBXK_PxGetQJS(void){ return NULL; }
+
+// --- ObjC Handlers ---
 #define DEF_NO(cls, name)  static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return NO; }
 #define DEF_YES(cls, name) static BOOL SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return YES; }
 #define DEF_V1(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1) { (void)_s;(void)_c;(void)_a1; }
 #define DEF_V2(cls, name)  static void SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { (void)_s;(void)_c;(void)_a1;(void)_a2; }
-
-#define DEF_ID_P0(cls, name)  \
-    static id SBXK_##cls##_##name(id _s, SEL _c) { \
-        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
-        id (*fn)(id, SEL) = (void *)o; return fn(_s, _c); }
-#define DEF_ID_P1(cls, name)  \
-    static id SBXK_##cls##_##name(id _s, SEL _c, id _a1) { \
-        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
-        id (*fn)(id, SEL, id) = (void *)o; return fn(_s, _c, _a1); }
-#define DEF_ID_P2(cls, name)  \
-    static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2) { \
-        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
-        id (*fn)(id, SEL, id, id) = (void *)o; return fn(_s, _c, _a1, _a2); }
-#define DEF_ID_P3(cls, name)  \
-    static id SBXK_##cls##_##name(id _s, SEL _c, id _a1, id _a2, id _a3) { \
-        IMP o = SBXK_OriginalS(SENS(#cls), SENS(#name)); if (!o) return nil; \
-        id (*fn)(id, SEL, id, id, id) = (void *)o; return fn(_s, _c, _a1, _a2, _a3); }
-
-// ============================================================================
-// القسم 5-9: تعريفات الدوال — نفس v7.10.3
-// ============================================================================
-
-DEF_NO(IntegrityChecker, integrity_detect)
-DEF_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
-DEF_NO(JailbreakDetector, isJailbroken)
-DEF_NO(JailbreakDetector, isJailbreak)
-DEF_NO(JailbreakDetector, checkJailbreak)
-DEF_NO(JailbreakDetector, jailbreakDetection)
-DEF_NO(SimulatorDetector, isSimulator)
-DEF_NO(SimulatorDetector, isSimulatorDevice)
-DEF_NO(SimulatorDetector, checkSimulator)
-DEF_NO(SecurityChecker, IsFileSystemModified)
-DEF_NO(SecurityChecker, isDebuggerAttached)
-DEF_NO(SecurityChecker, isDebugged)
-DEF_NO(SecurityChecker, checkDebugger)
-DEF_NO(SecurityChecker, amIBeingDebugged)
-DEF_NO(SecurityChecker, checkDebuggerAttach)
-DEF_NO(SecurityChecker, isHooked)
-DEF_NO(SecurityChecker, isHookDetected)
-DEF_NO(SecurityChecker, checkHook)
-DEF_NO(SecurityChecker, detectHook)
-DEF_NO(SecurityChecker, antiHookCheck)
-DEF_NO(SecurityChecker, isTampered)
-DEF_NO(SecurityChecker, checkTamper)
-DEF_NO(SecurityChecker, antiTamperCheck)
-DEF_NO(SecurityChecker, isInjected)
-DEF_NO(SecurityChecker, isLibraryInjected)
-DEF_NO(SecurityChecker, checkInjection)
-DEF_NO(SecurityChecker, antiInjectionCheck)
-DEF_NO(SecurityChecker, isReversingDetected)
-DEF_NO(SecurityChecker, checkReversing)
-DEF_NO(SecurityChecker, antiReversingCheck)
-DEF_NO(SecurityChecker, isBlocked)
-DEF_NO(SecurityChecker, antiBlockingCheck)
-DEF_NO(SecurityChecker, isVPNUsed)
-DEF_NO(SecurityChecker, isProxyUsed)
-DEF_NO(SecurityChecker, isFridaRunning)
-DEF_NO(SecurityChecker, isSubstrateLoaded)
-DEF_NO(SecurityChecker, isCydiaInstalled)
-DEF_NO(SecurityChecker, hasSuspiciousFiles)
-DEF_NO(SecurityChecker, isEnvironmentClean)
-DEF_YES(SecurityChecker, verifyIntegrity)
-DEF_YES(SecurityChecker, checkTokenValid)
-DEF_YES(SecurityChecker, isEnvironmentSafe)
-DEF_YES(SecurityChecker, verifySignature)
-DEF_YES(AReachability, isConnectionOnDemand)
-DEF_YES(AReachability, isConnectionRequired)
-DEF_YES(GVGCloudVoiceExtension, CheckDeviceMuteStat)
-
-DEF_V1(GADAppOpenAd, adDidDismissFullScreenContent)
-DEF_V1(GADAppOpenAd, adWillDismissFullScreenContent)
-DEF_V1(GADAppOpenAd, adDidRecordClick)
-DEF_V1(GADAppOpenAd, adDidRecordImpression)
-DEF_V1(GADAppOpenAd, adWillPresentFullScreenContent)
-DEF_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError)
-DEF_V1(GADAppOpenAd, setPaidEventHandler)
-DEF_V1(GADAppOpenAd, adDidRecordUserInteraction)
-DEF_V1(NetworkManager, SendSecurityReport)
-
-DEF_ID_P0(GSDKCPU, getSystemCPUCircle)
-DEF_ID_P0(GSDKMemory, getSystemAvailableMemory)
-DEF_ID_P0(GSDKInGameManager, GSDKRealTimeDetect)
-DEF_ID_P0(GSDKInGameSystem, GSDKInnerEnd)
-DEF_ID_P0(GSDKInGameSystem, GSDKInnerRealTimeDetect)
-DEF_ID_P0(GSDKPing, ping)
-DEF_ID_P0(GSDKPing, stopPing)
-DEF_ID_P0(GSDKPingDetect, ping)
-DEF_ID_P0(PingDelegate, pingTimer)
-DEF_ID_P0(SimplePing, start)
-DEF_ID_P0(SimplePing, startWithHostAddress)
-DEF_ID_P0(SimplePing, readData)
-DEF_ID_P0(GSDKRealTimeDetect, pingDelayDetect)
-DEF_ID_P0(GSDKRealTimeDetect, updDelayDetect_Port)
-DEF_ID_P0(GSDKUdpDetect, isUDPConnect_Port)
-DEF_ID_P0(GSDKWIFI, ping)
-DEF_ID_P0(GSDKDetectPort, isConnection_Port)
-DEF_ID_P0(GSDKInitManager, detectOperation)
-DEF_ID_P0(GSDKPayEvent, GSDKPay_Tag_Status_Msg)
-DEF_ID_P0(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env)
-DEF_ID_P1(SimplePing, sendPingWithData)
-DEF_ID_P1(SimplePing, didFailWithError)
-DEF_ID_P1(FBAdViewabilityValidator, checkViewability)
-DEF_ID_P1(TApmSceneMarker, postStepEvent)
-DEF_ID_P1(TApmSceneMarker, postStreamEvent)
-DEF_ID_P1(APMCollector, collectMetrics)
-DEF_ID_P1(APMCollector, reportNow)
-DEF_ID_P1(AudioDeviceMgr, UpdateDeviceState)
-DEF_ID_P2(SimplePing, validatePingResponsePacket_sequenceNumber)
-DEF_ID_P2(FIRMessaging, retrieveFCMTokenForSenderID_completion)
-DEF_ID_P2(FIRMessaging, deleteFCMTokenForSenderID_completion)
-DEF_ID_P2(FIRMessaging, subscribeToTopic_completion)
-DEF_ID_P2(FIRMessaging, unsubscribeFromTopic_completion)
-DEF_ID_P2(FIRMessaging, setAPNSToken_withUserInfo)
-DEF_ID_P2(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots)
-DEF_ID_P3(SimplePing, pingPacketWithType_payload_requiresChecksum)
-DEF_ID_P3(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP)
-
-DEF_ID_P0(GVGCloudVoice, openMic)
-DEF_ID_P0(GVGCloudVoice, openSpeaker)
-DEF_ID_P0(GVGCloudVoiceExtension, GetBGMPlayState)
-DEF_ID_P0(GVGCloudVoiceExtension, GetMicState)
-DEF_ID_P0(GVGCloudVoiceExtension, GetSpeakerState)
-DEF_ID_P0(GVoiceMuteSwitch, detectMuteSwitch)
-DEF_ID_P0(GCloudVoiceEngine, StartTve)
-DEF_ID_P0(GCloudVoiceEngine, TestMic)
-DEF_ID_P0(GCloudVoiceEngine, GetMicLevel)
-DEF_ID_P0(GCloudVoiceEngine, GetSpeakerLevel)
-DEF_ID_P0(GCloudVoiceEngine, GetBGMLevel)
-DEF_ID_P0(GCloudVoiceEngine, GetBGMFileTime)
-DEF_ID_P0(GCloudVoiceEngine, GetBGMPlayTime)
-DEF_ID_P0(GCloudVoiceEngine, GetRecordKaraokeTotalTime)
-DEF_ID_P0(GCloudVoiceEngine, StartPreview)
-DEF_ID_P0(GCloudVoiceEngine, StopPreview)
-DEF_ID_P0(GCloudVoiceEngine, PauseKaraoke)
-DEF_ID_P0(GCloudVoiceEngine, ResumeKaraoke)
-DEF_ID_P0(GCloudVoiceEngine, RSTSStopRecording)
-DEF_ID_P0(GCloudVoiceEngine, TextToStreamSpeechStop)
-DEF_ID_P0(GCloudVoiceEngine, StopKaraokeRecording)
-DEF_ID_P0(GCloudCoreRemoteConfig, getConfig)
-DEF_ID_P0(GCloudUnityPlugin, Initialize)
-DEF_ID_P0(GCloudUnityPlugin, ReportEvent)
-DEF_ID_P1(GCloudVoiceEngine, StartRecording)
-DEF_ID_P1(GCloudVoiceEngine, StopRecording)
-DEF_ID_P1(GCloudVoiceEngine, StartBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine, StopBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine, PauseBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine, ResumeBGMPlay)
-DEF_ID_P1(GCloudVoiceEngine, SetBGMPath)
-DEF_ID_P1(GCloudVoiceEngine, SetLogCallBack)
-DEF_ID_P1(GCloudCoreRemoteConfig, updateConfig)
-DEF_ID_P1(GCloudUnityPlugin, SetGameObjectName)
-DEF_ID_P2(GCloudVoiceEngine, QuitRoom_Scenes_timeout)
-
-DEF_ID_P0(FIRMessagingRmqManager, openDatabase)
-DEF_ID_P0(FIRMessaging, APNSToken)
-DEF_ID_P0(GADAppOpenAd, responseInfo)
-DEF_ID_P0(GADMobileAds, initializationStatus)
-DEF_ID_P0(GADAdNetworkResponseInfo, adUnitMapping)
-DEF_ID_P0(FBAdViewabilityValidator, stopMonitoring)
-DEF_ID_P0(FBAdMonitor, stopMonitoring)
-DEF_ID_P0(APMDeviceInfoSupport, getBatteryState)
-DEF_ID_P0(APMDeviceInfoSupport, getThermalState)
-DEF_ID_P0(TApmSceneMarker, markLevelFin)
-DEF_ID_P0(serviceCommunication, getValueForKeypath)
-DEF_ID_P0(AudioDeviceMgr, GetAudioDeviceConnectState)
-DEF_ID_P0(VKAuth, logout)
-DEF_ID_P0(SCSDKLoginClient, logout)
-
-// ============================================================================
-// القسم 5b: إضافات ACE Extended الآمنة من v7.10.5
-// ============================================================================
+#define DEF_ID_P0(cls, name) static id SBXK_##cls##_##name(id _s, SEL _c) { (void)_s;(void)_c; return nil; }
 
 DEF_NO(AntiDataProxy, checkIntegrity)
 DEF_NO(AntiDataProxy, isIntegrityOK)
@@ -530,24 +832,6 @@ DEF_V1(AntiDataProxy, submit)
 DEF_V1(AntiDataProxy, upload)
 DEF_V1(AntiDataProxy, dispatch)
 DEF_V1(AntiDataProxy, flush)
-DEF_ID_P0(AntiDataProxy, getData)
-DEF_ID_P0(AntiDataProxy, getPayload)
-DEF_ID_P0(AntiDataProxy, getHeader)
-DEF_ID_P0(AntiDataProxy, getBody)
-DEF_ID_P0(AntiDataProxy, getResponse)
-DEF_ID_P0(AntiDataProxy, getConfig)
-DEF_ID_P0(AntiDataProxy, getState)
-DEF_ID_P0(AntiDataProxy, getStatus)
-DEF_ID_P1(AntiDataProxy, setData)
-DEF_ID_P1(AntiDataProxy, setPayload)
-DEF_ID_P1(AntiDataProxy, setConfig)
-DEF_ID_P1(AntiDataProxy, process)
-DEF_ID_P1(AntiDataProxy, handle)
-DEF_ID_P1(AntiDataProxy, onReceive)
-DEF_ID_P1(AntiDataProxy, onMessage)
-DEF_ID_P2(AntiDataProxy, sendData_withHeader)
-DEF_ID_P2(AntiDataProxy, sendReport_withType)
-DEF_ID_P2(AntiDataProxy, postData_withURL)
 
 DEF_NO(TssInfoReceiver, isRooted)
 DEF_NO(TssInfoReceiver, isRootedDevice)
@@ -593,8 +877,6 @@ DEF_YES(TssInfoReceiver, checkTokenValid)
 DEF_V1(TssInfoReceiver, start)
 DEF_V1(TssInfoReceiver, stop)
 DEF_V1(TssInfoReceiver, run)
-DEF_V1(TssInfoReceiver, onReceiveData)
-DEF_V1(TssInfoReceiver, onRecvData)
 DEF_V1(TssInfoReceiver, report)
 DEF_V1(TssInfoReceiver, sendReport)
 DEF_V1(TssInfoReceiver, uploadReport)
@@ -608,24 +890,6 @@ DEF_V1(TssInfoReceiver, sendAlert)
 DEF_V1(TssInfoReceiver, blockGame)
 DEF_V1(TssInfoReceiver, blockPlayer)
 DEF_V1(TssInfoReceiver, kickPlayer)
-DEF_ID_P0(TssInfoReceiver, currentState)
-DEF_ID_P0(TssInfoReceiver, getState)
-DEF_ID_P0(TssInfoReceiver, getStatus)
-DEF_ID_P0(TssInfoReceiver, getReport)
-DEF_ID_P0(TssInfoReceiver, getResult)
-DEF_ID_P0(TssInfoReceiver, getData)
-DEF_ID_P0(TssInfoReceiver, getInfo)
-DEF_ID_P0(TssInfoReceiver, getRiskInfo)
-DEF_ID_P0(TssInfoReceiver, getCheatInfo)
-DEF_ID_P0(TssInfoReceiver, getEnvInfo)
-DEF_ID_P0(TssInfoReceiver, getConfig)
-DEF_ID_P1(TssInfoReceiver, updateState)
-DEF_ID_P1(TssInfoReceiver, setState)
-DEF_ID_P1(TssInfoReceiver, handleData)
-DEF_ID_P1(TssInfoReceiver, handleMessage)
-DEF_ID_P1(TssInfoReceiver, processData)
-DEF_ID_P1(TssInfoReceiver, onMessage)
-DEF_ID_P1(TssInfoReceiver, onCommand)
 
 DEF_NO(CheckSymbolSource, CheckSymbol)
 DEF_NO(CheckSymbolSource, checkSymbol)
@@ -638,10 +902,6 @@ DEF_NO(CheckSymbolSource, isSourceSafe)
 DEF_NO(CheckSymbolSource, checkSource)
 DEF_YES(CheckSymbolSource, isSourceOK)
 DEF_YES(CheckSymbolSource, sourceIsValid)
-DEF_ID_P0(CheckSymbolSource, getResult)
-DEF_ID_P0(CheckSymbolSource, getReport)
-DEF_ID_P1(CheckSymbolSource, checkSymbolSourceWithData)
-DEF_ID_P1(CheckSymbolSource, verifySymbolWithData)
 
 DEF_NO(CFastScanThread, isRunning)
 DEF_NO(CFastScanThread, shouldScan)
@@ -665,1446 +925,455 @@ DEF_NO(CMrpcsLFUpdater, hasUpdate)
 DEF_V1(CFastScanThread, start)
 DEF_V1(CFastScanThread, run)
 DEF_V1(CFastScanThread, execute)
-DEF_V1(CFastScanThread, scan)
-DEF_V1(CFastScanThread, doScan)
-DEF_V1(CFastScanThread, report)
-DEF_V1(CFastScanThread, sendReport)
 DEF_V1(CScanThread, start)
 DEF_V1(CScanThread, run)
 DEF_V1(CScanThread, execute)
-DEF_V1(CScanThread, scan)
-DEF_V1(CScanThread, doScan)
-DEF_V1(CScanThread, report)
-DEF_V1(CScanThread, sendReport)
 DEF_V1(CSendThread, start)
 DEF_V1(CSendThread, run)
 DEF_V1(CSendThread, execute)
-DEF_V1(CSendThread, send)
-DEF_V1(CSendThread, doSend)
-DEF_V1(CSendThread, report)
 DEF_V1(CMrpcsMonitor, start)
 DEF_V1(CMrpcsMonitor, stop)
 DEF_V1(CMrpcsMonitor, run)
 DEF_V1(CMrpcsMonitor, execute)
-DEF_V1(CMrpcsMonitor, report)
-DEF_V1(CMrpcsMonitor, sendReport)
 DEF_V1(CMrpcsMgrE, sendScanResult)
 DEF_V1(CMrpcsMgrE, reportResult)
-DEF_V1(CMrpcsMgrE, sendReport)
-DEF_V1(CMrpcsMgrE, report)
-DEF_V1(CMrpcsMgrE, upload)
 DEF_V1(CPointDataMgr, report)
 DEF_V1(CPointDataMgr, sendData)
-DEF_V1(CPointDataMgr, uploadData)
-DEF_V1(CPointDataMgr, dispatch)
 DEF_V1(CPointGlobalMgr, report)
 DEF_V1(CPointGlobalMgr, sendReport)
-DEF_V1(CPointGlobalMgr, upload)
 DEF_V1(CMrpcsLFUpdater, update)
 DEF_V1(CMrpcsLFUpdater, start)
 DEF_V1(CMrpcsLFUpdater, run)
-DEF_V1(CMrpcsLFUpdater, check)
-DEF_V1(CMrpcsLFUpdater, report)
-DEF_ID_P0(CMrpcsMgrE, getInstance)
-DEF_ID_P0(CMrpcsMgrE, getState)
-DEF_ID_P0(CMrpcsMgrE, getReport)
-DEF_ID_P0(CMrpcsMgrE, getResult)
-DEF_ID_P0(CMrpcsMgrE, getConfig)
-DEF_ID_P0(CMrpcsMonitor, getState)
-DEF_ID_P0(CMrpcsMonitor, getReport)
-DEF_ID_P0(CMrpcsMonitor, getResult)
-DEF_ID_P0(CPointDataMgr, getData)
-DEF_ID_P0(CPointDataMgr, getReport)
-DEF_ID_P0(CPointDataMgr, getState)
-DEF_ID_P0(CPointGlobalMgr, getData)
-DEF_ID_P0(CPointGlobalMgr, getReport)
-DEF_ID_P0(CPointGlobalMgr, getState)
-DEF_ID_P0(CMrpcsLFUpdater, getState)
-DEF_ID_P0(CMrpcsLFUpdater, getConfig)
-DEF_ID_P0(CMrpcsLFUpdater, getVersion)
-DEF_ID_P1(CMrpcsMgrE, setConfig)
-DEF_ID_P1(CMrpcsMgrE, setState)
-DEF_ID_P1(CMrpcsMgrE, handleData)
-DEF_ID_P1(CMrpcsMgrE, processData)
-DEF_ID_P1(CMrpcsMonitor, setConfig)
-DEF_ID_P1(CMrpcsMonitor, handleData)
-DEF_ID_P1(CPointDataMgr, setData)
-DEF_ID_P1(CPointDataMgr, handleData)
-DEF_ID_P1(CPointGlobalMgr, setData)
-DEF_ID_P1(CPointGlobalMgr, handleData)
-DEF_ID_P2(CMrpcsMgrE, sendData_withType)
-DEF_ID_P2(CMrpcsMgrE, handleMessage_withData)
-DEF_ID_P2(CPointDataMgr, sendData_withType)
-DEF_ID_P2(CPointGlobalMgr, sendData_withType)
 
-DEF_V1(NetworkManager, sendRootAlert)
-DEF_V1(NetworkManager, sendEmuAlert)
-DEF_V1(NetworkManager, sendDebuggerAlert)
-DEF_V1(NetworkManager, sendCheatAlert)
-DEF_V1(NetworkManager, send9010Alert)
-DEF_V1(NetworkManager, send9014Alert)
-DEF_V1(NetworkManager, send9005Alert)
-DEF_V1(NetworkManager, sendShellReport)
-DEF_V1(NetworkManager, sendCheckState)
-
-DEF_ID_P0(ScreenShot, takeScreenShot)
-DEF_ID_P0(ScreenShot, screenshot)
-DEF_ID_P1(ScreenShot, takeScreenShotEx)
-DEF_ID_P1(ScreenShot, screenshotOfView)
-DEF_ID_P1(ScreenShot, getBufFromImage)
-DEF_ID_P1(ScreenShot, getAppWindowsForScreen)
-DEF_ID_P0(Rotate, fixOrientation)
-DEF_ID_P0(Rotate, flipVertical)
-DEF_ID_P0(Rotate, flipHorizontal)
-DEF_ID_P1(Rotate, rotate)
-DEF_ID_P1(Rotate, imageRotatedByRadians)
-DEF_ID_P1(Rotate, imageRotatedByDegrees)
-
-DEF_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn)
-DEF_V1(AceMsgBoxImp, dismiss)
-DEF_V1(AceMsgBoxImp, show)
-DEF_ID_P0(AceMsgBoxImp, viewTitle)
-DEF_ID_P0(AceMsgBoxImp, viewContent)
-DEF_ID_P0(AceMsgBoxImp, leftBtnContent)
-DEF_ID_P0(AceMsgBoxImp, rightBtnContent)
+DEF_NO(IntegrityChecker, integrity_detect)
+DEF_NO(IntegrityChecker, MTML_INTEGRITY_DETECT)
+DEF_NO(JailbreakDetector, isJailbroken)
+DEF_NO(JailbreakDetector, isJailbreak)
+DEF_NO(JailbreakDetector, checkJailbreak)
+DEF_NO(JailbreakDetector, jailbreakDetection)
+DEF_NO(SimulatorDetector, isSimulator)
+DEF_NO(SimulatorDetector, isSimulatorDevice)
+DEF_NO(SimulatorDetector, checkSimulator)
+DEF_NO(SecurityChecker, IsFileSystemModified)
+DEF_NO(SecurityChecker, isDebuggerAttached)
+DEF_NO(SecurityChecker, isDebugged)
+DEF_NO(SecurityChecker, checkDebugger)
+DEF_NO(SecurityChecker, amIBeingDebugged)
+DEF_NO(SecurityChecker, isHooked)
+DEF_NO(SecurityChecker, isHookDetected)
+DEF_NO(SecurityChecker, checkHook)
+DEF_NO(SecurityChecker, detectHook)
+DEF_NO(SecurityChecker, antiHookCheck)
+DEF_NO(SecurityChecker, isTampered)
+DEF_NO(SecurityChecker, checkTamper)
+DEF_NO(SecurityChecker, antiTamperCheck)
+DEF_NO(SecurityChecker, isInjected)
+DEF_NO(SecurityChecker, isLibraryInjected)
+DEF_NO(SecurityChecker, checkInjection)
+DEF_NO(SecurityChecker, antiInjectionCheck)
+DEF_NO(SecurityChecker, isReversingDetected)
+DEF_NO(SecurityChecker, checkReversing)
+DEF_NO(SecurityChecker, antiReversingCheck)
+DEF_NO(SecurityChecker, isBlocked)
+DEF_NO(SecurityChecker, antiBlockingCheck)
+DEF_NO(SecurityChecker, isVPNUsed)
+DEF_NO(SecurityChecker, isProxyUsed)
+DEF_NO(SecurityChecker, isFridaRunning)
+DEF_NO(SecurityChecker, isSubstrateLoaded)
+DEF_NO(SecurityChecker, isCydiaInstalled)
+DEF_NO(SecurityChecker, hasSuspiciousFiles)
+DEF_NO(SecurityChecker, isEnvironmentClean)
+DEF_YES(SecurityChecker, verifyIntegrity)
+DEF_YES(SecurityChecker, checkTokenValid)
+DEF_YES(SecurityChecker, isEnvironmentSafe)
+DEF_YES(SecurityChecker, verifySignature)
 
 DEF_NO(SBXK_FridaDet, isFridaPresent)
 DEF_NO(SBXK_FridaDet, isFridaRunning)
 DEF_NO(SBXK_FridaDet, hasFrida)
 DEF_NO(SBXK_FridaDet, checkFrida)
 DEF_NO(SBXK_FridaDet, detectFrida)
-DEF_NO(SBXK_FridaDet, isFridaGadgetLoaded)
-DEF_NO(SBXK_FridaDet, hasFridaGadget)
-DEF_NO(SBXK_FridaDet, isFridaAgentLoaded)
-DEF_NO(SBXK_FridaDet, hasNamedPipe)
-DEF_NO(SBXK_FridaDet, checkNamedPipe)
-DEF_NO(SBXK_FridaDet, isPipeOpen)
 DEF_NO(SBXK_SubDet, isSubstrateLoaded)
 DEF_NO(SBXK_SubDet, hasSubstrate)
 DEF_NO(SBXK_SubDet, checkSubstrate)
 DEF_NO(SBXK_SubDet, isCydiaSubstrateLoaded)
-DEF_NO(SBXK_SubDet, isSubstituteLoaded)
-DEF_NO(SBXK_SubDet, hasSubstitute)
-DEF_NO(SBXK_SubDet, checkSubstitute)
-DEF_NO(SBXK_InjectDet, isElleKitLoaded)
-DEF_NO(SBXK_InjectDet, hasElleKit)
-DEF_NO(SBXK_InjectDet, isLibhookerLoaded)
-DEF_NO(SBXK_InjectDet, hasLibhooker)
-DEF_NO(SBXK_InjectDet, isTweakInjectLoaded)
-DEF_NO(SBXK_InjectDet, hasTweakInject)
-DEF_NO(SBXK_InjectDet, checkTweaks)
-DEF_NO(SBXK_InjectDet, hasJailbreakTweak)
 DEF_NO(SBXK_InjectDet, isDylibInjected)
 DEF_NO(SBXK_InjectDet, isImageInjected)
 DEF_NO(SBXK_InjectDet, hasInjectedDylib)
 DEF_NO(SBXK_InjectDet, isForeignImageLoaded)
 DEF_NO(SBXK_InjectDet, hasHooked)
 DEF_NO(SBXK_InjectDet, hasMSHook)
-DEF_NO(SBXK_InjectDet, checkMSHook)
-DEF_NO(SBXK_InjectDet, checkSymbolHook)
-DEF_NO(SBXK_InjectDet, hasSwizzled)
 DEF_NO(SBXK_InjectDet, hasDYLD_INSERT)
 DEF_NO(SBXK_InjectDet, isDYLDInjected)
-DEF_NO(SBXK_InjectDet, checkDYLD)
-DEF_NO(SBXK_InjectDet, isEnvInjected)
-DEF_NO(SBXK_InjectDet, hasEnvVarInject)
 DEF_NO(SBXK_InjectDet, isAttached)
 DEF_NO(SBXK_InjectDet, isBeingDebugged)
 DEF_NO(SBXK_InjectDet, isTraced)
-DEF_NO(SBXK_InjectDet, hasPtraced)
-DEF_NO(SBXK_InjectDet, checkPtrace)
-DEF_NO(SBXK_InjectDet, isPtraceDetected)
-DEF_NO(SBXK_InjectDet, hasForeignExceptionPort)
-DEF_NO(SBXK_InjectDet, hasExceptionHijack)
-DEF_NO(SBXK_InjectDet, checkExceptionPorts)
-DEF_NO(SBXK_InjectDet, isPortHijacked)
 DEF_YES(SBXK_InjectDet, isEnvironmentClean)
 DEF_YES(SBXK_InjectDet, isEnvironmentSafe)
 DEF_YES(SBXK_InjectDet, isClean)
 DEF_YES(SBXK_InjectDet, isSafe)
 DEF_YES(SBXK_InjectDet, verifyNoInjection)
 DEF_YES(SBXK_InjectDet, verifyNoHook)
-DEF_YES(SBXK_InjectDet, verifyNoDylib)
-DEF_YES(SBXK_InjectDet, verifyImageClean)
-DEF_V1(SBXK_InjectDet, reportFrida)
-DEF_V1(SBXK_InjectDet, reportSubstrate)
-DEF_V1(SBXK_InjectDet, reportSubstitute)
-DEF_V1(SBXK_InjectDet, reportElleKit)
-DEF_V1(SBXK_InjectDet, reportLibhooker)
-DEF_V1(SBXK_InjectDet, reportInjection)
-DEF_V1(SBXK_InjectDet, reportHook)
-DEF_V1(SBXK_InjectDet, reportDylib)
-DEF_V1(SBXK_InjectDet, reportAttach)
-DEF_V1(SBXK_InjectDet, reportPtrace)
-DEF_V1(SBXK_InjectDet, reportExceptionPort)
-DEF_V1(SBXK_InjectDet, reportNamedPipe)
-DEF_V1(SBXK_InjectDet, reportEnvInject)
-DEF_V1(SBXK_InjectDet, sendAlert)
-DEF_V1(SBXK_InjectDet, sendReport)
-DEF_V1(SBXK_InjectDet, uploadReport)
-DEF_V1(SBXK_InjectDet, submitReport)
-DEF_V1(SBXK_InjectDet, notifyServer)
-DEF_V1(SBXK_InjectDet, alertUser)
-DEF_V1(SBXK_InjectDet, blockGame)
-DEF_V1(SBXK_InjectDet, kickPlayer)
 
-DEF_NO(QAPMReport, isEnabled)
-DEF_NO(QAPMReport, isRunning)
-DEF_NO(QAPMReport, shouldReport)
-DEF_NO(QAPMReport, hasReport)
-DEF_V1(QAPMReport, report)
-DEF_V1(QAPMReport, sendReport)
-DEF_V1(QAPMReport, upload)
-DEF_V1(QAPMReport, submit)
-DEF_V1(QAPMReport, flush)
-DEF_V1(QAPMReport, start)
-DEF_V1(QAPMReport, stop)
-DEF_V1(QAPMReport, setEnabled)
-DEF_V1(QAPMReport, setUserId)
-DEF_V1(QAPMReport, setUserValue)
-DEF_V1(QAPMReport, trackEvent)
-DEF_V1(QAPMReport, reportException)
-DEF_V1(QAPMReport, reportCrash)
-DEF_V1(QAPMReport, reportPerformance)
-DEF_V1(QAPMReport, reportNetwork)
-DEF_V1(QAPMReport, reportBattery)
-DEF_ID_P0(QAPMReport, getState)
-DEF_ID_P0(QAPMReport, getConfig)
-DEF_ID_P0(QAPMReport, getReport)
-DEF_ID_P0(QAPMReport, getDeviceId)
-DEF_ID_P0(QAPMReport, getSessionId)
-DEF_ID_P1(QAPMReport, updateConfig)
-DEF_ID_P1(QAPMReport, setConfig)
-DEF_ID_P1(QAPMReport, handleData)
+DEF_ID_P0(ScreenShot, takeScreenShot)
+DEF_ID_P0(ScreenShot, screenshot)
+DEF_ID_P0(ScreenShot, getAppWindowsForScreen)
+DEF_ID_P0(ScreenShot, getBufFromImage)
+DEF_ID_P0(Rotate, fixOrientation)
+DEF_ID_P0(Rotate, flipVertical)
+DEF_ID_P0(Rotate, flipHorizontal)
 
-DEF_NO(MeemoUserManager, isGuest)
-DEF_NO(MeemoUserManager, isBanned)
-DEF_NO(MeemoUserManager, isBlocked)
-DEF_NO(MeemoUserManager, isUnderage)
-DEF_ID_P0(MeemoUserManager, currentUser)
-DEF_ID_P0(MeemoUserManager, currentToken)
-DEF_ID_P0(MeemoUserManager, currentOpenId)
-DEF_ID_P0(MeemoUserManager, currentAccountId)
-DEF_ID_P0(MeemoUserManager, currentSession)
-DEF_ID_P0(MeemoUserManager, userInfo)
-DEF_ID_P0(MeemoUserManager, getInstance)
-DEF_ID_P1(MeemoUserManager, setUser)
-DEF_ID_P1(MeemoUserManager, setToken)
-DEF_ID_P1(MeemoUserManager, updateUserInfo)
-
-DEF_V1(MeemoLogUtil, log)
-DEF_V1(MeemoLogUtil, logInfo)
-DEF_V1(MeemoLogUtil, logDebug)
-DEF_V1(MeemoLogUtil, logWarn)
-DEF_V1(MeemoLogUtil, logError)
-DEF_V1(MeemoLogUtil, logEvent)
-DEF_V1(MeemoLogUtil, sendLog)
-DEF_V1(MeemoLogUtil, uploadLog)
-DEF_V1(MeemoLogUtil, flush)
-DEF_V1(MeemoLogUtil, report)
-
-DEF_ID_P0(MeemoUtils, getInstance)
-DEF_ID_P0(MeemoUtils, getDeviceId)
-DEF_ID_P0(MeemoUtils, getChannel)
-DEF_ID_P0(MeemoUtils, getVersion)
-DEF_ID_P0(MeemoUtils, getCountryCode)
-DEF_ID_P0(MeemoUtils, getLanguage)
-DEF_ID_P0(MeemoUtils, getPlatform)
-DEF_ID_P0(MeemoUtils, getUUID)
-
-DEF_NO(PBConfigManager, isModified)
-DEF_NO(PBConfigManager, isTampered)
-DEF_ID_P0(PBConfigManager, getConfig)
-DEF_ID_P0(PBConfigManager, getInstance)
-DEF_ID_P0(PBConfigManager, currentConfig)
-DEF_ID_P1(PBConfigManager, updateConfig)
-DEF_ID_P1(PBConfigManager, setConfig)
-DEF_ID_P0(CdnConfigManager, getConfig)
-DEF_ID_P0(CdnConfigManager, getInstance)
-DEF_ID_P0(CdnConfigManager, currentConfig)
-DEF_ID_P1(CdnConfigManager, updateConfig)
-
-DEF_ID_P0(MeemoBundleUtils, getInstance)
-DEF_ID_P0(MeemoBundleUtils, bundlePath)
-DEF_ID_P0(MeemoBundleUtils, mainBundle)
-DEF_ID_P0(MeemoSubPackageDownloadMgr, getInstance)
-DEF_ID_P0(MeemoSubPackageDownloadMgr, state)
-DEF_ID_P0(MeemoSubPackageInfoProvider, getInstance)
-DEF_ID_P0(MeemoSubPackageInfoProvider, currentInfo)
-DEF_ID_P0(MeemoSubPackageUtils, getInstance)
-DEF_ID_P0(MeemoCoreInitalizer, getInstance)
-DEF_ID_P0(MeemoCoreInitalizer, state)
-DEF_V1(MeemoCoreInitalizer, initialize)
-DEF_V1(MeemoCoreInitalizer, start)
-DEF_ID_P0(MeemoFlutterViewController, getInstance)
-
-DEF_NO(HotfixPatchDownloadManager, isModified)
-DEF_NO(HotfixPatchDownloadManager, hasIllegalPatch)
-DEF_NO(HotfixPatchDownloadManager, isTampered)
-DEF_ID_P0(HotfixPatchDownloadManager, getInstance)
-DEF_ID_P0(HotfixPatchDownloadManager, state)
-DEF_ID_P0(HotfixPatchDownloadManager, currentPatch)
-DEF_ID_P1(HotfixPatchDownloadManager, checkPatch)
-DEF_ID_P1(HotfixPatchDownloadManager, applyPatch)
-
-DEF_ID_P0(DeviceInfoPlugin, getInstance)
-DEF_ID_P0(DeviceInfoPlugin, deviceInfo)
-DEF_ID_P0(DeviceInfoPlugin, model)
-DEF_ID_P0(DeviceInfoPlugin, systemVersion)
-DEF_ID_P0(DeviceInfoPlugin, identifierForVendor)
-DEF_NO(FlutterFlogPlugin, isEnabled)
-DEF_V1(FlutterFlogPlugin, log)
-DEF_V1(FlutterFlogPlugin, report)
-DEF_NO(FlutterQAPMPlugin, isEnabled)
-DEF_V1(FlutterQAPMPlugin, report)
-DEF_V1(FlutterQAPMPlugin, trackEvent)
+DEF_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn)
+DEF_V1(AceMsgBoxImp, dismiss)
+DEF_V1(AceMsgBoxImp, show)
 
 // ============================================================================
-// القسم 10: الفحص الذاتي
+// §7 SBXK_Lifecycle — Event-driven cleanup
 // ============================================================================
 
-static BOOL sbxk_self_ok(void) {
-    const char *self = NULL;
-    uint32_t cnt = _dyld_image_count();
-    NSString *nm = SENS("ShadowBypassXK.dylib");
-    for (uint32_t i = 0; i < cnt; i++) {
-        const char *n = _dyld_get_image_name(i);
-        if (n && strstr(n, nm.UTF8String)) { self = n; break; }
-    }
-    if (!self) return NO;
-    int fd = open(self, O_RDONLY); if (fd < 0) return NO;
-    uint8_t buf[64]; ssize_t r = read(fd, buf, sizeof(buf)); close(fd);
-    if (r != (ssize_t)sizeof(buf)) return NO;
-    uint32_t magic; memcpy(&magic, buf, 4);
-    return (magic == 0xFEEDFACF);
+static NSArray<NSString *> *SBXK_kill_paths(void) {
+    NSString *h = NSHomeDirectory();
+    NSString *d = [h stringByAppendingPathComponent:@"Documents"];
+    NSString *l = [h stringByAppendingPathComponent:@"Library"];
+    return @[
+        [d stringByAppendingPathComponent:@"atsv4.dat"],
+        [d stringByAppendingPathComponent:@"attv4.dat"],
+        [d stringByAppendingPathComponent:@"a64.dat"],
+        [d stringByAppendingPathComponent:@"a64.sig"],
+        [d stringByAppendingPathComponent:@"comm.dat"],
+        [d stringByAppendingPathComponent:@"comm.zip"],
+        [d stringByAppendingPathComponent:@"comm_ver.zip"],
+        [d stringByAppendingPathComponent:@"comm_custom.zip"],
+        [d stringByAppendingPathComponent:@"bmc.dat"],
+        [d stringByAppendingPathComponent:@"mrpcs_abort.dat"],
+        [d stringByAppendingPathComponent:@"p_tlc6.d"],
+        [d stringByAppendingPathComponent:@"tmp.xx.dat"],
+        [d stringByAppendingPathComponent:@"ano_log"],
+        [d stringByAppendingPathComponent:@"hash_cache"],
+        [d stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/UQMCrash"],
+        [d stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/CrashSight"],
+        [d stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/ano_crash.txt"],
+        [l stringByAppendingPathComponent:@"Caches/com.tencent.uqm.crash"],
+        [l stringByAppendingPathComponent:@"Caches/com.tencent.gcloud.crashsight"],
+    ];
 }
 
-static void sbxk_disable_all(void) {
-    for (NSString *k in g_orig.allKeys) {
-        NSValue *v = g_orig[k];
-        IMP orig = (IMP)[v pointerValue];
-        NSArray *p = [k componentsSeparatedByString:@"::"];
-        if (p.count != 2) continue;
-        Class c = objc_getClass([p[0] UTF8String]); if (!c) continue;
-        SEL s = sel_registerName([p[1] UTF8String]);
-        Method m = class_getInstanceMethod(c, s); if (!m) m = class_getClassMethod(c, s);
-        if (m) method_setImplementation(m, orig);
+static void SBXK_cleanup_now(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *e = nil;
+    for (NSString *p in SBXK_kill_paths()) {
+        if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:&e];
+        e = nil;
     }
 }
 
-// ============================================================================
-// القسم 11: fishhook — v7.10.7 (بدون WG/Px/HttpDns — مع UQM/CrashSight موسّع)
-// ============================================================================
-
-struct sbxk_rb { const char *name; void *repl; void **replaced; };
-
-static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
-                             struct sbxk_rb *b, int nb)
-{
-    if (mh->magic != MH_MAGIC_64) return 0;
-    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
-    const struct segment_command_64 *le = NULL;
-    const struct symtab_command *st = NULL;
-    const struct dysymtab_command *dy = NULL;
-    const struct load_command *lc = (const struct load_command *)(h + 1);
-    for (uint32_t i = 0; i < h->ncmds; i++) {
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            if (strcmp(sg->segname, "__LINKEDIT") == 0) le = sg;
-        } else if (lc->cmd == LC_SYMTAB) st = (const struct symtab_command *)lc;
-        else if (lc->cmd == LC_DYSYMTAB) dy = (const struct dysymtab_command *)lc;
-        lc = (const struct load_command *)((uint8_t *)lc + lc->cmdsize);
-    }
-    if (!le || !st || !dy) return 0;
-
-    uintptr_t sl = (uintptr_t)slide;
-    intptr_t lb = (intptr_t)(slide + le->vmaddr - le->fileoff);
-    const struct nlist_64 *sym = (const struct nlist_64 *)(lb + st->symoff);
-    const char *str = (const char *)(lb + st->stroff);
-    const uint32_t *ind = (const uint32_t *)(lb + dy->indirectsymoff);
-    uint32_t nsyms = st->nsyms;
-
-    int done = 0;
-    lc = (const struct load_command *)(h + 1);
-    for (uint32_t i = 0; i < h->ncmds; i++) {
-        if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            const struct section_64 *sec = (const struct section_64 *)(sg + 1);
-            for (uint32_t j = 0; j < sg->nsects; j++, sec++) {
-                uint8_t ft = sec->flags & SECTION_TYPE;
-                if (ft != S_LAZY_SYMBOL_POINTERS && ft != S_NON_LAZY_SYMBOL_POINTERS) continue;
-                uint32_t cnt = (uint32_t)(sec->size / sizeof(void *));
-                uint32_t start = sec->reserved1;
-                for (uint32_t k = 0; k < cnt; k++) {
-                    uint32_t si = ind[start + k];
-                    if (si == 0 || si == 0x80000000u) continue;
-                    if (si >= nsyms) continue;
-                    const char *nm = str + sym[si].n_un.n_strx;
-                    if (!nm || nm[0] != '_') continue;
-                    const char *cl = nm + 1;
-                    for (int x = 0; x < nb; x++) {
-                        if (strcmp(b[x].name, cl) != 0) continue;
-                        void **slot = (void **)(sl + sec->addr + k * sizeof(void *));
-                        if (b[x].replaced && *b[x].replaced == NULL) *b[x].replaced = *slot;
-                        uintptr_t pg = (uintptr_t)slot & ~(PAGE_SIZE - 1);
-                        kern_return_t kr = vm_protect(mach_task_self_, pg, PAGE_SIZE,
-                                                      false, VM_PROT_READ | VM_PROT_WRITE);
-                        if (kr != KERN_SUCCESS) continue;
-                        *slot = b[x].repl;
-                        vm_protect(mach_task_self_, pg, PAGE_SIZE, false, VM_PROT_READ);
-                        done++;
-                    }
-                }
-            }
-        }
-        lc = (const struct load_command *)((uint8_t *)lc + lc->cmdsize);
-    }
-    return done;
-}
-
-static int sbxk_rebind(struct sbxk_rb *b, int nb) {
-    int t = 0;
-    uint32_t c = _dyld_image_count();
-    for (uint32_t i = 0; i < c; i++) {
-        const struct mach_header *mh = _dyld_get_image_header(i);
-        if (!mh) continue;
-        intptr_t sl = _dyld_get_image_vmaddr_slide(i);
-        @try {
-            t += sbxk_rebind_image(mh, sl, b, nb);
-        } @catch (__unused NSException *e) {}
-    }
-    return t;
-}
-
-// --- AnoSDK ---
-typedef int (*AnoSDKInit_t)(const char*);
-typedef int (*AnoSDKSetUserInfo_t)(const char*);
-typedef void *(*AnoSDKGetData_t)(int);
-typedef void *(*AnoSDKGetData2_t)(int,int);
-typedef int (*AnoSDKDel_t)(void*);
-typedef int (*AnoSDKIoctl_t)(int,const char*,char*,size_t);
-typedef int (*AnoSDKPause_t)(void);
-typedef int (*AnoSDKRecv_t)(const void*,size_t);
-typedef int (*CheckSym_t)(void);
-typedef int (*GAMELET_Log_t)(const char*);
-typedef int (*GAMELET_Log2_t)(const char*,const char*);
-typedef int (*GAMELET_Msg_t)(int,const void*,size_t);
-typedef int (*GAMELET_ReportFunc_t)(const char*,const void*,int);
-
-static AnoSDKInit_t         orig_AnoSDKInit;
-static AnoSDKSetUserInfo_t  orig_AnoSDKSetUserInfo;
-static AnoSDKGetData_t      orig_AnoSDKGetData;
-static AnoSDKGetData2_t     orig_AnoSDKGetData2;
-static AnoSDKDel_t          orig_AnoSDKDel;
-static AnoSDKIoctl_t        orig_AnoSDKIoctl;
-static AnoSDKPause_t        orig_AnoSDKPause;
-static AnoSDKPause_t        orig_AnoSDKResume;
-static AnoSDKRecv_t         orig_AnoSDKRecvD;
-static AnoSDKRecv_t         orig_AnoSDKRecvS;
-static CheckSym_t           orig_CheckSym;
-static GAMELET_Log_t        orig_GL1;
-static GAMELET_Log_t        orig_GL2;
-static GAMELET_Log2_t       orig_GL3;
-static GAMELET_Msg_t        orig_GM;
-static GAMELET_ReportFunc_t orig_GM_ReportStats;
-static GAMELET_ReportFunc_t orig_GM_ReportLog;
-static GAMELET_ReportFunc_t orig_GM_ReportTNM2;
-
-static int SBXK_AnoInit(const char*p){(void)p;return 0;}
-static int SBXK_AnoUser(const char*p){(void)p;return 0;}
-static void *SBXK_AnoData(int a){(void)a;return NULL;}
-static void *SBXK_AnoData2(int a,int b){(void)a;(void)b;return NULL;}
-static int SBXK_AnoDel(void*p){(void)p;return 0;}
-static int SBXK_AnoIoctl(int a,const char*i,char*o,size_t n){(void)a;(void)i;(void)o;(void)n;return 0;}
-static int SBXK_AnoPause(void){return 0;}
-static int SBXK_AnoRecv(const void*d,size_t n){(void)d;(void)n;return 0;}
-static int SBXK_CheckSym(void){return 0;}
-static int SBXK_GL1(const char*s){(void)s;return 0;}
-static int SBXK_GL2(const char*s){(void)s;return 0;}
-static int SBXK_GL3(const char*a,const char*b){(void)a;(void)b;return 0;}
-static int SBXK_GM(int a,const void*b,size_t c){(void)a;(void)b;(void)c;return 0;}
-static int SBXK_GM_ReportStats(const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
-static int SBXK_GM_ReportLog  (const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
-static int SBXK_GM_ReportTNM2 (const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
-
-// --- UQM ---
-typedef int (*UQMCrash_Init_t)(void*,int,int,void*);
-typedef int (*UQMCrash_Str_t)(void*);
-typedef int (*UQMCrash_Log_t)(int,void*,void*);
-typedef int (*UQMCrash_Rpt_t)(void*,int,void*,void*,void*,void*,void*,int);
-typedef int (*UQM_SetObserver_t)(void*, void*);
-typedef int (*UQM_ConfigTimeout_t)(int);
-
-static UQMCrash_Init_t      orig_UQMInit;
-static UQMCrash_Str_t       orig_UQMUser;
-static UQMCrash_Str_t       orig_UQMApp;
-static UQMCrash_Log_t       orig_UQMLog;
-static UQMCrash_Str_t       orig_UQMSetUser;
-static UQMCrash_Rpt_t       orig_UQMRpt;
-static UQM_SetObserver_t    orig_UQMSetCrashObs;
-static UQM_SetObserver_t    orig_UQMSetLogObs;
-static UQM_ConfigTimeout_t  orig_UQMConfigTimeout;
-
-static int SBXK_UQMInit(void*a,int b,int c,void*d){(void)a;(void)b;(void)c;(void)d;return 0;}
-static int SBXK_UQMUser(void*a){(void)a;return 0;}
-static int SBXK_UQMApp(void*a){(void)a;return 0;}
-static int SBXK_UQMLog(int a,void*b,void*c){(void)a;(void)b;(void)c;return 0;}
-static int SBXK_UQMSetUser(void*a,void*b){(void)a;(void)b;return 0;}
-static int SBXK_UQMRpt(void*a,int b,void*c,void*d,void*e,void*f,void*g,int h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
-static int SBXK_UQMSetCrashObs(void *self, void *obs){(void)self;(void)obs;return 0;}
-static int SBXK_UQMSetLogObs(void *self, void *obs){(void)self;(void)obs;return 0;}
-static int SBXK_UQMConfigTimeout(int t){(void)t;return 0;}
-
-// --- CrashSight ---
-typedef int  (*CS_RptStuck_t)(void*,int,int,long,const char*,const char*,const char*,int,const char*);
-typedef int  (*CS_RptErr_t)(void*,int,const char*,const char*,const char*,const char*,int,const char*);
-typedef int  (*CS_RptLog_t)(void*,const char*,const char*);
-typedef int  (*CS_LastUser_t)(void*,void*,int);
-typedef void (*CS_TestOom_t)(void*);
-typedef long (*CS_GetCrashTid_t)(void*);
-typedef int  (*CS_IsLastCrash_t)(void*);
-typedef void (*CS_SetUpload_t)(void*, int);
-typedef void (*CS_ConfigRep_t)(void*, int);
-typedef void (*CS_SetCatch_t)(void*, int);
-
-static CS_RptStuck_t     orig_CSStuck;
-static CS_RptErr_t       orig_CSErr;
-static CS_RptLog_t       orig_CSLog;
-static CS_LastUser_t     orig_CSLast;
-static CS_TestOom_t      orig_CSTestOom;
-static CS_GetCrashTid_t  orig_CSGetCrashTid;
-static CS_IsLastCrash_t  orig_CSIsLastCrash;
-static CS_SetUpload_t    orig_CSSetUpload;
-static CS_ConfigRep_t    orig_CSConfigRep;
-static CS_SetCatch_t     orig_CSSetCatch;
-
-static int SBXK_CSStuck(void*a,int b,int c,long d,const char*e,const char*f,const char*g,int h,const char*i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
-static int SBXK_CSErr(void*a,int b,const char*c,const char*d,const char*e,const char*f,int g,const char*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
-static int SBXK_CSLog(void*a,const char*b,const char*c){(void)a;(void)b;(void)c;return 0;}
-static int SBXK_CSLast(void*a,void*b,int c){(void)a;(void)b;(void)c;return 0;}
-static void SBXK_CSTestOom(void *self)          { (void)self; }
-static long SBXK_CSGetCrashTid(void *self)      { (void)self; return 0; }
-static int  SBXK_CSIsLastCrash(void *self)      { (void)self; return 0; }
-static void SBXK_CSSetUpload(void *self, int n) { (void)self; (void)n; }
-static void SBXK_CSConfigRep(void *self, int n) { (void)self; (void)n; }
-static void SBXK_CSSetCatch(void *self, int b)  { (void)self; (void)b; }
-
-static void SBXK_RegisterFishhook(void) {
-    struct sbxk_rb rb[] = {
-        // === AnoSDK ===
-        { "AnoSDKInit",               (void*)SBXK_AnoInit,  (void**)&orig_AnoSDKInit },
-        { "AnoSDKSetUserInfo",        (void*)SBXK_AnoUser,  (void**)&orig_AnoSDKSetUserInfo },
-        { "AnoSDKGetReportData",      (void*)SBXK_AnoData,  (void**)&orig_AnoSDKGetData },
-        { "AnoSDKGetReportData2",     (void*)SBXK_AnoData2, (void**)&orig_AnoSDKGetData2 },
-        { "AnoSDKDelReportData",      (void*)SBXK_AnoDel,   (void**)&orig_AnoSDKDel },
-        { "AnoSDKIoctl",              (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
-        { "AnoSDKIoctlOld",           (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
-        { "AnoSDKOnPause",            (void*)SBXK_AnoPause, (void**)&orig_AnoSDKPause },
-        { "AnoSDKOnResume",           (void*)SBXK_AnoPause, (void**)&orig_AnoSDKResume },
-        { "AnoSDKOnRecvData",         (void*)SBXK_AnoRecv,  (void**)&orig_AnoSDKRecvD },
-        { "AnoSDKOnRecvSignature",    (void*)SBXK_AnoRecv,  (void**)&orig_AnoSDKRecvS },
-        { "CheckSymbolSource",        (void*)SBXK_CheckSym, (void**)&orig_CheckSym },
-
-        // === GAMELET ===
-        { "GAMELET_ReportSDKLog",                (void*)SBXK_GL1, (void**)&orig_GL1 },
-        { "GAMELET_ReportScriptError",           (void*)SBXK_GL2, (void**)&orig_GL2 },
-        { "GAMELET_ReportScriptErrorWithAppInfo",(void*)SBXK_GL3, (void**)&orig_GL3 },
-        { "GAMELET_SendMsg",                     (void*)SBXK_GM,  (void**)&orig_GM },
-        { "GAMELET_ReportStatsFunc",             (void*)SBXK_GM_ReportStats, (void**)&orig_GM_ReportStats },
-        { "GAMELET_ReportLogFunc",               (void*)SBXK_GM_ReportLog,   (void**)&orig_GM_ReportLog },
-        { "GAMELET_ReportToTNM2Func",            (void*)SBXK_GM_ReportTNM2,  (void**)&orig_GM_ReportTNM2 },
-
-        // === UQM (mangled names مُصحَّحة) ===
-        { "__ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_",
-          (void*)SBXK_UQMInit,        (void**)&orig_UQMInit },
-        { "__ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE",
-          (void*)SBXK_UQMUser,        (void**)&orig_UQMUser },
-        { "__ZN3UQM8UQMCrash8SetAppIdERKNS_9UQMStringE",
-          (void*)SBXK_UQMApp,         (void**)&orig_UQMApp },
-        { "__ZN3UQM8UQMCrash7LogInfoEiRKNS_9UQMStringES3_",
-          (void*)SBXK_UQMLog,         (void**)&orig_UQMLog },
-        { "__ZN3UQM8UQMCrash12SetUserValueERKNS_9UQMStringES3_",
-          (void*)SBXK_UQMSetUser,     (void**)&orig_UQMSetUser },
-        { "__ZN3UQM8UQMCrash18ReportExceptionPRVEiRKNS_9UQMStringES3_S3_RKNS_9UQMVectorINS_9UQMKVPairELj16EEES3_bi",
-          (void*)SBXK_UQMRpt,         (void**)&orig_UQMRpt },
-        { "__ZN3UQM8UQMCrash16SetCrashObserverEPNS_16UQMCrashObserverE",
-          (void*)SBXK_UQMSetCrashObs, (void**)&orig_UQMSetCrashObs },
-        { "__ZN3UQM8UQMCrash19SetCrashLogObserverEPNS_19UQMCrashLogObserverE",
-          (void*)SBXK_UQMSetLogObs,   (void**)&orig_UQMSetLogObs },
-        { "__ZN3UQM8UQMCrash24ConfigCrashHandleTimeoutEi",
-          (void*)SBXK_UQMConfigTimeout, (void**)&orig_UQMConfigTimeout },
-
-        // === CrashSight (كامل) ===
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent11ReportStuckEiilPKcS3_S3_iS3_",
-          (void*)SBXK_CSStuck,        (void**)&orig_CSStuck },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ReportExceptionJsonEiPKcS3_S3_S3_iS3_",
-          (void*)SBXK_CSErr,          (void**)&orig_CSErr },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent13ReportLogInfoEPKcS3_",
-          (void*)SBXK_CSLog,          (void**)&orig_CSLog },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent20GetLastSessionUserIdEPvi",
-          (void*)SBXK_CSLast,         (void**)&orig_CSLast },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent12TestOomCrashEv",
-          (void*)SBXK_CSTestOom,      (void**)&orig_CSTestOom },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent16GetCrashThreadIdEv",
-          (void*)SBXK_CSGetCrashTid,  (void**)&orig_CSGetCrashTid },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent18IsLastSessionCrashEv",
-          (void*)SBXK_CSIsLastCrash,  (void**)&orig_CSIsLastCrash },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent18SetUploadThreadNumEi",
-          (void*)SBXK_CSSetUpload,    (void**)&orig_CSSetUpload },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ConfigCrashReporterEi",
-          (void*)SBXK_CSConfigRep,    (void**)&orig_CSConfigRep },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19SetCatchMultiSignalEb",
-          (void*)SBXK_CSSetCatch,     (void**)&orig_CSSetCatch },
-
-        // ============================================================
-        // v7.10.7 — لم يُضَف WGGetHostByNameAsyncWithTag
-        // v7.10.7 — لم يُضَف Px_GetQJSFunctionTable_V04
-        // (الاثنان كانا سبب تجميد اللوجين في v7.10.5/v7.10.6)
-        // ============================================================
-    };
-    int t = sbxk_rebind(rb, (int)(sizeof(rb)/sizeof(rb[0])));
-    NSLog(@"[SBXK-fh-v7.10.7] %d rebound / %zu registered",
-          t, sizeof(rb)/sizeof(rb[0]));
-}
-
-// ============================================================================
-// القسم 12: ماكرو التسجيل
-// ============================================================================
-
-#define REG_B(cls, name)   (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "B@:")
-#define REG_V1(cls, name)  (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "v@:@")
-#define REG_V2(cls, name)  (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "v@:@@")
-#define REG_ID0(cls, name) (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:")
-#define REG_ID1(cls, name) (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@")
-#define REG_ID2(cls, name) (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@@")
-#define REG_ID3(cls, name) (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@@@")
-
-// ============================================================================
-// القسم 13: تسجيل الأساس — نفس v7.10.3
-// ============================================================================
-
-static void SBXK_RegBase(void) {
-    REG_B(IntegrityChecker, integrity_detect);
-    REG_B(IntegrityChecker, MTML_INTEGRITY_DETECT);
-    REG_B(JailbreakDetector, isJailbroken);
-    REG_B(JailbreakDetector, isJailbreak);
-    REG_B(JailbreakDetector, checkJailbreak);
-    REG_B(JailbreakDetector, jailbreakDetection);
-    REG_B(SimulatorDetector, isSimulator);
-    REG_B(SimulatorDetector, isSimulatorDevice);
-    REG_B(SimulatorDetector, checkSimulator);
-    REG_B(SecurityChecker, IsFileSystemModified);
-    REG_B(SecurityChecker, isDebuggerAttached);
-    REG_B(SecurityChecker, isDebugged);
-    REG_B(SecurityChecker, checkDebugger);
-    REG_B(SecurityChecker, amIBeingDebugged);
-    REG_B(SecurityChecker, checkDebuggerAttach);
-    REG_B(SecurityChecker, isHooked);
-    REG_B(SecurityChecker, isHookDetected);
-    REG_B(SecurityChecker, checkHook);
-    REG_B(SecurityChecker, detectHook);
-    REG_B(SecurityChecker, antiHookCheck);
-    REG_B(SecurityChecker, isTampered);
-    REG_B(SecurityChecker, checkTamper);
-    REG_B(SecurityChecker, antiTamperCheck);
-    REG_B(SecurityChecker, isInjected);
-    REG_B(SecurityChecker, isLibraryInjected);
-    REG_B(SecurityChecker, checkInjection);
-    REG_B(SecurityChecker, antiInjectionCheck);
-    REG_B(SecurityChecker, isReversingDetected);
-    REG_B(SecurityChecker, checkReversing);
-    REG_B(SecurityChecker, antiReversingCheck);
-    REG_B(SecurityChecker, isBlocked);
-    REG_B(SecurityChecker, antiBlockingCheck);
-    REG_B(SecurityChecker, isVPNUsed);
-    REG_B(SecurityChecker, isProxyUsed);
-    REG_B(SecurityChecker, isFridaRunning);
-    REG_B(SecurityChecker, isSubstrateLoaded);
-    REG_B(SecurityChecker, isCydiaInstalled);
-    REG_B(SecurityChecker, hasSuspiciousFiles);
-    REG_B(SecurityChecker, isEnvironmentClean);
-    REG_B(SecurityChecker, verifyIntegrity);
-    REG_B(SecurityChecker, checkTokenValid);
-    REG_B(SecurityChecker, isEnvironmentSafe);
-    REG_B(SecurityChecker, verifySignature);
-    REG_B(AReachability, isConnectionOnDemand);
-    REG_B(AReachability, isConnectionRequired);
-    REG_B(GVGCloudVoiceExtension, CheckDeviceMuteStat);
-    REG_V1(GADAppOpenAd, adDidDismissFullScreenContent);
-    REG_V1(GADAppOpenAd, adWillDismissFullScreenContent);
-    REG_V1(GADAppOpenAd, adDidRecordClick);
-    REG_V1(GADAppOpenAd, adDidRecordImpression);
-    REG_V1(GADAppOpenAd, adWillPresentFullScreenContent);
-    REG_V1(GADAppOpenAd, adDidFailToPresentFullScreenContentWithError);
-    REG_V1(GADAppOpenAd, setPaidEventHandler);
-    REG_V1(GADAppOpenAd, adDidRecordUserInteraction);
-    REG_V1(NetworkManager, SendSecurityReport);
-    REG_ID0(GSDKCPU, getSystemCPUCircle);
-    REG_ID0(GSDKMemory, getSystemAvailableMemory);
-    REG_ID0(GSDKInGameManager, GSDKRealTimeDetect);
-    REG_ID0(GSDKInGameSystem, GSDKInnerEnd);
-    REG_ID0(GSDKInGameSystem, GSDKInnerRealTimeDetect);
-    REG_ID0(GSDKPing, ping);
-    REG_ID0(GSDKPing, stopPing);
-    REG_ID0(GSDKPingDetect, ping);
-    REG_ID0(PingDelegate, pingTimer);
-    REG_ID0(SimplePing, start);
-    REG_ID0(SimplePing, startWithHostAddress);
-    REG_ID0(SimplePing, readData);
-    REG_ID0(GSDKRealTimeDetect, pingDelayDetect);
-    REG_ID0(GSDKRealTimeDetect, updDelayDetect_Port);
-    REG_ID0(GSDKUdpDetect, isUDPConnect_Port);
-    REG_ID0(GSDKWIFI, ping);
-    REG_ID0(GSDKDetectPort, isConnection_Port);
-    REG_ID0(GSDKInitManager, detectOperation);
-    REG_ID0(GSDKPayEvent, GSDKPay_Tag_Status_Msg);
-    REG_ID0(GSDKHttpRequest, requestControl_Openid_Acctype_Zoneid_Env);
-    REG_ID1(SimplePing, sendPingWithData);
-    REG_ID1(SimplePing, didFailWithError);
-    REG_ID1(FBAdViewabilityValidator, checkViewability);
-    REG_ID1(TApmSceneMarker, postStepEvent);
-    REG_ID1(TApmSceneMarker, postStreamEvent);
-    REG_ID1(APMCollector, collectMetrics);
-    REG_ID1(APMCollector, reportNow);
-    REG_ID1(AudioDeviceMgr, UpdateDeviceState);
-    REG_ID2(SimplePing, validatePingResponsePacket_sequenceNumber);
-    REG_ID2(FIRMessaging, retrieveFCMTokenForSenderID_completion);
-    REG_ID2(FIRMessaging, deleteFCMTokenForSenderID_completion);
-    REG_ID2(FIRMessaging, subscribeToTopic_completion);
-    REG_ID2(FIRMessaging, unsubscribeFromTopic_completion);
-    REG_ID2(FIRMessaging, setAPNSToken_withUserInfo);
-    REG_ID2(GSDKInGameSystem, GSDKInnerSaveFPS_FpsDots);
-    REG_ID3(SimplePing, pingPacketWithType_payload_requiresChecksum);
-    REG_ID3(GSDKInGameSystem, GSDKInnerStart_SceneID_RoomIP);
-    REG_ID0(GVGCloudVoice, openMic);
-    REG_ID0(GVGCloudVoice, openSpeaker);
-    REG_ID0(GVGCloudVoiceExtension, GetBGMPlayState);
-    REG_ID0(GVGCloudVoiceExtension, GetMicState);
-    REG_ID0(GVGCloudVoiceExtension, GetSpeakerState);
-    REG_ID0(GVoiceMuteSwitch, detectMuteSwitch);
-    REG_ID0(GCloudVoiceEngine, StartTve);
-    REG_ID0(GCloudVoiceEngine, TestMic);
-    REG_ID0(GCloudVoiceEngine, GetMicLevel);
-    REG_ID0(GCloudVoiceEngine, GetSpeakerLevel);
-    REG_ID0(GCloudVoiceEngine, GetBGMLevel);
-    REG_ID0(GCloudVoiceEngine, GetBGMFileTime);
-    REG_ID0(GCloudVoiceEngine, GetBGMPlayTime);
-    REG_ID0(GCloudVoiceEngine, GetRecordKaraokeTotalTime);
-    REG_ID0(GCloudVoiceEngine, StartPreview);
-    REG_ID0(GCloudVoiceEngine, StopPreview);
-    REG_ID0(GCloudVoiceEngine, PauseKaraoke);
-    REG_ID0(GCloudVoiceEngine, ResumeKaraoke);
-    REG_ID0(GCloudVoiceEngine, RSTSStopRecording);
-    REG_ID0(GCloudVoiceEngine, TextToStreamSpeechStop);
-    REG_ID0(GCloudVoiceEngine, StopKaraokeRecording);
-    REG_ID0(GCloudCoreRemoteConfig, getConfig);
-    REG_ID0(GCloudUnityPlugin, Initialize);
-    REG_ID0(GCloudUnityPlugin, ReportEvent);
-    REG_ID1(GCloudVoiceEngine, StartRecording);
-    REG_ID1(GCloudVoiceEngine, StopRecording);
-    REG_ID1(GCloudVoiceEngine, StartBGMPlay);
-    REG_ID1(GCloudVoiceEngine, StopBGMPlay);
-    REG_ID1(GCloudVoiceEngine, PauseBGMPlay);
-    REG_ID1(GCloudVoiceEngine, ResumeBGMPlay);
-    REG_ID1(GCloudVoiceEngine, SetBGMPath);
-    REG_ID1(GCloudVoiceEngine, SetLogCallBack);
-    REG_ID1(GCloudCoreRemoteConfig, updateConfig);
-    REG_ID1(GCloudUnityPlugin, SetGameObjectName);
-    REG_ID2(GCloudVoiceEngine, QuitRoom_Scenes_timeout);
-    REG_ID0(FIRMessagingRmqManager, openDatabase);
-    REG_ID0(FIRMessaging, APNSToken);
-    REG_ID0(GADAppOpenAd, responseInfo);
-    REG_ID0(GADMobileAds, initializationStatus);
-    REG_ID0(GADAdNetworkResponseInfo, adUnitMapping);
-    REG_ID0(FBAdViewabilityValidator, stopMonitoring);
-    REG_ID0(FBAdMonitor, stopMonitoring);
-    REG_ID0(APMDeviceInfoSupport, getBatteryState);
-    REG_ID0(APMDeviceInfoSupport, getThermalState);
-    REG_ID0(TApmSceneMarker, markLevelFin);
-    REG_ID0(serviceCommunication, getValueForKeypath);
-    REG_ID0(AudioDeviceMgr, GetAudioDeviceConnectState);
-    REG_ID0(VKAuth, logout);
-    REG_ID0(SCSDKLoginClient, logout);
-}
-
-// ============================================================================
-// القسم 14: تسجيل الموسّع — v7.10.3 + إضافات ACE الآمنة من v7.10.5
-// ============================================================================
-
-static void SBXK_RegExtended(void) {
-    // --- ACE Extended (كانت في v7.10.5 — كلها آمنة) ---
-    REG_B(AntiDataProxy, checkIntegrity);
-    REG_B(AntiDataProxy, isIntegrityOK);
-    REG_B(AntiDataProxy, verifyData);
-    REG_B(AntiDataProxy, isDataValid);
-    REG_B(AntiDataProxy, isModified);
-    REG_B(AntiDataProxy, isCheat);
-    REG_B(AntiDataProxy, isSuspicious);
-    REG_B(AntiDataProxy, antiCheatCheck);
-    REG_B(AntiDataProxy, securityCheck);
-    REG_B(AntiDataProxy, hasRisk);
-    REG_B(AntiDataProxy, detectRisk);
-    REG_B(AntiDataProxy, isRiskDetected);
-    REG_B(AntiDataProxy, isValid);
-    REG_B(AntiDataProxy, isSafe);
-    REG_B(AntiDataProxy, isClean);
-    REG_B(AntiDataProxy, verifyIntegrity);
-    REG_B(AntiDataProxy, verifySignature);
-    REG_B(AntiDataProxy, shouldPass);
-    REG_B(AntiDataProxy, allowReport);
-    REG_V1(AntiDataProxy, sendData);
-    REG_V1(AntiDataProxy, report);
-    REG_V1(AntiDataProxy, submit);
-    REG_V1(AntiDataProxy, upload);
-    REG_V1(AntiDataProxy, dispatch);
-    REG_V1(AntiDataProxy, flush);
-    REG_ID0(AntiDataProxy, getData);
-    REG_ID0(AntiDataProxy, getPayload);
-    REG_ID0(AntiDataProxy, getHeader);
-    REG_ID0(AntiDataProxy, getBody);
-    REG_ID0(AntiDataProxy, getResponse);
-    REG_ID0(AntiDataProxy, getConfig);
-    REG_ID0(AntiDataProxy, getState);
-    REG_ID0(AntiDataProxy, getStatus);
-    REG_ID1(AntiDataProxy, setData);
-    REG_ID1(AntiDataProxy, setPayload);
-    REG_ID1(AntiDataProxy, setConfig);
-    REG_ID1(AntiDataProxy, process);
-    REG_ID1(AntiDataProxy, handle);
-    REG_ID1(AntiDataProxy, onReceive);
-    REG_ID1(AntiDataProxy, onMessage);
-    REG_ID2(AntiDataProxy, sendData_withHeader);
-    REG_ID2(AntiDataProxy, sendReport_withType);
-    REG_ID2(AntiDataProxy, postData_withURL);
-
-    REG_B(TssInfoReceiver, isRooted);
-    REG_B(TssInfoReceiver, isRootedDevice);
-    REG_B(TssInfoReceiver, isJailbroken);
-    REG_B(TssInfoReceiver, isJailbreakDevice);
-    REG_B(TssInfoReceiver, isEmulator);
-    REG_B(TssInfoReceiver, isEmulatorDevice);
-    REG_B(TssInfoReceiver, isSimulator);
-    REG_B(TssInfoReceiver, isDebuggerAttached);
-    REG_B(TssInfoReceiver, isDebugged);
-    REG_B(TssInfoReceiver, isModified);
-    REG_B(TssInfoReceiver, isTampered);
-    REG_B(TssInfoReceiver, isInjected);
-    REG_B(TssInfoReceiver, isHooked);
-    REG_B(TssInfoReceiver, hasCheat);
-    REG_B(TssInfoReceiver, hasCheatTool);
-    REG_B(TssInfoReceiver, hasSuspiciousFiles);
-    REG_B(TssInfoReceiver, hasRisk);
-    REG_B(TssInfoReceiver, checkEnvironment);
-    REG_B(TssInfoReceiver, checkSecurity);
-    REG_B(TssInfoReceiver, checkCheat);
-    REG_B(TssInfoReceiver, detectCheat);
-    REG_B(TssInfoReceiver, detectRisk);
-    REG_B(TssInfoReceiver, detectEnvironment);
-    REG_B(TssInfoReceiver, isCheating);
-    REG_B(TssInfoReceiver, isCheatDetected);
-    REG_B(TssInfoReceiver, isSuspicious);
-    REG_B(TssInfoReceiver, antiCheatCheck);
-    REG_B(TssInfoReceiver, securityCheck);
-    REG_B(TssInfoReceiver, shouldReport);
-    REG_B(TssInfoReceiver, shouldBlock);
-    REG_B(TssInfoReceiver, needReport);
-    REG_B(TssInfoReceiver, needBlock);
-    REG_B(TssInfoReceiver, isBlocked);
-    REG_B(TssInfoReceiver, isBanned);
-    REG_B(TssInfoReceiver, isSafe);
-    REG_B(TssInfoReceiver, isClean);
-    REG_B(TssInfoReceiver, isEnvironmentClean);
-    REG_B(TssInfoReceiver, isEnvironmentSafe);
-    REG_B(TssInfoReceiver, verifyIntegrity);
-    REG_B(TssInfoReceiver, verifySignature);
-    REG_B(TssInfoReceiver, checkTokenValid);
-    REG_V1(TssInfoReceiver, start);
-    REG_V1(TssInfoReceiver, stop);
-    REG_V1(TssInfoReceiver, run);
-    REG_V1(TssInfoReceiver, onReceiveData);
-    REG_V1(TssInfoReceiver, onRecvData);
-    REG_V1(TssInfoReceiver, report);
-    REG_V1(TssInfoReceiver, sendReport);
-    REG_V1(TssInfoReceiver, uploadReport);
-    REG_V1(TssInfoReceiver, submitReport);
-    REG_V1(TssInfoReceiver, reportRoot);
-    REG_V1(TssInfoReceiver, reportEmu);
-    REG_V1(TssInfoReceiver, reportDebugger);
-    REG_V1(TssInfoReceiver, reportCheat);
-    REG_V1(TssInfoReceiver, reportAlert);
-    REG_V1(TssInfoReceiver, sendAlert);
-    REG_V1(TssInfoReceiver, blockGame);
-    REG_V1(TssInfoReceiver, blockPlayer);
-    REG_V1(TssInfoReceiver, kickPlayer);
-    REG_ID0(TssInfoReceiver, currentState);
-    REG_ID0(TssInfoReceiver, getState);
-    REG_ID0(TssInfoReceiver, getStatus);
-    REG_ID0(TssInfoReceiver, getReport);
-    REG_ID0(TssInfoReceiver, getResult);
-    REG_ID0(TssInfoReceiver, getData);
-    REG_ID0(TssInfoReceiver, getInfo);
-    REG_ID0(TssInfoReceiver, getRiskInfo);
-    REG_ID0(TssInfoReceiver, getCheatInfo);
-    REG_ID0(TssInfoReceiver, getEnvInfo);
-    REG_ID0(TssInfoReceiver, getConfig);
-    REG_ID1(TssInfoReceiver, updateState);
-    REG_ID1(TssInfoReceiver, setState);
-    REG_ID1(TssInfoReceiver, handleData);
-    REG_ID1(TssInfoReceiver, handleMessage);
-    REG_ID1(TssInfoReceiver, processData);
-    REG_ID1(TssInfoReceiver, onMessage);
-    REG_ID1(TssInfoReceiver, onCommand);
-
-    REG_B(CheckSymbolSource, CheckSymbol);
-    REG_B(CheckSymbolSource, checkSymbol);
-    REG_B(CheckSymbolSource, checkSymbolSource);
-    REG_B(CheckSymbolSource, isSymbolValid);
-    REG_B(CheckSymbolSource, isSymbolOK);
-    REG_B(CheckSymbolSource, verifySymbol);
-    REG_B(CheckSymbolSource, verifySymbols);
-    REG_B(CheckSymbolSource, isSourceSafe);
-    REG_B(CheckSymbolSource, checkSource);
-    REG_B(CheckSymbolSource, isSourceOK);
-    REG_B(CheckSymbolSource, sourceIsValid);
-    REG_ID0(CheckSymbolSource, getResult);
-    REG_ID0(CheckSymbolSource, getReport);
-    REG_ID1(CheckSymbolSource, checkSymbolSourceWithData);
-    REG_ID1(CheckSymbolSource, verifySymbolWithData);
-
-    REG_B(CFastScanThread, isRunning);
-    REG_B(CFastScanThread, shouldScan);
-    REG_B(CFastScanThread, hasResult);
-    REG_B(CScanThread, isRunning);
-    REG_B(CScanThread, shouldScan);
-    REG_B(CScanThread, hasResult);
-    REG_B(CSendThread, isRunning);
-    REG_B(CSendThread, shouldSend);
-    REG_B(CSendThread, hasData);
-    REG_B(CMrpcsMonitor, isRunning);
-    REG_B(CMrpcsMonitor, shouldReport);
-    REG_B(CMrpcsMgrE, isReady);
-    REG_B(CMrpcsMgrE, shouldReport);
-    REG_B(CPointDataMgr, shouldReport);
-    REG_B(CPointDataMgr, hasData);
-    REG_B(CPointGlobalMgr, shouldReport);
-    REG_B(CPointGlobalMgr, hasData);
-    REG_B(CMrpcsLFUpdater, shouldUpdate);
-    REG_B(CMrpcsLFUpdater, hasUpdate);
-    REG_V1(CFastScanThread, start);
-    REG_V1(CFastScanThread, run);
-    REG_V1(CFastScanThread, execute);
-    REG_V1(CFastScanThread, scan);
-    REG_V1(CFastScanThread, doScan);
-    REG_V1(CFastScanThread, report);
-    REG_V1(CFastScanThread, sendReport);
-    REG_V1(CScanThread, start);
-    REG_V1(CScanThread, run);
-    REG_V1(CScanThread, execute);
-    REG_V1(CScanThread, scan);
-    REG_V1(CScanThread, doScan);
-    REG_V1(CScanThread, report);
-    REG_V1(CScanThread, sendReport);
-    REG_V1(CSendThread, start);
-    REG_V1(CSendThread, run);
-    REG_V1(CSendThread, execute);
-    REG_V1(CSendThread, send);
-    REG_V1(CSendThread, doSend);
-    REG_V1(CSendThread, report);
-    REG_V1(CMrpcsMonitor, start);
-    REG_V1(CMrpcsMonitor, stop);
-    REG_V1(CMrpcsMonitor, run);
-    REG_V1(CMrpcsMonitor, execute);
-    REG_V1(CMrpcsMonitor, report);
-    REG_V1(CMrpcsMonitor, sendReport);
-    REG_V1(CMrpcsMgrE, sendScanResult);
-    REG_V1(CMrpcsMgrE, reportResult);
-    REG_V1(CMrpcsMgrE, sendReport);
-    REG_V1(CMrpcsMgrE, report);
-    REG_V1(CMrpcsMgrE, upload);
-    REG_V1(CPointDataMgr, report);
-    REG_V1(CPointDataMgr, sendData);
-    REG_V1(CPointDataMgr, uploadData);
-    REG_V1(CPointDataMgr, dispatch);
-    REG_V1(CPointGlobalMgr, report);
-    REG_V1(CPointGlobalMgr, sendReport);
-    REG_V1(CPointGlobalMgr, upload);
-    REG_V1(CMrpcsLFUpdater, update);
-    REG_V1(CMrpcsLFUpdater, start);
-    REG_V1(CMrpcsLFUpdater, run);
-    REG_V1(CMrpcsLFUpdater, check);
-    REG_V1(CMrpcsLFUpdater, report);
-    REG_ID0(CMrpcsMgrE, getInstance);
-    REG_ID0(CMrpcsMgrE, getState);
-    REG_ID0(CMrpcsMgrE, getReport);
-    REG_ID0(CMrpcsMgrE, getResult);
-    REG_ID0(CMrpcsMgrE, getConfig);
-    REG_ID0(CMrpcsMonitor, getState);
-    REG_ID0(CMrpcsMonitor, getReport);
-    REG_ID0(CMrpcsMonitor, getResult);
-    REG_ID0(CPointDataMgr, getData);
-    REG_ID0(CPointDataMgr, getReport);
-    REG_ID0(CPointDataMgr, getState);
-    REG_ID0(CPointGlobalMgr, getData);
-    REG_ID0(CPointGlobalMgr, getReport);
-    REG_ID0(CPointGlobalMgr, getState);
-    REG_ID0(CMrpcsLFUpdater, getState);
-    REG_ID0(CMrpcsLFUpdater, getConfig);
-    REG_ID0(CMrpcsLFUpdater, getVersion);
-    REG_ID1(CMrpcsMgrE, setConfig);
-    REG_ID1(CMrpcsMgrE, setState);
-    REG_ID1(CMrpcsMgrE, handleData);
-    REG_ID1(CMrpcsMgrE, processData);
-    REG_ID1(CMrpcsMonitor, setConfig);
-    REG_ID1(CMrpcsMonitor, handleData);
-    REG_ID1(CPointDataMgr, setData);
-    REG_ID1(CPointDataMgr, handleData);
-    REG_ID1(CPointGlobalMgr, setData);
-    REG_ID1(CPointGlobalMgr, handleData);
-    REG_ID2(CMrpcsMgrE, sendData_withType);
-    REG_ID2(CMrpcsMgrE, handleMessage_withData);
-    REG_ID2(CPointDataMgr, sendData_withType);
-    REG_ID2(CPointGlobalMgr, sendData_withType);
-
-    REG_V1(NetworkManager, sendRootAlert);
-    REG_V1(NetworkManager, sendEmuAlert);
-    REG_V1(NetworkManager, sendDebuggerAlert);
-    REG_V1(NetworkManager, sendCheatAlert);
-    REG_V1(NetworkManager, send9010Alert);
-    REG_V1(NetworkManager, send9014Alert);
-    REG_V1(NetworkManager, send9005Alert);
-    REG_V1(NetworkManager, sendShellReport);
-    REG_V1(NetworkManager, sendCheckState);
-
-    REG_ID0(ScreenShot, takeScreenShot);
-    REG_ID0(ScreenShot, screenshot);
-    REG_ID1(ScreenShot, takeScreenShotEx);
-    REG_ID1(ScreenShot, screenshotOfView);
-    REG_ID1(ScreenShot, getBufFromImage);
-    REG_ID1(ScreenShot, getAppWindowsForScreen);
-    REG_ID0(Rotate, fixOrientation);
-    REG_ID0(Rotate, flipVertical);
-    REG_ID0(Rotate, flipHorizontal);
-    REG_ID1(Rotate, rotate);
-    REG_ID1(Rotate, imageRotatedByRadians);
-    REG_ID1(Rotate, imageRotatedByDegrees);
-
-    REG_V2(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn);
-    REG_V1(AceMsgBoxImp, dismiss);
-    REG_V1(AceMsgBoxImp, show);
-    REG_ID0(AceMsgBoxImp, viewTitle);
-    REG_ID0(AceMsgBoxImp, viewContent);
-    REG_ID0(AceMsgBoxImp, leftBtnContent);
-    REG_ID0(AceMsgBoxImp, rightBtnContent);
-}
-
-// ============================================================================
-// القسم 15: تسجيل قتل أدوات الحقن
-// ============================================================================
-
-static void SBXK_RegInjectionKill(void) {
-    REG_B(SBXK_FridaDet, isFridaPresent);
-    REG_B(SBXK_FridaDet, isFridaRunning);
-    REG_B(SBXK_FridaDet, hasFrida);
-    REG_B(SBXK_FridaDet, checkFrida);
-    REG_B(SBXK_FridaDet, detectFrida);
-    REG_B(SBXK_FridaDet, isFridaGadgetLoaded);
-    REG_B(SBXK_FridaDet, hasFridaGadget);
-    REG_B(SBXK_FridaDet, isFridaAgentLoaded);
-    REG_B(SBXK_FridaDet, hasNamedPipe);
-    REG_B(SBXK_FridaDet, checkNamedPipe);
-    REG_B(SBXK_FridaDet, isPipeOpen);
-    REG_B(SBXK_SubDet, isSubstrateLoaded);
-    REG_B(SBXK_SubDet, hasSubstrate);
-    REG_B(SBXK_SubDet, checkSubstrate);
-    REG_B(SBXK_SubDet, isCydiaSubstrateLoaded);
-    REG_B(SBXK_SubDet, isSubstituteLoaded);
-    REG_B(SBXK_SubDet, hasSubstitute);
-    REG_B(SBXK_SubDet, checkSubstitute);
-    REG_B(SBXK_InjectDet, isElleKitLoaded);
-    REG_B(SBXK_InjectDet, hasElleKit);
-    REG_B(SBXK_InjectDet, isLibhookerLoaded);
-    REG_B(SBXK_InjectDet, hasLibhooker);
-    REG_B(SBXK_InjectDet, isTweakInjectLoaded);
-    REG_B(SBXK_InjectDet, hasTweakInject);
-    REG_B(SBXK_InjectDet, checkTweaks);
-    REG_B(SBXK_InjectDet, hasJailbreakTweak);
-    REG_B(SBXK_InjectDet, isDylibInjected);
-    REG_B(SBXK_InjectDet, isImageInjected);
-    REG_B(SBXK_InjectDet, hasInjectedDylib);
-    REG_B(SBXK_InjectDet, isForeignImageLoaded);
-    REG_B(SBXK_InjectDet, hasHooked);
-    REG_B(SBXK_InjectDet, hasMSHook);
-    REG_B(SBXK_InjectDet, checkMSHook);
-    REG_B(SBXK_InjectDet, checkSymbolHook);
-    REG_B(SBXK_InjectDet, hasSwizzled);
-    REG_B(SBXK_InjectDet, hasDYLD_INSERT);
-    REG_B(SBXK_InjectDet, isDYLDInjected);
-    REG_B(SBXK_InjectDet, checkDYLD);
-    REG_B(SBXK_InjectDet, isEnvInjected);
-    REG_B(SBXK_InjectDet, hasEnvVarInject);
-    REG_B(SBXK_InjectDet, isAttached);
-    REG_B(SBXK_InjectDet, isBeingDebugged);
-    REG_B(SBXK_InjectDet, isTraced);
-    REG_B(SBXK_InjectDet, hasPtraced);
-    REG_B(SBXK_InjectDet, checkPtrace);
-    REG_B(SBXK_InjectDet, isPtraceDetected);
-    REG_B(SBXK_InjectDet, hasForeignExceptionPort);
-    REG_B(SBXK_InjectDet, hasExceptionHijack);
-    REG_B(SBXK_InjectDet, checkExceptionPorts);
-    REG_B(SBXK_InjectDet, isPortHijacked);
-    REG_B(SBXK_InjectDet, isEnvironmentClean);
-    REG_B(SBXK_InjectDet, isEnvironmentSafe);
-    REG_B(SBXK_InjectDet, isClean);
-    REG_B(SBXK_InjectDet, isSafe);
-    REG_B(SBXK_InjectDet, verifyNoInjection);
-    REG_B(SBXK_InjectDet, verifyNoHook);
-    REG_B(SBXK_InjectDet, verifyNoDylib);
-    REG_B(SBXK_InjectDet, verifyImageClean);
-    REG_V1(SBXK_InjectDet, reportFrida);
-    REG_V1(SBXK_InjectDet, reportSubstrate);
-    REG_V1(SBXK_InjectDet, reportSubstitute);
-    REG_V1(SBXK_InjectDet, reportElleKit);
-    REG_V1(SBXK_InjectDet, reportLibhooker);
-    REG_V1(SBXK_InjectDet, reportInjection);
-    REG_V1(SBXK_InjectDet, reportHook);
-    REG_V1(SBXK_InjectDet, reportDylib);
-    REG_V1(SBXK_InjectDet, reportAttach);
-    REG_V1(SBXK_InjectDet, reportPtrace);
-    REG_V1(SBXK_InjectDet, reportExceptionPort);
-    REG_V1(SBXK_InjectDet, reportNamedPipe);
-    REG_V1(SBXK_InjectDet, reportEnvInject);
-    REG_V1(SBXK_InjectDet, sendAlert);
-    REG_V1(SBXK_InjectDet, sendReport);
-    REG_V1(SBXK_InjectDet, uploadReport);
-    REG_V1(SBXK_InjectDet, submitReport);
-    REG_V1(SBXK_InjectDet, notifyServer);
-    REG_V1(SBXK_InjectDet, alertUser);
-    REG_V1(SBXK_InjectDet, blockGame);
-    REG_V1(SBXK_InjectDet, kickPlayer);
-}
-
-// ============================================================================
-// القسم 16: تسجيل الأصناف الحقيقية — v7.10.3 + Meemo/QAPM موسّع من v7.10.5
-// ============================================================================
-
-static void SBXK_RegReal(void) {
-    REG_B(QAPMReport, isEnabled);
-    REG_B(QAPMReport, isRunning);
-    REG_B(QAPMReport, shouldReport);
-    REG_B(QAPMReport, hasReport);
-    REG_V1(QAPMReport, report);
-    REG_V1(QAPMReport, sendReport);
-    REG_V1(QAPMReport, upload);
-    REG_V1(QAPMReport, submit);
-    REG_V1(QAPMReport, flush);
-    REG_V1(QAPMReport, start);
-    REG_V1(QAPMReport, stop);
-    REG_V1(QAPMReport, setEnabled);
-    REG_V1(QAPMReport, setUserId);
-    REG_V1(QAPMReport, setUserValue);
-    REG_V1(QAPMReport, trackEvent);
-    REG_V1(QAPMReport, reportException);
-    REG_V1(QAPMReport, reportCrash);
-    REG_V1(QAPMReport, reportPerformance);
-    REG_V1(QAPMReport, reportNetwork);
-    REG_V1(QAPMReport, reportBattery);
-    REG_ID0(QAPMReport, getState);
-    REG_ID0(QAPMReport, getConfig);
-    REG_ID0(QAPMReport, getReport);
-    REG_ID0(QAPMReport, getDeviceId);
-    REG_ID0(QAPMReport, getSessionId);
-    REG_ID1(QAPMReport, updateConfig);
-    REG_ID1(QAPMReport, setConfig);
-    REG_ID1(QAPMReport, handleData);
-
-    REG_B(MeemoUserManager, isGuest);
-    REG_B(MeemoUserManager, isBanned);
-    REG_B(MeemoUserManager, isBlocked);
-    REG_B(MeemoUserManager, isUnderage);
-    REG_ID0(MeemoUserManager, currentUser);
-    REG_ID0(MeemoUserManager, currentToken);
-    REG_ID0(MeemoUserManager, currentOpenId);
-    REG_ID0(MeemoUserManager, currentAccountId);
-    REG_ID0(MeemoUserManager, currentSession);
-    REG_ID0(MeemoUserManager, userInfo);
-    REG_ID0(MeemoUserManager, getInstance);
-    REG_ID1(MeemoUserManager, setUser);
-    REG_ID1(MeemoUserManager, setToken);
-    REG_ID1(MeemoUserManager, updateUserInfo);
-
-    REG_V1(MeemoLogUtil, log);
-    REG_V1(MeemoLogUtil, logInfo);
-    REG_V1(MeemoLogUtil, logDebug);
-    REG_V1(MeemoLogUtil, logWarn);
-    REG_V1(MeemoLogUtil, logError);
-    REG_V1(MeemoLogUtil, logEvent);
-    REG_V1(MeemoLogUtil, sendLog);
-    REG_V1(MeemoLogUtil, uploadLog);
-    REG_V1(MeemoLogUtil, flush);
-    REG_V1(MeemoLogUtil, report);
-
-    REG_ID0(MeemoUtils, getInstance);
-    REG_ID0(MeemoUtils, getDeviceId);
-    REG_ID0(MeemoUtils, getChannel);
-    REG_ID0(MeemoUtils, getVersion);
-    REG_ID0(MeemoUtils, getCountryCode);
-    REG_ID0(MeemoUtils, getLanguage);
-    REG_ID0(MeemoUtils, getPlatform);
-    REG_ID0(MeemoUtils, getUUID);
-
-    REG_B(PBConfigManager, isModified);
-    REG_B(PBConfigManager, isTampered);
-    REG_ID0(PBConfigManager, getConfig);
-    REG_ID0(PBConfigManager, getInstance);
-    REG_ID0(PBConfigManager, currentConfig);
-    REG_ID1(PBConfigManager, updateConfig);
-    REG_ID1(PBConfigManager, setConfig);
-    REG_ID0(CdnConfigManager, getConfig);
-    REG_ID0(CdnConfigManager, getInstance);
-    REG_ID0(CdnConfigManager, currentConfig);
-    REG_ID1(CdnConfigManager, updateConfig);
-
-    REG_ID0(MeemoBundleUtils, getInstance);
-    REG_ID0(MeemoBundleUtils, bundlePath);
-    REG_ID0(MeemoBundleUtils, mainBundle);
-    REG_ID0(MeemoSubPackageDownloadMgr, getInstance);
-    REG_ID0(MeemoSubPackageDownloadMgr, state);
-    REG_ID0(MeemoSubPackageInfoProvider, getInstance);
-    REG_ID0(MeemoSubPackageInfoProvider, currentInfo);
-    REG_ID0(MeemoSubPackageUtils, getInstance);
-    REG_ID0(MeemoCoreInitalizer, getInstance);
-    REG_ID0(MeemoCoreInitalizer, state);
-    REG_V1(MeemoCoreInitalizer, initialize);
-    REG_V1(MeemoCoreInitalizer, start);
-    REG_ID0(MeemoFlutterViewController, getInstance);
-
-    REG_B(HotfixPatchDownloadManager, isModified);
-    REG_B(HotfixPatchDownloadManager, hasIllegalPatch);
-    REG_B(HotfixPatchDownloadManager, isTampered);
-    REG_ID0(HotfixPatchDownloadManager, getInstance);
-    REG_ID0(HotfixPatchDownloadManager, state);
-    REG_ID0(HotfixPatchDownloadManager, currentPatch);
-    REG_ID1(HotfixPatchDownloadManager, checkPatch);
-    REG_ID1(HotfixPatchDownloadManager, applyPatch);
-
-    REG_ID0(DeviceInfoPlugin, getInstance);
-    REG_ID0(DeviceInfoPlugin, deviceInfo);
-    REG_ID0(DeviceInfoPlugin, model);
-    REG_ID0(DeviceInfoPlugin, systemVersion);
-    REG_ID0(DeviceInfoPlugin, identifierForVendor);
-    REG_B(FlutterFlogPlugin, isEnabled);
-    REG_V1(FlutterFlogPlugin, log);
-    REG_V1(FlutterFlogPlugin, report);
-    REG_B(FlutterQAPMPlugin, isEnabled);
-    REG_V1(FlutterQAPMPlugin, report);
-    REG_V1(FlutterQAPMPlugin, trackEvent);
-}
-
-// ============================================================================
-// القسم 17: عارض سجل الأعطال — مع إصلاح class methods
-// ============================================================================
-
-@interface SBXK_LogViewer : NSObject @end
-@implementation SBXK_LogViewer
-+ (void)installObserver {
-    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(onLaunched:)
-        name:UIApplicationDidFinishLaunchingNotification object:nil];
-}
-+ (void)onLaunched:(NSNotification *)n {
+static void SBXK_lifecycle_notif(NSNotification *n) {
     (void)n;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self show]; });
-}
-+ (void)show {
-    NSString *p = [NSHomeDirectory()
-                   stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
-    NSData *d = [NSData dataWithContentsOfFile:p];
-    if (!d.length) { atomic_store(&g_viewer_done, true); return; }
-    NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
-    if (!s.length) { atomic_store(&g_viewer_done, true); return; }
-    if (s.length > 2500) s = [[s substringToIndex:2500] stringByAppendingString:@"…"];
-
-    UIWindow *w = nil;
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-            if (sc.activationState == UISceneActivationStateForegroundActive &&
-                [sc isKindOfClass:[UIWindowScene class]]) {
-                for (UIWindow *win in ((UIWindowScene *)sc).windows) {
-                    if (win.isKeyWindow) { w = win; break; }
-                }
-                if (w) break;
-            }
-        }
-    }
-    if (!w) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        w = [UIApplication sharedApplication].keyWindow;
-#pragma clang diagnostic pop
-    }
-    atomic_store(&g_viewer_done, true);
-
-    if (!w || !w.rootViewController || w.rootViewController.presentedViewController) return;
-    UIAlertController *a = [UIAlertController
-        alertControllerWithTitle:@"SBXK" message:s
-        preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK"
-        style:UIAlertActionStyleDefault handler:nil]];
-    [w.rootViewController presentViewController:a animated:YES completion:nil];
-}
-@end
-
-// ============================================================================
-// القسم 18: تنظيف ملفات — نفس v7.10.3
-// ============================================================================
-
-static NSArray<NSString *> *sbxk_cleanup_exact_paths(void) {
-    NSString *home = NSHomeDirectory();
-    NSString *docs = [home stringByAppendingPathComponent:@"Documents"];
-    NSString *lib  = [home stringByAppendingPathComponent:@"Library"];
-    return @[
-        [docs stringByAppendingPathComponent:@"sbxk_crash.log"],
-        [docs stringByAppendingPathComponent:@"sbxk_crash_prev.log"],
-        [docs stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/UQMCrash"],
-        [docs stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/CrashSight"],
-        [docs stringByAppendingPathComponent:@"ShadowTrackerExtra/Saved/Logs/ano_crash.txt"],
-        [lib  stringByAppendingPathComponent:@"Caches/com.tencent.uqm.crash"],
-        [lib  stringByAppendingPathComponent:@"Caches/com.tencent.gcloud.crashsight"],
-        [lib  stringByAppendingPathComponent:@"Caches/ano_log"],
-    ];
-}
-
-static NSArray<NSString *> *sbxk_cleanup_dirs(void) {
-    return @[
-        [NSHomeDirectory() stringByAppendingPathComponent:
-            @"Documents/ShadowTrackerExtra/Saved/Logs"],
-    ];
-}
-
-static BOOL sbxk_should_skip(NSString *name) {
-    if (!name.length) return YES;
-    if ([name isEqualToString:@"MMKV"])         return YES;
-    if ([name isEqualToString:@"Gamelet"])      return YES;
-    if ([name isEqualToString:@"mmkv.default"]) return YES;
-    if ([name isEqualToString:@"kvcache8.dat"]) return YES;
-    if ([name hasSuffix:@".crc"])               return YES;
-    if ([name hasSuffix:@".sig"])               return YES;
-    if ([name hasSuffix:@".dat"])               return YES;
-    if ([name hasSuffix:@".plist"])             return YES;
-    return NO;
-}
-
-static void sbxk_do_cleanup(void) {
-    @try {
-        NSFileManager *fm = [NSFileManager defaultManager];
-        NSError *err = nil;
-
-        for (NSString *p in sbxk_cleanup_exact_paths()) {
-            if (!atomic_load(&g_viewer_done) &&
-                [p hasSuffix:@"sbxk_crash_prev.log"]) continue;
-            if ([fm fileExistsAtPath:p]) {
-                [fm removeItemAtPath:p error:&err];
-                err = nil;
-            }
-        }
-
-        for (NSString *dir in sbxk_cleanup_dirs()) {
-            if (![fm fileExistsAtPath:dir]) continue;
-            NSArray *items = [fm contentsOfDirectoryAtPath:dir error:&err];
-            err = nil;
-            for (NSString *item in items) {
-                if (sbxk_should_skip(item)) continue;
-                if (![item hasSuffix:@".log"] &&
-                    ![item hasSuffix:@".txt"] &&
-                    ![item hasSuffix:@".dump"] &&
-                    ![item hasSuffix:@".stack"]) continue;
-                NSString *full = [dir stringByAppendingPathComponent:item];
-                [fm removeItemAtPath:full error:&err];
-                err = nil;
-            }
-        }
-    } @catch (__unused NSException *e) {}
-}
-
-__attribute__((constructor))
-static void sbxk_start_cleanup_timer(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        sbxk_do_cleanup();
-        [NSTimer scheduledTimerWithTimeInterval:2.0
-                                         repeats:YES
-                                           block:^(NSTimer *t) {
-            (void)t;
-            sbxk_do_cleanup();
-        }];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool { SBXK_cleanup_now(); }
     });
 }
 
+static void SBXK_lifecycle_install(void) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n){ SBXK_lifecycle_notif(n); }];
+    [nc addObserverForName:UIApplicationWillResignActiveNotification
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n){ SBXK_lifecycle_notif(n); }];
+    [nc addObserverForName:UIApplicationWillTerminateNotification
+                    object:nil queue:nil
+                usingBlock:^(NSNotification *n){ SBXK_lifecycle_notif(n); }];
+}
+
 // ============================================================================
-// القسم 19: نقطة الدخول — v7.10.7
+// §8 SBXK_Boot — Entry point
 // ============================================================================
 
-static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
+static atomic_bool g_installed = false;
+static pthread_mutex_t g_install_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void SBXK_install_fishhook(void) {
+    struct sbxk_rb rb[] = {
+        // AnoSDK
+        { "AnoSDKInit",            (void*)SBXK_AnoInit,  (void**)&orig_AnoSDKInit },
+        { "AnoSDKSetUserInfo",     (void*)SBXK_AnoUser,  (void**)&orig_AnoSDKSetUserInfo },
+        { "AnoSDKGetReportData",   (void*)SBXK_AnoData,  (void**)&orig_AnoSDKGetData },
+        { "AnoSDKGetReportData2",  (void*)SBXK_AnoData2, (void**)&orig_AnoSDKGetData2 },
+        { "AnoSDKDelReportData",   (void*)SBXK_AnoDel,   (void**)&orig_AnoSDKDel },
+        { "AnoSDKIoctl",           (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
+        { "AnoSDKIoctlOld",        (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
+        { "AnoSDKOnPause",         (void*)SBXK_AnoPause, (void**)&orig_AnoSDKPause },
+        { "AnoSDKOnResume",        (void*)SBXK_AnoPause, (void**)&orig_AnoSDKResume },
+        { "AnoSDKOnRecvData",      (void*)SBXK_AnoRecv,  (void**)&orig_AnoSDKRecvD },
+        { "AnoSDKOnRecvSignature", (void*)SBXK_AnoRecv,  (void**)&orig_AnoSDKRecvS },
+        { "CheckSymbolSource",     (void*)SBXK_CheckSym, (void**)&orig_CheckSym },
+        // UQM
+        { "__ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_", (void*)SBXK_UQMInit, (void**)&orig_UQMInit },
+        { "__ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE", (void*)SBXK_UQMUser, (void**)&orig_UQMUser },
+        { "__ZN3UQM8UQMCrash8SetAppIdERKNS_9UQMStringE",  (void*)SBXK_UQMApp,  (void**)&orig_UQMApp },
+        { "__ZN3UQM8UQMCrash7LogInfoEiRKNS_9UQMStringES3_", (void*)SBXK_UQMLog, (void**)&orig_UQMLog },
+        { "__ZN3UQM8UQMCrash12SetUserValueERKNS_9UQMStringES3_", (void*)SBXK_UQMSetUser, (void**)&orig_UQMSetUser },
+        { "__ZN3UQM8UQMCrash18ReportExceptionPRVEiRKNS_9UQMStringES3_S3_RKNS_9UQMVectorINS_9UQMKVPairELj16EEES3_bi",
+          (void*)SBXK_UQMRpt, (void**)&orig_UQMRpt },
+        { "__ZN3UQM8UQMCrash16SetCrashObserverEPNS_16UQMCrashObserverE", (void*)SBXK_UQMSetCrashObs, (void**)&orig_UQMSetCrashObs },
+        { "__ZN3UQM8UQMCrash19SetCrashLogObserverEPNS_19UQMCrashLogObserverE", (void*)SBXK_UQMSetLogObs, (void**)&orig_UQMSetLogObs },
+        { "__ZN3UQM8UQMCrash24ConfigCrashHandleTimeoutEi", (void*)SBXK_UQMConfigTimeout, (void**)&orig_UQMConfigTimeout },
+        // CrashSight
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent11ReportStuckEiilPKcS3_S3_iS3_", (void*)SBXK_CSStuck, (void**)&orig_CSStuck },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ReportExceptionJsonEiPKcS3_S3_S3_iS3_", (void*)SBXK_CSErr, (void**)&orig_CSErr },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent13ReportLogInfoEPKcS3_", (void*)SBXK_CSLog, (void**)&orig_CSLog },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent20GetLastSessionUserIdEPvi", (void*)SBXK_CSLast, (void**)&orig_CSLast },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent12TestOomCrashEv", (void*)SBXK_CSTestOom, (void**)&orig_CSTestOom },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent16GetCrashThreadIdEv", (void*)SBXK_CSGetCrashTid, (void**)&orig_CSGetCrashTid },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent18IsLastSessionCrashEv", (void*)SBXK_CSIsLastCrash, (void**)&orig_CSIsLastCrash },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent18SetUploadThreadNumEi", (void*)SBXK_CSSetUpload, (void**)&orig_CSSetUpload },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ConfigCrashReporterEi", (void*)SBXK_CSConfigRep, (void**)&orig_CSConfigRep },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19SetCatchMultiSignalEb", (void*)SBXK_CSSetCatch, (void**)&orig_CSSetCatch },
+        // Cros
+        { "Px_GetQJSFunctionTable_V04", (void*)SBXK_PxGetQJS, (void**)&orig_PxGetQJS },
+    };
+    int t = SBXK_fishhook(rb, (int)(sizeof(rb)/sizeof(rb[0])));
+    NSLog(@"[SBXK-v9.0] fishhook: %d / %zu", t, sizeof(rb)/sizeof(rb[0]));
+}
+
+static void SBXK_install_string_hooks(void) {
+    struct sbxk_rb rb[] = {
+        { "strstr",     (void*)SBXK_strstr,     (void**)&orig_strstr },
+        { "strcasestr", (void*)SBXK_strcasestr, (void**)&orig_strcasestr },
+        { "strcmp",     (void*)SBXK_strcmp,     (void**)&orig_strcmp },
+        { "strncmp",    (void*)SBXK_strncmp,    (void**)&orig_strncmp },
+        { "memmem",     (void*)SBXK_memmem,     (void**)&orig_memmem },
+    };
+    SBXK_fishhook(rb, (int)(sizeof(rb)/sizeof(rb[0])));
+
+    Method containsM = class_getInstanceMethod([NSString class], @selector(containsString:));
+    if (containsM) method_setImplementation(containsM, (IMP)SBXK_NSString_containsString);
+}
+
+static void SBXK_install_trampolines(void) {
+    void *targets[] = {
+        dlsym(RTLD_DEFAULT, "vm_read_overwrite"),
+        dlsym(RTLD_DEFAULT, "task_get_exception_ports"),
+        dlsym(RTLD_DEFAULT, "thread_get_exception_ports"),
+    };
+    void *handlers[] = {
+        (void*)SBXK_vm_read_overwrite,
+        (void*)SBXK_task_get_exp,
+        (void*)SBXK_thread_get_exp,
+    };
+    for (size_t i = 0; i < sizeof(targets)/sizeof(targets[0]); i++) {
+        if (targets[i] && handlers[i]) SBXK_tramp_install(targets[i], handlers[i]);
+    }
+    if (targets[0]) orig_vm_read_overwrite = (vm_read_overwrite_t)targets[0];
+    if (targets[1]) orig_task_get_exp = (task_get_exception_ports_t)targets[1];
+    if (targets[2]) orig_thread_get_exp = (thread_get_exception_ports_t)targets[2];
+}
+
+static void SBXK_install_objc(void) {
+    // AntiDataProxy
+    HK_B(AntiDataProxy, checkIntegrity);  HK_B(AntiDataProxy, isIntegrityOK);
+    HK_B(AntiDataProxy, verifyData);      HK_B(AntiDataProxy, isDataValid);
+    HK_B(AntiDataProxy, isModified);      HK_B(AntiDataProxy, isCheat);
+    HK_B(AntiDataProxy, isSuspicious);    HK_B(AntiDataProxy, antiCheatCheck);
+    HK_B(AntiDataProxy, securityCheck);   HK_B(AntiDataProxy, hasRisk);
+    HK_B(AntiDataProxy, detectRisk);      HK_B(AntiDataProxy, isRiskDetected);
+    HK_B(AntiDataProxy, isValid);         HK_B(AntiDataProxy, isSafe);
+    HK_B(AntiDataProxy, isClean);         HK_B(AntiDataProxy, verifyIntegrity);
+    HK_B(AntiDataProxy, verifySignature); HK_B(AntiDataProxy, shouldPass);
+    HK_B(AntiDataProxy, allowReport);     HK_B(AntiDataProxy, sendData);
+    HK_B(AntiDataProxy, report);          HK_B(AntiDataProxy, submit);
+    HK_B(AntiDataProxy, upload);          HK_B(AntiDataProxy, dispatch);
+    HK_B(AntiDataProxy, flush);
+
+    // TssInfoReceiver
+    HK_B(TssInfoReceiver, isRooted);      HK_B(TssInfoReceiver, isRootedDevice);
+    HK_B(TssInfoReceiver, isJailbroken);  HK_B(TssInfoReceiver, isJailbreakDevice);
+    HK_B(TssInfoReceiver, isEmulator);    HK_B(TssInfoReceiver, isEmulatorDevice);
+    HK_B(TssInfoReceiver, isSimulator);   HK_B(TssInfoReceiver, isDebuggerAttached);
+    HK_B(TssInfoReceiver, isDebugged);    HK_B(TssInfoReceiver, isModified);
+    HK_B(TssInfoReceiver, isTampered);    HK_B(TssInfoReceiver, isInjected);
+    HK_B(TssInfoReceiver, isHooked);      HK_B(TssInfoReceiver, hasCheat);
+    HK_B(TssInfoReceiver, hasCheatTool);  HK_B(TssInfoReceiver, hasSuspiciousFiles);
+    HK_B(TssInfoReceiver, hasRisk);       HK_B(TssInfoReceiver, checkEnvironment);
+    HK_B(TssInfoReceiver, checkSecurity); HK_B(TssInfoReceiver, checkCheat);
+    HK_B(TssInfoReceiver, detectCheat);   HK_B(TssInfoReceiver, detectRisk);
+    HK_B(TssInfoReceiver, detectEnvironment); HK_B(TssInfoReceiver, isCheating);
+    HK_B(TssInfoReceiver, isCheatDetected); HK_B(TssInfoReceiver, isSuspicious);
+    HK_B(TssInfoReceiver, antiCheatCheck); HK_B(TssInfoReceiver, securityCheck);
+    HK_B(TssInfoReceiver, shouldReport);  HK_B(TssInfoReceiver, shouldBlock);
+    HK_B(TssInfoReceiver, needReport);    HK_B(TssInfoReceiver, needBlock);
+    HK_B(TssInfoReceiver, isBlocked);     HK_B(TssInfoReceiver, isBanned);
+    HK_B(TssInfoReceiver, isSafe);        HK_B(TssInfoReceiver, isClean);
+    HK_B(TssInfoReceiver, isEnvironmentClean); HK_B(TssInfoReceiver, isEnvironmentSafe);
+    HK_B(TssInfoReceiver, verifyIntegrity); HK_B(TssInfoReceiver, verifySignature);
+    HK_B(TssInfoReceiver, checkTokenValid); HK_B(TssInfoReceiver, start);
+    HK_B(TssInfoReceiver, stop);          HK_B(TssInfoReceiver, run);
+    HK_B(TssInfoReceiver, report);        HK_B(TssInfoReceiver, sendReport);
+    HK_B(TssInfoReceiver, uploadReport);  HK_B(TssInfoReceiver, submitReport);
+    HK_B(TssInfoReceiver, reportRoot);    HK_B(TssInfoReceiver, reportEmu);
+    HK_B(TssInfoReceiver, reportDebugger); HK_B(TssInfoReceiver, reportCheat);
+    HK_B(TssInfoReceiver, reportAlert);   HK_B(TssInfoReceiver, sendAlert);
+    HK_B(TssInfoReceiver, blockGame);     HK_B(TssInfoReceiver, blockPlayer);
+    HK_B(TssInfoReceiver, kickPlayer);
+
+    // CheckSymbolSource
+    HK_B(CheckSymbolSource, CheckSymbol); HK_B(CheckSymbolSource, checkSymbol);
+    HK_B(CheckSymbolSource, checkSymbolSource); HK_B(CheckSymbolSource, isSymbolValid);
+    HK_B(CheckSymbolSource, isSymbolOK);  HK_B(CheckSymbolSource, verifySymbol);
+    HK_B(CheckSymbolSource, verifySymbols); HK_B(CheckSymbolSource, isSourceSafe);
+    HK_B(CheckSymbolSource, checkSource); HK_B(CheckSymbolSource, isSourceOK);
+    HK_B(CheckSymbolSource, sourceIsValid);
+
+    // Scan threads
+    HK_B(CFastScanThread, isRunning); HK_B(CFastScanThread, shouldScan);
+    HK_B(CFastScanThread, hasResult); HK_B(CScanThread, isRunning);
+    HK_B(CScanThread, shouldScan);    HK_B(CScanThread, hasResult);
+    HK_B(CSendThread, isRunning);     HK_B(CSendThread, shouldSend);
+    HK_B(CSendThread, hasData);       HK_B(CMrpcsMonitor, isRunning);
+    HK_B(CMrpcsMonitor, shouldReport); HK_B(CMrpcsMgrE, isReady);
+    HK_B(CMrpcsMgrE, shouldReport);   HK_B(CPointDataMgr, shouldReport);
+    HK_B(CPointDataMgr, hasData);     HK_B(CPointGlobalMgr, shouldReport);
+    HK_B(CPointGlobalMgr, hasData);   HK_B(CMrpcsLFUpdater, shouldUpdate);
+    HK_B(CMrpcsLFUpdater, hasUpdate);
+    HK_B(CFastScanThread, start);     HK_B(CFastScanThread, run);
+    HK_B(CFastScanThread, execute);   HK_B(CScanThread, start);
+    HK_B(CScanThread, run);           HK_B(CScanThread, execute);
+    HK_B(CSendThread, start);         HK_B(CSendThread, run);
+    HK_B(CSendThread, execute);       HK_B(CMrpcsMonitor, start);
+    HK_B(CMrpcsMonitor, stop);        HK_B(CMrpcsMonitor, run);
+    HK_B(CMrpcsMonitor, execute);     HK_B(CMrpcsMgrE, sendScanResult);
+    HK_B(CMrpcsMgrE, reportResult);   HK_B(CPointDataMgr, report);
+    HK_B(CPointDataMgr, sendData);    HK_B(CPointGlobalMgr, report);
+    HK_B(CPointGlobalMgr, sendReport); HK_B(CMrpcsLFUpdater, update);
+    HK_B(CMrpcsLFUpdater, start);     HK_B(CMrpcsLFUpdater, run);
+
+    // Integrity
+    HK_B(IntegrityChecker, integrity_detect);
+    HK_B(IntegrityChecker, MTML_INTEGRITY_DETECT);
+    HK_B(JailbreakDetector, isJailbroken);
+    HK_B(JailbreakDetector, isJailbreak);
+    HK_B(JailbreakDetector, checkJailbreak);
+    HK_B(JailbreakDetector, jailbreakDetection);
+    HK_B(SimulatorDetector, isSimulator);
+    HK_B(SimulatorDetector, isSimulatorDevice);
+    HK_B(SimulatorDetector, checkSimulator);
+    HK_B(SecurityChecker, IsFileSystemModified);
+    HK_B(SecurityChecker, isDebuggerAttached);
+    HK_B(SecurityChecker, isDebugged);
+    HK_B(SecurityChecker, checkDebugger);
+    HK_B(SecurityChecker, amIBeingDebugged);
+    HK_B(SecurityChecker, isHooked);
+    HK_B(SecurityChecker, isHookDetected);
+    HK_B(SecurityChecker, checkHook);
+    HK_B(SecurityChecker, detectHook);
+    HK_B(SecurityChecker, antiHookCheck);
+    HK_B(SecurityChecker, isTampered);
+    HK_B(SecurityChecker, checkTamper);
+    HK_B(SecurityChecker, antiTamperCheck);
+    HK_B(SecurityChecker, isInjected);
+    HK_B(SecurityChecker, isLibraryInjected);
+    HK_B(SecurityChecker, checkInjection);
+    HK_B(SecurityChecker, antiInjectionCheck);
+    HK_B(SecurityChecker, isReversingDetected);
+    HK_B(SecurityChecker, checkReversing);
+    HK_B(SecurityChecker, antiReversingCheck);
+    HK_B(SecurityChecker, isBlocked);
+    HK_B(SecurityChecker, antiBlockingCheck);
+    HK_B(SecurityChecker, isVPNUsed);
+    HK_B(SecurityChecker, isProxyUsed);
+    HK_B(SecurityChecker, isFridaRunning);
+    HK_B(SecurityChecker, isSubstrateLoaded);
+    HK_B(SecurityChecker, isCydiaInstalled);
+    HK_B(SecurityChecker, hasSuspiciousFiles);
+    HK_B(SecurityChecker, isEnvironmentClean);
+    HK_B(SecurityChecker, verifyIntegrity);
+    HK_B(SecurityChecker, checkTokenValid);
+    HK_B(SecurityChecker, isEnvironmentSafe);
+    HK_B(SecurityChecker, verifySignature);
+
+    // Frida
+    HK_B(SBXK_FridaDet, isFridaPresent);
+    HK_B(SBXK_FridaDet, isFridaRunning);
+    HK_B(SBXK_FridaDet, hasFrida);
+    HK_B(SBXK_FridaDet, checkFrida);
+    HK_B(SBXK_FridaDet, detectFrida);
+    HK_B(SBXK_SubDet, isSubstrateLoaded);
+    HK_B(SBXK_SubDet, hasSubstrate);
+    HK_B(SBXK_SubDet, checkSubstrate);
+    HK_B(SBXK_SubDet, isCydiaSubstrateLoaded);
+    HK_B(SBXK_InjectDet, isDylibInjected);
+    HK_B(SBXK_InjectDet, isImageInjected);
+    HK_B(SBXK_InjectDet, hasInjectedDylib);
+    HK_B(SBXK_InjectDet, isForeignImageLoaded);
+    HK_B(SBXK_InjectDet, hasHooked);
+    HK_B(SBXK_InjectDet, hasMSHook);
+    HK_B(SBXK_InjectDet, hasDYLD_INSERT);
+    HK_B(SBXK_InjectDet, isDYLDInjected);
+    HK_B(SBXK_InjectDet, isAttached);
+    HK_B(SBXK_InjectDet, isBeingDebugged);
+    HK_B(SBXK_InjectDet, isTraced);
+    HK_B(SBXK_InjectDet, isEnvironmentClean);
+    HK_B(SBXK_InjectDet, isEnvironmentSafe);
+    HK_B(SBXK_InjectDet, isClean);
+    HK_B(SBXK_InjectDet, isSafe);
+    HK_B(SBXK_InjectDet, verifyNoInjection);
+    HK_B(SBXK_InjectDet, verifyNoHook);
+
+    // Screenshot
+    HK_B(ScreenShot, takeScreenShot);
+    HK_B(ScreenShot, screenshot);
+    HK_B(ScreenShot, getAppWindowsForScreen);
+    HK_B(ScreenShot, getBufFromImage);
+    HK_B(Rotate, fixOrientation);
+    HK_B(Rotate, flipVertical);
+    HK_B(Rotate, flipHorizontal);
+
+    // Message box
+    HK_B(AceMsgBoxImp, ShowMessageBoxWithTitle_Message_LeftBtn_RightBtn);
+    HK_B(AceMsgBoxImp, dismiss);
+    HK_B(AceMsgBoxImp, show);
+}
+
+static void SBXK_install_all(void) {
+    pthread_mutex_lock(&g_install_lock);
+    if (atomic_load(&g_installed)) {
+        pthread_mutex_unlock(&g_install_lock);
+        return;
+    }
+
+    SBXK_install_objc();
+    SBXK_install_fishhook();
+    SBXK_install_string_hooks();
+    SBXK_install_trampolines();
+
+    atomic_store(&g_installed, true);
+    pthread_mutex_unlock(&g_install_lock);
+}
+
+static void SBXK_on_dyld_image(const struct mach_header *mh, intptr_t slide) {
     (void)mh; (void)slide;
-    atomic_store(&g_pending, true);
-}
-
-static void SBXK_FullInstall(void) {
-    @try { SBXK_RegBase();          } @catch (NSException *e) { NSLog(@"[SBXK] RegBase: %@", e); }
-    @try { SBXK_RegExtended();      } @catch (NSException *e) { NSLog(@"[SBXK] RegExtended: %@", e); }
-    @try { SBXK_RegInjectionKill(); } @catch (NSException *e) { NSLog(@"[SBXK] RegInject: %@", e); }
-    @try { SBXK_RegReal();          } @catch (NSException *e) { NSLog(@"[SBXK] RegReal: %@", e); }
-    @try { SBXK_RegisterFishhook(); } @catch (NSException *e) { NSLog(@"[SBXK] Fishhook: %@", e); }
-    // v7.10.7: SBXK_RegAceClasses محذوفة (كانت تسبب تجميد DNS)
-}
-
-static void SBXK_Retry(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ SBXK_Retry(); });
-        return;
-    }
-    SBXK_FullInstall();
-}
-
-static void SBXK_Run(void) {
-    if (!sbxk_should_run()) return;
-    atomic_store(&g_phase, 20);
-    SBXK_FullInstall();
-    atomic_store(&g_phase, 30);
-    if (!sbxk_self_ok()) {
-        NSLog(@"[SBXK] self-check fail — rollback");
-        sbxk_disable_all();
-        return;
-    }
-    sbxk_mark_ok();
-    NSLog(@"[SBXK] v7.10.7 done=%lu skip=%lu",
-          (unsigned long)g_done.count, (unsigned long)g_skip.count);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool { SBXK_install_fishhook(); }
+    });
 }
 
 __attribute__((constructor))
-static void SBXK_Boot(void) {
+static void SBXK_boot(void) {
     @autoreleasepool {
-        g_orig = [NSMutableDictionary dictionary];
-        g_done = [NSMutableSet set];
-        g_skip = [NSMutableSet set];
-        SBXK_InitPaths();
-        SBXK_InstallCrashHandlers();
-        atomic_store(&g_phase, 1);
-        SBXK_RotateCrashLog();
-        atomic_store(&g_phase, 2);
-        SBXK_ANTIDEBUG();
-        NSLog(@"[SBXK] v7.10.7 boot");
-        [SBXK_LogViewer installObserver];
-        _dyld_register_func_for_add_image(sbxk_on_image_added);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+        SBXK_derive_key();
+        SBXK_detect_jit();
+        _dyld_register_func_for_add_image(SBXK_on_dyld_image);
+        SBXK_lifecycle_install();
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool {
-                SBXK_Run();
-                [NSTimer scheduledTimerWithTimeInterval:3.0
-                                                 repeats:YES
-                                                   block:^(NSTimer *t) {
-                    (void)t;
-                    if (atomic_exchange(&g_pending, false)) SBXK_Retry();
-                }];
+                SBXK_install_all();
+                SBXK_cleanup_now();
+                NSLog(@"[SBXK-v9.0] installed. hooks=%zu tramps=%zu jit=%d",
+                      g_hooks_len, g_tramps_len, (int)g_jit_supported);
             }
         });
     }
