@@ -1,9 +1,12 @@
 // ============================================================================
-// ShadowBypass XK v7.10.4 — iOS 14+ arm64 — ملف واحد كامل مع تشفير مدمج
+// ShadowBypass XK v7.10.4 — iOS 14+ arm64 — ملف واحد كامل
 //
-//   - كل إصلاحات v7.10.3 (fishhook + crash-loop + cleanup)
-//   - تشفير defcrypto مدمج عبر الجسر
-//   - self-test للتشفير في الـconstructor
+// يشمل كل الإصلاحات:
+//   v7.10.1 : إصلاح subscript pointer + فواصل منقوطة
+//   v7.10.2 : fishhook مصحح (indirectsymoff = uint32_t[])
+//   v7.10.3 : تنظيف ملفات مُصحَّح + g_viewer_done + حماية crash-loop
+//   v7.10.4 : دمج ACE extended — UQM/CrashSight/HTTPDNS/Cros + GAMELET
+//             إضافات كاملة عبر fishhook + swizzle HttpDns plugin
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -25,8 +28,6 @@
 #import <sys/mman.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
-#import <sys/socket.h>
-#import "defcrypto_bridge.h"
 
 // ============================================================================
 // القسم 0: تشفير النصوص XOR
@@ -152,44 +153,6 @@ static void sbxk_whex(int fd, const void *p) {
     char b[20]; int i = 0;
     while (v > 0 && i < 19) { b[i++] = hx[v & 0xF]; v >>= 4; }
     while (i > 0) { char c = b[--i]; ssize_t _r = write(fd, &c, 1); (void)_r; }
-}
-
-// ============================================================================
-// القسم 1b: مساعد التشفير (defcrypto bridge wrappers)
-// ============================================================================
-
-static NSData *SBXK_EncryptData(NSData *data, NSData *password) {
-    if (!data.length || !password.length) return nil;
-    uint8_t buf[16384];
-    size_t blen = 0;
-    int rc = sbxk_encrypt_pwd(data.bytes, data.length,
-                              password.bytes, password.length,
-                              NULL, 0,
-                              buf, sizeof(buf), &blen);
-    if (rc != 0) return nil;
-    return [NSData dataWithBytes:buf length:blen];
-}
-
-static NSData *SBXK_DecryptData(NSData *data, NSData *password) {
-    if (!data.length || !password.length) return nil;
-    uint8_t buf[16384];
-    size_t blen = 0;
-    int rc = sbxk_decrypt_pwd(data.bytes, data.length,
-                              password.bytes, password.length,
-                              NULL, 0,
-                              buf, sizeof(buf), &blen);
-    if (rc != 0) return nil;
-    return [NSData dataWithBytes:buf length:blen];
-}
-
-static NSData *SBXK_RandomKey(void) {
-    uint8_t buf[32];
-    if (sbxk_random_key(buf) != 0) return nil;
-    return [NSData dataWithBytes:buf length:32];
-}
-
-static void SBXK_SecureWipe(void *p, size_t n) {
-    sbxk_wipe(p, n);
 }
 
 // ============================================================================
@@ -1026,7 +989,7 @@ static void sbxk_disable_all(void) {
 }
 
 // ============================================================================
-// القسم 11: fishhook مدمج — مصحح
+// القسم 11: fishhook مدمج — مصحح + ACE extended
 // ============================================================================
 
 struct sbxk_rb { const char *name; void *repl; void **replaced; };
@@ -1034,7 +997,7 @@ struct sbxk_rb { const char *name; void *repl; void **replaced; };
 static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
                              struct sbxk_rb *b, int nb)
 {
-    if (!mh || mh->magic != MH_MAGIC_64) return 0;
+    if (mh->magic != MH_MAGIC_64) return 0;
     const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
     const struct segment_command_64 *le = NULL;
     const struct symtab_command *st = NULL;
@@ -1070,14 +1033,14 @@ static int sbxk_rebind_image(const struct mach_header *mh, intptr_t slide,
                 uint32_t start = sec->reserved1;
                 for (uint32_t k = 0; k < cnt; k++) {
                     uint32_t si = ind[start + k];
-                    if (si == 0 || si == 0x80000000u || si >= nsyms) continue;
+                    if (si == 0 || si == 0x80000000u) continue;
+                    if (si >= nsyms) continue;
                     const char *nm = str + sym[si].n_un.n_strx;
                     if (!nm || nm[0] != '_') continue;
                     const char *cl = nm + 1;
                     for (int x = 0; x < nb; x++) {
                         if (strcmp(b[x].name, cl) != 0) continue;
                         void **slot = (void **)(sl + sec->addr + k * sizeof(void *));
-                        if (!slot) continue;
                         if (b[x].replaced && *b[x].replaced == NULL) *b[x].replaced = *slot;
                         uintptr_t pg = (uintptr_t)slot & ~(PAGE_SIZE - 1);
                         kern_return_t kr = vm_protect(mach_task_self_, pg, PAGE_SIZE,
@@ -1109,7 +1072,7 @@ static int sbxk_rebind(struct sbxk_rb *b, int nb) {
     return t;
 }
 
-// بدائل رموز C
+// --- بدائل رموز C (AnoSDK + GAMELET + Check) ---
 typedef int (*AnoSDKInit_t)(const char*);
 typedef int (*AnoSDKSetUserInfo_t)(const char*);
 typedef void *(*AnoSDKGetData_t)(int);
@@ -1122,22 +1085,26 @@ typedef int (*CheckSym_t)(void);
 typedef int (*GAMELET_Log_t)(const char*);
 typedef int (*GAMELET_Log2_t)(const char*,const char*);
 typedef int (*GAMELET_Msg_t)(int,const void*,size_t);
+typedef int (*GAMELET_ReportFunc_t)(const char*,const void*,int);
 
-static AnoSDKInit_t orig_AnoSDKInit;
-static AnoSDKSetUserInfo_t orig_AnoSDKSetUserInfo;
-static AnoSDKGetData_t orig_AnoSDKGetData;
-static AnoSDKGetData2_t orig_AnoSDKGetData2;
-static AnoSDKDel_t orig_AnoSDKDel;
-static AnoSDKIoctl_t orig_AnoSDKIoctl;
-static AnoSDKPause_t orig_AnoSDKPause;
-static AnoSDKPause_t orig_AnoSDKResume;
-static AnoSDKRecv_t orig_AnoSDKRecvD;
-static AnoSDKRecv_t orig_AnoSDKRecvS;
-static CheckSym_t orig_CheckSym;
-static GAMELET_Log_t orig_GL1;
-static GAMELET_Log_t orig_GL2;
-static GAMELET_Log2_t orig_GL3;
-static GAMELET_Msg_t orig_GM;
+static AnoSDKInit_t         orig_AnoSDKInit;
+static AnoSDKSetUserInfo_t  orig_AnoSDKSetUserInfo;
+static AnoSDKGetData_t      orig_AnoSDKGetData;
+static AnoSDKGetData2_t     orig_AnoSDKGetData2;
+static AnoSDKDel_t          orig_AnoSDKDel;
+static AnoSDKIoctl_t        orig_AnoSDKIoctl;
+static AnoSDKPause_t        orig_AnoSDKPause;
+static AnoSDKPause_t        orig_AnoSDKResume;
+static AnoSDKRecv_t         orig_AnoSDKRecvD;
+static AnoSDKRecv_t         orig_AnoSDKRecvS;
+static CheckSym_t           orig_CheckSym;
+static GAMELET_Log_t        orig_GL1;
+static GAMELET_Log_t        orig_GL2;
+static GAMELET_Log2_t       orig_GL3;
+static GAMELET_Msg_t        orig_GM;
+static GAMELET_ReportFunc_t orig_GM_ReportStats;
+static GAMELET_ReportFunc_t orig_GM_ReportLog;
+static GAMELET_ReportFunc_t orig_GM_ReportTNM2;
 
 static int SBXK_AnoInit(const char*p){(void)p;return 0;}
 static int SBXK_AnoUser(const char*p){(void)p;return 0;}
@@ -1152,69 +1119,193 @@ static int SBXK_GL1(const char*s){(void)s;return 0;}
 static int SBXK_GL2(const char*s){(void)s;return 0;}
 static int SBXK_GL3(const char*a,const char*b){(void)a;(void)b;return 0;}
 static int SBXK_GM(int a,const void*b,size_t c){(void)a;(void)b;(void)c;return 0;}
+static int SBXK_GM_ReportStats(const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
+static int SBXK_GM_ReportLog  (const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
+static int SBXK_GM_ReportTNM2 (const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
 
-// بدائل C++ mangled
+// --- UQM crash ---
 typedef int (*UQMCrash_Init_t)(void*,int,int,void*);
 typedef int (*UQMCrash_Str_t)(void*);
 typedef int (*UQMCrash_Log_t)(int,void*,void*);
 typedef int (*UQMCrash_Rpt_t)(void*,int,void*,void*,void*,void*,void*,int);
-static UQMCrash_Init_t orig_UQMInit;
-static UQMCrash_Str_t orig_UQMUser;
-static UQMCrash_Str_t orig_UQMApp;
-static UQMCrash_Log_t orig_UQMLog;
-static UQMCrash_Str_t orig_UQMSetUser;
-static UQMCrash_Rpt_t orig_UQMRpt;
+typedef int (*UQM_SetObserver_t)(void*, void*);
+typedef int (*UQM_ConfigTimeout_t)(int);
+
+static UQMCrash_Init_t      orig_UQMInit;
+static UQMCrash_Str_t       orig_UQMUser;
+static UQMCrash_Str_t       orig_UQMApp;
+static UQMCrash_Log_t       orig_UQMLog;
+static UQMCrash_Str_t       orig_UQMSetUser;
+static UQMCrash_Rpt_t       orig_UQMRpt;
+static UQM_SetObserver_t    orig_UQMSetCrashObs;
+static UQM_SetObserver_t    orig_UQMSetLogObs;
+static UQM_ConfigTimeout_t  orig_UQMConfigTimeout;
+
 static int SBXK_UQMInit(void*a,int b,int c,void*d){(void)a;(void)b;(void)c;(void)d;return 0;}
 static int SBXK_UQMUser(void*a){(void)a;return 0;}
 static int SBXK_UQMApp(void*a){(void)a;return 0;}
 static int SBXK_UQMLog(int a,void*b,void*c){(void)a;(void)b;(void)c;return 0;}
 static int SBXK_UQMSetUser(void*a,void*b){(void)a;(void)b;return 0;}
 static int SBXK_UQMRpt(void*a,int b,void*c,void*d,void*e,void*f,void*g,int h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
+static int SBXK_UQMSetCrashObs(void *self, void *obs){(void)self;(void)obs;return 0;}
+static int SBXK_UQMSetLogObs(void *self, void *obs){(void)self;(void)obs;return 0;}
+static int SBXK_UQMConfigTimeout(int t){(void)t;return 0;}
 
-typedef int (*CS_RptStuck_t)(void*,int,int,long,const char*,const char*,const char*,int,const char*);
-typedef int (*CS_RptErr_t)(void*,int,const char*,const char*,const char*,const char*,int,const char*);
-typedef int (*CS_RptLog_t)(void*,const char*,const char*);
-typedef int (*CS_LastUser_t)(void*,void*,int);
-static CS_RptStuck_t orig_CSStuck;
-static CS_RptErr_t orig_CSErr;
-static CS_RptLog_t orig_CSLog;
-static CS_LastUser_t orig_CSLast;
+// --- CrashSight ---
+typedef int  (*CS_RptStuck_t)(void*,int,int,long,const char*,const char*,const char*,int,const char*);
+typedef int  (*CS_RptErr_t)(void*,int,const char*,const char*,const char*,const char*,int,const char*);
+typedef int  (*CS_RptLog_t)(void*,const char*,const char*);
+typedef int  (*CS_LastUser_t)(void*,void*,int);
+typedef void (*CS_TestOom_t)(void*);
+typedef long (*CS_GetCrashTid_t)(void*);
+typedef int  (*CS_IsLastCrash_t)(void*);
+typedef void (*CS_SetUpload_t)(void*, int);
+typedef void (*CS_ConfigRep_t)(void*, int);
+typedef void (*CS_SetCatch_t)(void*, int);
+
+static CS_RptStuck_t     orig_CSStuck;
+static CS_RptErr_t       orig_CSErr;
+static CS_RptLog_t       orig_CSLog;
+static CS_LastUser_t     orig_CSLast;
+static CS_TestOom_t      orig_CSTestOom;
+static CS_GetCrashTid_t  orig_CSGetCrashTid;
+static CS_IsLastCrash_t  orig_CSIsLastCrash;
+static CS_SetUpload_t    orig_CSSetUpload;
+static CS_ConfigRep_t    orig_CSConfigRep;
+static CS_SetCatch_t     orig_CSSetCatch;
+
 static int SBXK_CSStuck(void*a,int b,int c,long d,const char*e,const char*f,const char*g,int h,const char*i){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;(void)i;return 0;}
 static int SBXK_CSErr(void*a,int b,const char*c,const char*d,const char*e,const char*f,int g,const char*h){(void)a;(void)b;(void)c;(void)d;(void)e;(void)f;(void)g;(void)h;return 0;}
 static int SBXK_CSLog(void*a,const char*b,const char*c){(void)a;(void)b;(void)c;return 0;}
 static int SBXK_CSLast(void*a,void*b,int c){(void)a;(void)b;(void)c;return 0;}
+static void SBXK_CSTestOom(void *self)          { (void)self; }
+static long SBXK_CSGetCrashTid(void *self)      { (void)self; return 0; }
+static int  SBXK_CSIsLastCrash(void *self)      { (void)self; return 0; }
+static void SBXK_CSSetUpload(void *self, int n) { (void)self; (void)n; }
+static void SBXK_CSConfigRep(void *self, int n) { (void)self; (void)n; }
+static void SBXK_CSSetCatch(void *self, int b)  { (void)self; (void)b; }
+
+// --- HTTPDNS / Cros ---
+typedef void (*WG_GetHostByName_t)(const char*, const char*, void*, void*);
+typedef void* (*Px_GetQJS_t)(void);
+
+static WG_GetHostByName_t orig_WGGetHostByName;
+static Px_GetQJS_t        orig_PxGetQJS;
+
+static void SBXK_WGGetHostByName(const char *host, const char *tag,
+                                 void *cb, void *ctx) {
+    if (orig_WGGetHostByName) {
+        orig_WGGetHostByName(host, tag, cb, ctx);
+        return;
+    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSString *hs = host ? [NSString stringWithUTF8String:host] : @"";
+        CFHostRef h = CFHostCreateWithName(kCFAllocatorDefault,
+                        (__bridge CFStringRef)hs);
+        if (!h) return;
+        CFHostStartInfoResolution(h, kCFHostAddresses, NULL);
+        if (cb) {
+            void (*fn)(void*, void*) = (void*)cb;
+            fn(ctx, (void*)h);
+        }
+        CFRelease(h);
+    });
+}
+
+static void *SBXK_PxGetQJS(void) { return NULL; }
 
 static void SBXK_RegisterFishhook(void) {
     struct sbxk_rb rb[] = {
-        { "AnoSDKInit", (void*)SBXK_AnoInit, (void**)&orig_AnoSDKInit },
-        { "AnoSDKSetUserInfo", (void*)SBXK_AnoUser, (void**)&orig_AnoSDKSetUserInfo },
-        { "AnoSDKGetReportData", (void*)SBXK_AnoData, (void**)&orig_AnoSDKGetData },
-        { "AnoSDKGetReportData2", (void*)SBXK_AnoData2, (void**)&orig_AnoSDKGetData2 },
-        { "AnoSDKDelReportData", (void*)SBXK_AnoDel, (void**)&orig_AnoSDKDel },
-        { "AnoSDKIoctl", (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
-        { "AnoSDKIoctlOld", (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
-        { "AnoSDKOnPause", (void*)SBXK_AnoPause, (void**)&orig_AnoSDKPause },
-        { "AnoSDKOnResume", (void*)SBXK_AnoPause, (void**)&orig_AnoSDKResume },
-        { "AnoSDKOnRecvData", (void*)SBXK_AnoRecv, (void**)&orig_AnoSDKRecvD },
-        { "AnoSDKOnRecvSignature", (void*)SBXK_AnoRecv, (void**)&orig_AnoSDKRecvS },
-        { "CheckSymbolSource", (void*)SBXK_CheckSym, (void**)&orig_CheckSym },
-        { "GAMELET_ReportSDKLog", (void*)SBXK_GL1, (void**)&orig_GL1 },
-        { "GAMELET_ReportScriptError", (void*)SBXK_GL2, (void**)&orig_GL2 },
-        { "GAMELET_ReportScriptErrorWithAppInfo", (void*)SBXK_GL3, (void**)&orig_GL3 },
-        { "GAMELET_SendMsg", (void*)SBXK_GM, (void**)&orig_GM },
-        { "__ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_", (void*)SBXK_UQMInit, (void**)&orig_UQMInit },
-        { "__ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE", (void*)SBXK_UQMUser, (void**)&orig_UQMUser },
-        { "__ZN3UQM8UQMCrash8SetAppIdERKNS_9UQMStringE", (void*)SBXK_UQMApp, (void**)&orig_UQMApp },
-        { "__ZN3UQM8UQMCrash7LogInfoEiRKNS_9UQMStringES3_", (void*)SBXK_UQMLog, (void**)&orig_UQMLog },
-        { "__ZN3UQM8UQMCrash12SetUserValueERKNS_9UQMStringES3_", (void*)SBXK_UQMSetUser, (void**)&orig_UQMSetUser },
-        { "__ZN3UQM8UQMCrash18ReportExceptionPRVEiRKNS_9UQMStringES3_S3_RKNS_9UQMVectorINS_9UQMKVPairELj16EEES3_bi", (void*)SBXK_UQMRpt, (void**)&orig_UQMRpt },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent11ReportStuckEiilPKcS3_S3_iS3_", (void*)SBXK_CSStuck, (void**)&orig_CSStuck },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ReportExceptionJsonEiPKcS3_S3_S3_iS3_", (void*)SBXK_CSErr, (void**)&orig_CSErr },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent13ReportLogInfoEPKcS3_", (void*)SBXK_CSLog, (void**)&orig_CSLog },
-        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent20GetLastSessionUserIdEPvi", (void*)SBXK_CSLast, (void**)&orig_CSLast },
+        // === AnoSDK ===
+        { "AnoSDKInit",               (void*)SBXK_AnoInit,  (void**)&orig_AnoSDKInit },
+        { "AnoSDKSetUserInfo",        (void*)SBXK_AnoUser,  (void**)&orig_AnoSDKSetUserInfo },
+        { "AnoSDKGetReportData",      (void*)SBXK_AnoData,  (void**)&orig_AnoSDKGetData },
+        { "AnoSDKGetReportData2",     (void*)SBXK_AnoData2, (void**)&orig_AnoSDKGetData2 },
+        { "AnoSDKDelReportData",      (void*)SBXK_AnoDel,   (void**)&orig_AnoSDKDel },
+        { "AnoSDKIoctl",              (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
+        { "AnoSDKIoctlOld",           (void*)SBXK_AnoIoctl, (void**)&orig_AnoSDKIoctl },
+        { "AnoSDKOnPause",            (void*)SBXK_AnoPause, (void**)&orig_AnoSDKPause },
+        { "AnoSDKOnResume",           (void*)SBXK_AnoPause, (void**)&orig_AnoSDKResume },
+        { "AnoSDKOnRecvData",         (void*)SBXK_AnoRecv,  (void**)&orig_AnoSDKRecvD },
+        { "AnoSDKOnRecvSignature",    (void*)SBXK_AnoRecv,  (void**)&orig_AnoSDKRecvS },
+        { "CheckSymbolSource",        (void*)SBXK_CheckSym, (void**)&orig_CheckSym },
+
+        // === GAMELET ===
+        { "GAMELET_ReportSDKLog",                (void*)SBXK_GL1, (void**)&orig_GL1 },
+        { "GAMELET_ReportScriptError",           (void*)SBXK_GL2, (void**)&orig_GL2 },
+        { "GAMELET_ReportScriptErrorWithAppInfo",(void*)SBXK_GL3, (void**)&orig_GL3 },
+        { "GAMELET_SendMsg",                     (void*)SBXK_GM,  (void**)&orig_GM },
+        { "GAMELET_ReportStatsFunc",             (void*)SBXK_GM_ReportStats, (void**)&orig_GM_ReportStats },
+        { "GAMELET_ReportLogFunc",               (void*)SBXK_GM_ReportLog,   (void**)&orig_GM_ReportLog },
+        { "GAMELET_ReportToTNM2Func",            (void*)SBXK_GM_ReportTNM2,  (void**)&orig_GM_ReportTNM2 },
+
+        // === UQM crash — كامل ===
+        { "__ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_",
+          (void*)SBXK_UQMInit,        (void**)&orig_UQMInit },
+        { "__ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE",
+          (void*)SBXK_UQMUser,        (void**)&orig_UQMUser },
+        { "__ZN3UQM8UQMCrash8SetAppIdERKNS_9UQMStringE",
+          (void*)SBXK_UQMApp,         (void**)&orig_UQMApp },
+        { "__ZN3UQM8UQMCrash7LogInfoEiRKNS_9UQMStringES3_",
+          (void*)SBXK_UQMLog,         (void**)&orig_UQMLog },
+        { "__ZN3UQM8UQMCrash12SetUserValueERKNS_9UQMStringES3_",
+          (void*)SBXK_UQMSetUser,     (void**)&orig_UQMSetUser },
+        { "__ZN3UQM8UQMCrash18ReportExceptionPRVEiRKNS_9UQMStringES3_S3_RKNS_9UQMVectorINS_9UQMKVPairELj16EEES3_bi",
+          (void*)SBXK_UQMRpt,         (void**)&orig_UQMRpt },
+        { "__ZN3UQM8UQMCrash16SetCrashObserverEPNS_16UQMCrashObserverE",
+          (void*)SBXK_UQMSetCrashObs, (void**)&orig_UQMSetCrashObs },
+        { "__ZN3UQM8UQMCrash19SetCrashLogObserverEPNS_19UQMCrashLogObserverE",
+          (void*)SBXK_UQMSetLogObs,   (void**)&orig_UQMSetLogObs },
+        { "__ZN3UQM8UQMCrash24ConfigCrashHandleTimeoutEi",
+          (void*)SBXK_UQMConfigTimeout, (void**)&orig_UQMConfigTimeout },
+
+        // === CrashSight — كامل ===
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent11ReportStuckEiilPKcS3_S3_iS3_",
+          (void*)SBXK_CSStuck,        (void**)&orig_CSStuck },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ReportExceptionJsonEiPKcS3_S3_S3_iS3_",
+          (void*)SBXK_CSErr,          (void**)&orig_CSErr },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent13ReportLogInfoEPKcS3_",
+          (void*)SBXK_CSLog,          (void**)&orig_CSLog },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent20GetLastSessionUserIdEPvi",
+          (void*)SBXK_CSLast,         (void**)&orig_CSLast },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent12TestOomCrashEv",
+          (void*)SBXK_CSTestOom,      (void**)&orig_CSTestOom },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent16GetCrashThreadIdEv",
+          (void*)SBXK_CSGetCrashTid,  (void**)&orig_CSGetCrashTid },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent18IsLastSessionCrashEv",
+          (void*)SBXK_CSIsLastCrash,  (void**)&orig_CSIsLastCrash },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent18SetUploadThreadNumEi",
+          (void*)SBXK_CSSetUpload,    (void**)&orig_CSSetUpload },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ConfigCrashReporterEi",
+          (void*)SBXK_CSConfigRep,    (void**)&orig_CSConfigRep },
+        { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19SetCatchMultiSignalEb",
+          (void*)SBXK_CSSetCatch,     (void**)&orig_CSSetCatch },
+
+        // === HTTPDNS / Cros ===
+        { "WGGetHostByNameAsyncWithTag",
+          (void*)SBXK_WGGetHostByName, (void**)&orig_WGGetHostByName },
+        { "Px_GetQJSFunctionTable_V04",
+          (void*)SBXK_PxGetQJS,        (void**)&orig_PxGetQJS },
     };
     int t = sbxk_rebind(rb, (int)(sizeof(rb)/sizeof(rb[0])));
-    NSLog(@"[SBXK-fh] %d/%zu", t, sizeof(rb)/sizeof(rb[0]));
+    NSLog(@"[SBXK-fh-ACE] %d rebound / %zu registered",
+          t, sizeof(rb)/sizeof(rb[0]));
+}
+
+// --- Swizzle HttpDns plugin lifecycle (ObjC) ---
+static void SBXK_HttpDns_onPause(id self, SEL _cmd)  { (void)self; (void)_cmd; }
+static void SBXK_HttpDns_onResume(id self, SEL _cmd) { (void)self; (void)_cmd; }
+
+static void SBXK_RegAceClasses(void) {
+    Class hdpl = objc_getClass("HttpDnsPluginLifecycle");
+    if (hdpl) {
+        SEL sPause  = sel_registerName("onPause");
+        SEL sResume = sel_registerName("onResume");
+        if (class_getInstanceMethod(hdpl, sPause))
+            class_replaceMethod(hdpl, sPause, (IMP)SBXK_HttpDns_onPause, "v@:");
+        if (class_getInstanceMethod(hdpl, sResume))
+            class_replaceMethod(hdpl, sResume, (IMP)SBXK_HttpDns_onResume, "v@:");
+    }
 }
 
 // ============================================================================
@@ -1865,7 +1956,8 @@ static void SBXK_RegReal(void) {
                    dispatch_get_main_queue(), ^{ [self show]; });
 }
 + (void)show {
-    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
+    NSString *p = [NSHomeDirectory()
+                   stringByAppendingPathComponent:@"Documents/sbxk_crash_prev.log"];
     NSData *d = [NSData dataWithContentsOfFile:p];
     if (!d.length) { atomic_store(&g_viewer_done, true); return; }
     NSString *s = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
@@ -1891,16 +1983,19 @@ static void SBXK_RegReal(void) {
 #pragma clang diagnostic pop
     }
     atomic_store(&g_viewer_done, true);
+
     if (!w || !w.rootViewController || w.rootViewController.presentedViewController) return;
-    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"SBXK" message:s
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"SBXK" message:s
         preferredStyle:UIAlertControllerStyleAlert];
-    [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK"
+        style:UIAlertActionStyleDefault handler:nil]];
     [w.rootViewController presentViewController:a animated:YES completion:nil];
 }
 @end
 
 // ============================================================================
-// القسم 18: تنظيف ملفات مُصحَّح
+// القسم 18: تنظيف ملفات
 // ============================================================================
 
 static NSArray<NSString *> *sbxk_cleanup_exact_paths(void) {
@@ -1943,6 +2038,7 @@ static void sbxk_do_cleanup(void) {
     @try {
         NSFileManager *fm = [NSFileManager defaultManager];
         NSError *err = nil;
+
         for (NSString *p in sbxk_cleanup_exact_paths()) {
             if (!atomic_load(&g_viewer_done) &&
                 [p hasSuffix:@"sbxk_crash_prev.log"]) continue;
@@ -1951,6 +2047,7 @@ static void sbxk_do_cleanup(void) {
                 err = nil;
             }
         }
+
         for (NSString *dir in sbxk_cleanup_dirs()) {
             if (![fm fileExistsAtPath:dir]) continue;
             NSArray *items = [fm contentsOfDirectoryAtPath:dir error:&err];
@@ -1996,6 +2093,7 @@ static void SBXK_FullInstall(void) {
     @try { SBXK_RegExtended();      } @catch (NSException *e) { NSLog(@"[SBXK] RegExtended: %@", e); }
     @try { SBXK_RegInjectionKill(); } @catch (NSException *e) { NSLog(@"[SBXK] RegInject: %@", e); }
     @try { SBXK_RegReal();          } @catch (NSException *e) { NSLog(@"[SBXK] RegReal: %@", e); }
+    @try { SBXK_RegAceClasses();    } @catch (NSException *e) { NSLog(@"[SBXK] RegAce: %@", e); }
     @try { SBXK_RegisterFishhook(); } @catch (NSException *e) { NSLog(@"[SBXK] Fishhook: %@", e); }
 }
 
@@ -2035,14 +2133,6 @@ static void SBXK_Boot(void) {
         atomic_store(&g_phase, 2);
         SBXK_ANTIDEBUG();
         NSLog(@"[SBXK] v7.10.4 boot");
-
-        // ★ self-test للتشفير
-        uint8_t test_key[32];
-        if (sbxk_random_key(test_key) == 0) {
-            NSLog(@"[SBXK] crypto ready, hw_aes=%d", sbxk_has_hw_aes());
-            sbxk_wipe(test_key, 32);
-        }
-
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
