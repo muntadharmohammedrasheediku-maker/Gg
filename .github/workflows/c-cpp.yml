@@ -1,189 +1,61 @@
-name: build-shadowxk-unified
+name: build-shadowbypass
 
-on:
-  push:
-    branches: [main, master]
-  workflow_dispatch:
+on: [push, workflow_dispatch]
 
 jobs:
   build:
     runs-on: macos-14
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
+          submodules: recursive
           fetch-depth: 0
 
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
-      - name: List repo
-        run: ls -la
-
-      - name: Download OpenSSL xcframework
+      - name: Fetch fishhook (fallback if submodule missing)
         run: |
-          set -Eeuo pipefail
-          mkdir -p deps
-          cd deps
-          curl -fsSL -o openssl.zip \
-            https://github.com/krzyzanowskim/OpenSSL/releases/download/3.3.2000/OpenSSL.xcframework.zip
-          unzip -q openssl.zip
-          rm -f openssl.zip
-          echo "=== Slices ==="
-          ls -la OpenSSL.xcframework/
-
-      - name: Prepare OpenSSL paths
-        run: |
-          set -Eeuo pipefail
-          ROOT="$PWD/deps/OpenSSL.xcframework"
-
-          IOS_FW=""
-          for d in "$ROOT"/*; do
-            [ -d "$d" ] || continue
-            name=$(basename "$d")
-            case "$name" in
-              *maccatalyst*) continue ;;
-              *simulator*)   continue ;;
-            esac
-            if [ -d "$d/OpenSSL.framework" ] && echo "$name" | grep -q '^ios-arm64'; then
-              IOS_FW="$d/OpenSSL.framework"
-              break
-            fi
-          done
-
-          [ -n "$IOS_FW" ] || { echo "FATAL: no iOS device framework"; ls -la "$ROOT"; exit 1; }
-          echo "Found: $IOS_FW"
-
-          HEADERS_DIR="$IOS_FW/Headers"
-          BINARY="$IOS_FW/OpenSSL"
-
-          [ -f "$HEADERS_DIR/evp.h" ] || { echo "FATAL: evp.h missing"; exit 1; }
-          [ -f "$BINARY" ]            || { echo "FATAL: binary missing"; exit 1; }
-
-          if [ ! -e "$HEADERS_DIR/openssl" ]; then
-            ln -s . "$HEADERS_DIR/openssl"
-            echo "Created symlink openssl -> ."
+          if [ ! -f deps/fishhook/fishhook.h ]; then
+            mkdir -p deps/fishhook
+            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h -o deps/fishhook/fishhook.h
+            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c -o deps/fishhook/fishhook.c
           fi
-          test -f "$HEADERS_DIR/openssl/evp.h" || { echo "FATAL: symlink broken"; exit 1; }
-
-          echo "OSSL_INC=$HEADERS_DIR"                      >> $GITHUB_ENV
-          echo "OSSL_FW=$IOS_FW"                            >> $GITHUB_ENV
-          echo "OSSL_FW_PARENT=$(dirname "$IOS_FW")"        >> $GITHUB_ENV
-          file "$BINARY"
-
-      - name: Verify headers
+      - name: Syntax check
         run: |
-          set -Eeuo pipefail
-          for h in evp.h kdf.h core_names.h param_build.h rand.h crypto.h; do
-            test -f "$OSSL_INC/openssl/$h" || { echo "missing: $h"; exit 1; }
-          done
-          echo "headers OK"
-
-      - name: Compile defcrypto.o
-        run: |
-          set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang++ -std=c++20 -arch arm64 -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 -O2 -fPIC \
-            -fvisibility=hidden -fvisibility-inlines-hidden \
-            -I "$OSSL_INC" -I . \
-            -c defcrypto.cpp -o defcrypto.o
-          file defcrypto.o
-
-      - name: Compile defcrypto_bridge.o
-        run: |
-          set -Eeuo pipefail
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang++ -std=c++20 -arch arm64 -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 -O2 -fPIC -fvisibility=hidden \
-            -I "$OSSL_INC" -I . \
-            -c defcrypto_bridge.cpp -o defcrypto_bridge.o
-          file defcrypto_bridge.o
-
-      - name: Compile ShadowBypassXK.o
-        run: |
-          set -Eeuo pipefail
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -x objective-c -arch arm64 -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
-            -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
+          clang -arch arm64 -arch arm64e \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc -O0 \
             -Wno-incompatible-pointer-types \
-            -I "$OSSL_INC" -I . \
-            -c ShadowBypassXK.m -o ShadowBypassXK.o
-          file ShadowBypassXK.o
-
-      - name: Compile ShadowMonitorXK.o
-        run: |
-          set -Eeuo pipefail
-          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -x objective-c -arch arm64 -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 -fobjc-arc -fblocks -O2 -fPIC \
+            -Wno-implicit-function-declaration \
             -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
-            -Wno-incompatible-pointer-types \
-            -I "$OSSL_INC" -I . \
-            -c ShadowMonitorXK.m -o ShadowMonitorXK.o
-          file ShadowMonitorXK.o
-
-      - name: Link ShadowXK.dylib
+            -fsyntax-only \
+            -I deps \
+            ShadowBypassXK.m
+      - name: Build dylib
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-
-          echo "=== Undefined symbols pre-flight ==="
-          nm -u defcrypto.o defcrypto_bridge.o ShadowBypassXK.o ShadowMonitorXK.o \
-            | grep -Ev '^$|^[^ ]+\.o:$' | sort -u | head -80 || true
-
-          clang++ -arch arm64 -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 -dynamiclib -O2 \
-            -o ShadowXK.dylib \
-            defcrypto.o \
-            defcrypto_bridge.o \
-            ShadowBypassXK.o \
-            ShadowMonitorXK.o \
-            -F "$OSSL_FW_PARENT" -framework OpenSSL \
-            -framework Foundation \
-            -framework UIKit \
-            -framework CoreGraphics \
-            -framework QuartzCore \
-            -framework CoreImage \
-            -framework CoreFoundation \
-            -framework Security \
-            -framework AdSupport \
-            -lz \
-            -Wl,-rpath,@executable_path/Frameworks \
-            -Wl,-rpath,@loader_path/Frameworks \
-            -Wl,-rpath,/usr/lib
-
-          file ShadowXK.dylib
-
-      - name: Verify
+          clang -arch arm64 -arch arm64e \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -fobjc-arc -O2 -dynamiclib \
+            -Wno-incompatible-pointer-types \
+            -Wno-implicit-function-declaration \
+            -Wno-nullability-completeness \
+            -I deps \
+            ShadowBypassXK.m deps/fishhook/fishhook.c \
+            -framework Foundation -framework UIKit -framework Security \
+            -framework AdSupport -framework AppTrackingTransparency \
+            -o ShadowBypassXK.dylib
+      - name: Verify output
         run: |
-          set -Eeuo pipefail
-          echo "=== info ==="
-          file ShadowXK.dylib
-          echo "=== linked libs ==="
-          otool -L ShadowXK.dylib
-          echo "=== exports ==="
-          nm -gU ShadowXK.dylib | grep -E "sbxk_(encrypt|decrypt|wipe|random|has_hw|derive_key)" || echo "(none)"
-          echo "=== size ==="
-          ls -lh ShadowXK.dylib
-
-      - name: Package
-        run: |
-          set -Eeuo pipefail
-          rm -rf ShadowXK-pkg
-          mkdir -p ShadowXK-pkg/Frameworks
-          cp ShadowXK.dylib ShadowXK-pkg/
-          cp -R "$OSSL_FW" ShadowXK-pkg/Frameworks/
-          find ShadowXK-pkg -type f | head -30
-          du -sh ShadowXK-pkg
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          file ShadowBypassXK.dylib
+          otool -L ShadowBypassXK.dylib
+          nm -u ShadowBypassXK.dylib | grep -E "fishhook|RSA_|AES_" || true
+      - uses: actions/upload-artifact@v4
         with:
-          name: ShadowXK-unified
-          path: ShadowXK-pkg/
-          if-no-files-found: error
-          retention-days: 30
+          name: ShadowBypassXK
+          path: ShadowBypassXK.dylib
