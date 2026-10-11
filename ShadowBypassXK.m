@@ -1,12 +1,10 @@
 // ============================================================================
-// ShadowBypass XK v7.10.4 — iOS 14+ arm64 — ملف واحد كامل
+// ShadowBypass XK v7.10.5 — iOS 14+ arm64 — ملف واحد كامل
 //
-// يشمل كل الإصلاحات:
-//   v7.10.1 : إصلاح subscript pointer + فواصل منقوطة
-//   v7.10.2 : fishhook مصحح (indirectsymoff = uint32_t[])
-//   v7.10.3 : تنظيف ملفات مُصحَّح + g_viewer_done + حماية crash-loop
-//   v7.10.4 : دمج ACE extended — UQM/CrashSight/HTTPDNS/Cros + GAMELET
-//             إضافات كاملة عبر fishhook + swizzle HttpDns plugin
+// إصلاح v7.10.5:
+//   - استبدال CFHost (CFNetwork) بـ getaddrinfo (libc) لحل خطأ الربط
+//   - إضافة #include <netdb.h>
+//   - بقية الإصلاحات من v7.10.1 .. v7.10.4 محفوظة
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -28,6 +26,10 @@
 #import <sys/mman.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
+#import <netdb.h>
+#import <arpa/inet.h>
+#import <sys/socket.h>
+#import <netinet/in.h>
 
 // ============================================================================
 // القسم 0: تشفير النصوص XOR
@@ -1192,23 +1194,24 @@ typedef void* (*Px_GetQJS_t)(void);
 static WG_GetHostByName_t orig_WGGetHostByName;
 static Px_GetQJS_t        orig_PxGetQJS;
 
+// v7.10.5: استخدام getaddrinfo من libc بدل CFHost لتجنب ربط CFNetwork.
 static void SBXK_WGGetHostByName(const char *host, const char *tag,
                                  void *cb, void *ctx) {
     if (orig_WGGetHostByName) {
         orig_WGGetHostByName(host, tag, cb, ctx);
         return;
     }
+    if (!cb) return;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSString *hs = host ? [NSString stringWithUTF8String:host] : @"";
-        CFHostRef h = CFHostCreateWithName(kCFAllocatorDefault,
-                        (__bridge CFStringRef)hs);
-        if (!h) return;
-        CFHostStartInfoResolution(h, kCFHostAddresses, NULL);
-        if (cb) {
-            void (*fn)(void*, void*) = (void*)cb;
-            fn(ctx, (void*)h);
-        }
-        CFRelease(h);
+        if (!host) { return; }
+        struct addrinfo hints; memset(&hints, 0, sizeof(hints));
+        hints.ai_family   = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_flags    = AI_ADDRCONFIG;
+        struct addrinfo *res = NULL;
+        int rc = getaddrinfo(host, NULL, &hints, &res);
+        (void)rc;
+        if (res) freeaddrinfo(res);
     });
 }
 
@@ -2116,7 +2119,7 @@ static void SBXK_Run(void) {
         return;
     }
     sbxk_mark_ok();
-    NSLog(@"[SBXK] v7.10.4 done=%lu skip=%lu",
+    NSLog(@"[SBXK] v7.10.5 done=%lu skip=%lu",
           (unsigned long)g_done.count, (unsigned long)g_skip.count);
 }
 
@@ -2132,7 +2135,7 @@ static void SBXK_Boot(void) {
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
         SBXK_ANTIDEBUG();
-        NSLog(@"[SBXK] v7.10.4 boot");
+        NSLog(@"[SBXK] v7.10.5 boot");
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
