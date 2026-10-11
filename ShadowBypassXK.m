@@ -1,13 +1,12 @@
 // ============================================================================
-// ShadowBypass XK v7.10.6 — iOS 14+ arm64 — ملف واحد كامل
+// ShadowBypass XK v7.10.7 — iOS 14+ arm64 — ملف واحد كامل
 //
-// إصلاحات v7.10.6 (تجميد اللوجين):
-//   - FIX ① : SBXK_WorkQueue — serial background queue لكل شغل retry
-//   - FIX ② : حذف WGGetHostByNameAsyncWithTag من fishhook (تعليق callback)
-//   - FIX ③ : cleanup timer على background queue + dispatch_source
-//   - FIX ④ : SBXK_Retry ينفّذ على background
-//   - FIX ⑤ : boot retry timer على background + dispatch_source
-// ما قبلها محفوظ: v7.10.1..v7.10.5 (subscript, fishhook, rollback, getaddrinfo)
+// الاستراتيجية:
+//   - الأساس: v7.10.3 (النسخة العاملة بدون تجميد)
+//   - الإضافات: كل الآمن من v7.10.5 (ACE Extended objc swizzles + UQM + CrashSight)
+//   - المحذوف: WGGetHostByNameAsyncWithTag + Px_GetQJSFunctionTable_V04 +
+//              HttpDnsPluginLifecycle swizzle (الثلاثة التي تسبب التجميد)
+//   - التصحيحات: LogViewer class methods + UQM mangled names + attribute fix
 // ============================================================================
 
 #import <Foundation/Foundation.h>
@@ -29,10 +28,6 @@
 #import <sys/mman.h>
 #import <sys/sysctl.h>
 #import <sys/types.h>
-#import <netdb.h>
-#import <arpa/inet.h>
-#import <sys/socket.h>
-#import <netinet/in.h>
 
 // ============================================================================
 // القسم 0: تشفير النصوص XOR
@@ -134,19 +129,6 @@ static atomic_int  g_phase       = 0;
 static atomic_bool g_pending     = false;
 static atomic_int  g_crash_fd    = -1;
 static atomic_bool g_viewer_done = false;
-
-// v7.10.6 FIX ①: serial background queue لكل شغل retry/fishhook/cleanup
-static dispatch_queue_t SBXK_WorkQueue(void) {
-    static dispatch_once_t once;
-    static dispatch_queue_t q = NULL;
-    dispatch_once(&once, ^{
-        dispatch_queue_attr_t attr =
-            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
-                                                    QOS_CLASS_UTILITY, 0);
-        q = dispatch_queue_create("sbxk.work", attr);
-    });
-    return q;
-}
 
 #define SBXK_WLIT(fd, lit) do { \
     static const char _s[] = lit; \
@@ -370,7 +352,7 @@ static BOOL SBXK_SwizzleS(NSString *clsS, NSString *selS, IMP repl, const char *
         id (*fn)(id, SEL, id, id, id) = (void *)o; return fn(_s, _c, _a1, _a2, _a3); }
 
 // ============================================================================
-// القسم 5-9: تعريفات الدوال
+// القسم 5-9: تعريفات الدوال — نفس v7.10.3
 // ============================================================================
 
 DEF_NO(IntegrityChecker, integrity_detect)
@@ -518,6 +500,10 @@ DEF_ID_P0(serviceCommunication, getValueForKeypath)
 DEF_ID_P0(AudioDeviceMgr, GetAudioDeviceConnectState)
 DEF_ID_P0(VKAuth, logout)
 DEF_ID_P0(SCSDKLoginClient, logout)
+
+// ============================================================================
+// القسم 5b: إضافات ACE Extended الآمنة من v7.10.5
+// ============================================================================
 
 DEF_NO(AntiDataProxy, checkIntegrity)
 DEF_NO(AntiDataProxy, isIntegrityOK)
@@ -1007,7 +993,7 @@ static void sbxk_disable_all(void) {
 }
 
 // ============================================================================
-// القسم 11: fishhook مدمج — مصحح + ACE extended (v7.10.6: WG أُزيل)
+// القسم 11: fishhook — v7.10.7 (بدون WG/Px/HttpDns — مع UQM/CrashSight موسّع)
 // ============================================================================
 
 struct sbxk_rb { const char *name; void *repl; void **replaced; };
@@ -1090,7 +1076,7 @@ static int sbxk_rebind(struct sbxk_rb *b, int nb) {
     return t;
 }
 
-// --- بدائل رموز C (AnoSDK + GAMELET + Check) ---
+// --- AnoSDK ---
 typedef int (*AnoSDKInit_t)(const char*);
 typedef int (*AnoSDKSetUserInfo_t)(const char*);
 typedef void *(*AnoSDKGetData_t)(int);
@@ -1141,7 +1127,7 @@ static int SBXK_GM_ReportStats(const char*a,const void*b,int c){(void)a;(void)b;
 static int SBXK_GM_ReportLog  (const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
 static int SBXK_GM_ReportTNM2 (const char*a,const void*b,int c){(void)a;(void)b;(void)c;return 0;}
 
-// --- UQM crash ---
+// --- UQM ---
 typedef int (*UQMCrash_Init_t)(void*,int,int,void*);
 typedef int (*UQMCrash_Str_t)(void*);
 typedef int (*UQMCrash_Log_t)(int,void*,void*);
@@ -1203,15 +1189,6 @@ static void SBXK_CSSetUpload(void *self, int n) { (void)self; (void)n; }
 static void SBXK_CSConfigRep(void *self, int n) { (void)self; (void)n; }
 static void SBXK_CSSetCatch(void *self, int b)  { (void)self; (void)b; }
 
-// --- Cros ---
-typedef void* (*Px_GetQJS_t)(void);
-static Px_GetQJS_t orig_PxGetQJS;
-static void *SBXK_PxGetQJS(void) { return NULL; }
-
-// v7.10.6 FIX ②: WGGetHostByNameAsyncWithTag أُزيل من fishhook بالكامل.
-// السبب: الـcallback signature غير موثّق علناً، وأي replacement بدون
-// استدعاء callback صحيح يعلّق caller طوال timeout الشبكة.
-
 static void SBXK_RegisterFishhook(void) {
     struct sbxk_rb rb[] = {
         // === AnoSDK ===
@@ -1237,7 +1214,7 @@ static void SBXK_RegisterFishhook(void) {
         { "GAMELET_ReportLogFunc",               (void*)SBXK_GM_ReportLog,   (void**)&orig_GM_ReportLog },
         { "GAMELET_ReportToTNM2Func",            (void*)SBXK_GM_ReportTNM2,  (void**)&orig_GM_ReportTNM2 },
 
-        // === UQM crash ===
+        // === UQM (mangled names مُصحَّحة) ===
         { "__ZN3UQM8UQMCrash4InitERKNS_9UQMStringEbbS3_",
           (void*)SBXK_UQMInit,        (void**)&orig_UQMInit },
         { "__ZN3UQM8UQMCrash9SetUserIdERKNS_9UQMStringE",
@@ -1257,7 +1234,7 @@ static void SBXK_RegisterFishhook(void) {
         { "__ZN3UQM8UQMCrash24ConfigCrashHandleTimeoutEi",
           (void*)SBXK_UQMConfigTimeout, (void**)&orig_UQMConfigTimeout },
 
-        // === CrashSight ===
+        // === CrashSight (كامل) ===
         { "__ZN6GCloud10CrashSight21CrashSightMobileAgent11ReportStuckEiilPKcS3_S3_iS3_",
           (void*)SBXK_CSStuck,        (void**)&orig_CSStuck },
         { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19ReportExceptionJsonEiPKcS3_S3_S3_iS3_",
@@ -1279,29 +1256,15 @@ static void SBXK_RegisterFishhook(void) {
         { "__ZN6GCloud10CrashSight21CrashSightMobileAgent19SetCatchMultiSignalEb",
           (void*)SBXK_CSSetCatch,     (void**)&orig_CSSetCatch },
 
-        // === Cros ===
-        { "Px_GetQJSFunctionTable_V04",
-          (void*)SBXK_PxGetQJS,        (void**)&orig_PxGetQJS },
+        // ============================================================
+        // v7.10.7 — لم يُضَف WGGetHostByNameAsyncWithTag
+        // v7.10.7 — لم يُضَف Px_GetQJSFunctionTable_V04
+        // (الاثنان كانا سبب تجميد اللوجين في v7.10.5/v7.10.6)
+        // ============================================================
     };
     int t = sbxk_rebind(rb, (int)(sizeof(rb)/sizeof(rb[0])));
-    NSLog(@"[SBXK-fh-ACE] %d rebound / %zu registered",
+    NSLog(@"[SBXK-fh-v7.10.7] %d rebound / %zu registered",
           t, sizeof(rb)/sizeof(rb[0]));
-}
-
-// --- Swizzle HttpDns plugin lifecycle (ObjC) ---
-static void SBXK_HttpDns_onPause(id self, SEL _cmd)  { (void)self; (void)_cmd; }
-static void SBXK_HttpDns_onResume(id self, SEL _cmd) { (void)self; (void)_cmd; }
-
-static void SBXK_RegAceClasses(void) {
-    Class hdpl = objc_getClass("HttpDnsPluginLifecycle");
-    if (hdpl) {
-        SEL sPause  = sel_registerName("onPause");
-        SEL sResume = sel_registerName("onResume");
-        if (class_getInstanceMethod(hdpl, sPause))
-            class_replaceMethod(hdpl, sPause, (IMP)SBXK_HttpDns_onPause, "v@:");
-        if (class_getInstanceMethod(hdpl, sResume))
-            class_replaceMethod(hdpl, sResume, (IMP)SBXK_HttpDns_onResume, "v@:");
-    }
 }
 
 // ============================================================================
@@ -1317,7 +1280,7 @@ static void SBXK_RegAceClasses(void) {
 #define REG_ID3(cls, name) (void)SBXK_SwizzleS(SENS(#cls), SENS(#name), (IMP)SBXK_##cls##_##name, "@@:@@@")
 
 // ============================================================================
-// القسم 13: تسجيل الأساس
+// القسم 13: تسجيل الأساس — نفس v7.10.3
 // ============================================================================
 
 static void SBXK_RegBase(void) {
@@ -1465,10 +1428,11 @@ static void SBXK_RegBase(void) {
 }
 
 // ============================================================================
-// القسم 14: تسجيل الموسّع
+// القسم 14: تسجيل الموسّع — v7.10.3 + إضافات ACE الآمنة من v7.10.5
 // ============================================================================
 
 static void SBXK_RegExtended(void) {
+    // --- ACE Extended (كانت في v7.10.5 — كلها آمنة) ---
     REG_B(AntiDataProxy, checkIntegrity);
     REG_B(AntiDataProxy, isIntegrityOK);
     REG_B(AntiDataProxy, verifyData);
@@ -1820,7 +1784,7 @@ static void SBXK_RegInjectionKill(void) {
 }
 
 // ============================================================================
-// القسم 16: تسجيل الأصناف الحقيقية
+// القسم 16: تسجيل الأصناف الحقيقية — v7.10.3 + Meemo/QAPM موسّع من v7.10.5
 // ============================================================================
 
 static void SBXK_RegReal(void) {
@@ -1937,7 +1901,7 @@ static void SBXK_RegReal(void) {
 }
 
 // ============================================================================
-// القسم 17: عارض سجل الأعطال
+// القسم 17: عارض سجل الأعطال — مع إصلاح class methods
 // ============================================================================
 
 @interface SBXK_LogViewer : NSObject @end
@@ -1991,7 +1955,7 @@ static void SBXK_RegReal(void) {
 @end
 
 // ============================================================================
-// القسم 18: تنظيف ملفات (v7.10.6 FIX ③ — background + dispatch_source)
+// القسم 18: تنظيف ملفات — نفس v7.10.3
 // ============================================================================
 
 static NSArray<NSString *> *sbxk_cleanup_exact_paths(void) {
@@ -2064,26 +2028,19 @@ static void sbxk_do_cleanup(void) {
 
 __attribute__((constructor))
 static void sbxk_start_cleanup_timer(void) {
-    static dispatch_source_t timer = NULL;
-    if (timer) return;
-    dispatch_async(SBXK_WorkQueue(), ^{
-        @autoreleasepool { sbxk_do_cleanup(); }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        sbxk_do_cleanup();
+        [NSTimer scheduledTimerWithTimeInterval:2.0
+                                         repeats:YES
+                                           block:^(NSTimer *t) {
+            (void)t;
+            sbxk_do_cleanup();
+        }];
     });
-    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                   SBXK_WorkQueue());
-    if (!timer) return;
-    dispatch_source_set_timer(timer,
-        dispatch_time(DISPATCH_TIME_NOW, 2ull * NSEC_PER_SEC),
-        5ull * NSEC_PER_SEC,
-        1ull * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(timer, ^{
-        @autoreleasepool { sbxk_do_cleanup(); }
-    });
-    dispatch_resume(timer);
 }
 
 // ============================================================================
-// القسم 19: نقطة الدخول (v7.10.6 FIX ④⑤ — كل شغل على background)
+// القسم 19: نقطة الدخول — v7.10.7
 // ============================================================================
 
 static void sbxk_on_image_added(const struct mach_header *mh, intptr_t slide) {
@@ -2096,17 +2053,16 @@ static void SBXK_FullInstall(void) {
     @try { SBXK_RegExtended();      } @catch (NSException *e) { NSLog(@"[SBXK] RegExtended: %@", e); }
     @try { SBXK_RegInjectionKill(); } @catch (NSException *e) { NSLog(@"[SBXK] RegInject: %@", e); }
     @try { SBXK_RegReal();          } @catch (NSException *e) { NSLog(@"[SBXK] RegReal: %@", e); }
-    @try { SBXK_RegAceClasses();    } @catch (NSException *e) { NSLog(@"[SBXK] RegAce: %@", e); }
     @try { SBXK_RegisterFishhook(); } @catch (NSException *e) { NSLog(@"[SBXK] Fishhook: %@", e); }
+    // v7.10.7: SBXK_RegAceClasses محذوفة (كانت تسبب تجميد DNS)
 }
 
-// v7.10.6 FIX ④: التنفيذ على background queue — لا يجمّد main thread.
 static void SBXK_Retry(void) {
-    dispatch_async(SBXK_WorkQueue(), ^{
-        @autoreleasepool {
-            SBXK_FullInstall();
-        }
-    });
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ SBXK_Retry(); });
+        return;
+    }
+    SBXK_FullInstall();
 }
 
 static void SBXK_Run(void) {
@@ -2120,7 +2076,7 @@ static void SBXK_Run(void) {
         return;
     }
     sbxk_mark_ok();
-    NSLog(@"[SBXK] v7.10.6 done=%lu skip=%lu",
+    NSLog(@"[SBXK] v7.10.7 done=%lu skip=%lu",
           (unsigned long)g_done.count, (unsigned long)g_skip.count);
 }
 
@@ -2136,29 +2092,19 @@ static void SBXK_Boot(void) {
         SBXK_RotateCrashLog();
         atomic_store(&g_phase, 2);
         SBXK_ANTIDEBUG();
-        NSLog(@"[SBXK] v7.10.6 boot");
+        NSLog(@"[SBXK] v7.10.7 boot");
         [SBXK_LogViewer installObserver];
         _dyld_register_func_for_add_image(sbxk_on_image_added);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool {
                 SBXK_Run();
-                // v7.10.6 FIX ⑤: retry timer على background — لا main freeze.
-                static dispatch_source_t retry_timer = NULL;
-                if (!retry_timer) {
-                    retry_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
-                                                         0, 0, SBXK_WorkQueue());
-                    if (retry_timer) {
-                        dispatch_source_set_timer(retry_timer,
-                            dispatch_time(DISPATCH_TIME_NOW, 3ull * NSEC_PER_SEC),
-                            3ull * NSEC_PER_SEC,
-                            500ull * NSEC_PER_MSEC);
-                        dispatch_source_set_event_handler(retry_timer, ^{
-                            if (atomic_exchange(&g_pending, false)) SBXK_Retry();
-                        });
-                        dispatch_resume(retry_timer);
-                    }
-                }
+                [NSTimer scheduledTimerWithTimeInterval:3.0
+                                                 repeats:YES
+                                                   block:^(NSTimer *t) {
+                    (void)t;
+                    if (atomic_exchange(&g_pending, false)) SBXK_Retry();
+                }];
             }
         });
     }
