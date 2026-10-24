@@ -1,19 +1,13 @@
 // language: Objective-C++, file: ShadowBypassXK.mm, target: iOS arm64/arm64e jailed
-// Build: xcrun -sdk iphoneos clang++ -std=gnu++17 -arch arm64e -arch arm64 \
-//        -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-//        -miphoneos-version-min=13.0 -fobjc-arc -O2 -dynamiclib \
-//        -Wl,-undefined,dynamic_lookup \
-//        -I deps/Titanox/libtitanox \
-//        -I deps/Titanox/libtitanox/libtitanox \
-//        -L deps/Titanox -ltitanox \
-//        -framework Foundation -framework UIKit -framework Security \
-//        -o ShadowBypassXK.dylib ShadowBypassXK.mm
-//
-// Titanox header MUST stay at deps/Titanox/libtitanox/libtitanox/libtitanox.h
-// because its #imports are relative to that directory.
+// Build: see workflow — C and C++ compiled separately, linked with clang++.
 
 #import <Foundation/Foundation.h>
 #import "libtitanox.h"
+
+// iOS hides kinfo_proc and P_TRACED unless __APPLE_API_UNSTABLE is set.
+#define __APPLE_API_UNSTABLE 1
+#include <sys/sysctl.h>
+#include <sys/types.h>
 #include <mach-o/dyld.h>
 #include <ptrauth.h>
 #include <cstring>
@@ -21,8 +15,22 @@
 #include <cstdio>
 #include <dlfcn.h>
 
+// Fallback if the SDK still hides them.
+#ifndef CTL_KERN
+#define CTL_KERN 1
+#endif
+#ifndef KERN_PROC
+#define KERN_PROC 14
+#endif
+#ifndef KERN_PROC_PID
+#define KERN_PROC_PID 1
+#endif
+#ifndef P_TRACED
+#define P_TRACED 0x00000800
+#endif
+
 // ============================================================
-// GOT HOOKS (exported symbols — unlimited, safe)
+// GOT HOOKS — exported symbols (unlimited, safe)
 // ============================================================
 
 static int (*orig_kill)(pid_t, int) = NULL;
@@ -50,6 +58,7 @@ static int hk_ptrace(int req, pid_t pid, caddr_t addr, int data) {
     return orig_ptrace ? orig_ptrace(req, pid, addr, data) : -1;
 }
 
+// --- AnoSDK report path ---
 static int (*orig_GetReportData)(void*, unsigned int*) = NULL;
 static int hk_GetReportData(void *o, unsigned int *l) {
     if (o) memset(o, 0, l ? *l : 0);
@@ -73,28 +82,21 @@ static int hk_DelReportData(void) { return 0; }
 // INTERNAL HOOKS
 // ============================================================
 
-// 0x10C24 — dynamic resolver. Use the static-inline-hook API because it
-// returns a trampoline we can call (BRK does not).
 typedef void *(*resolver_fn_t)(uint64_t, uint64_t, uint64_t, uint64_t);
 static resolver_fn_t orig_resolver = NULL;
 
 static void *hk_resolver(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     void *resolved = orig_resolver ? orig_resolver(a0, a1, a2, a3) : NULL;
-    // Only swap the anti-debug primitives; leave everything else intact so
-    // the game's own open/read/connect calls keep working.
     if (resolved == (void*)dlsym(RTLD_DEFAULT, "kill"))   return (void*)&hk_kill;
     if (resolved == (void*)dlsym(RTLD_DEFAULT, "ptrace")) return (void*)&hk_ptrace;
     if (resolved == (void*)dlsym(RTLD_DEFAULT, "sysctl")) return (void*)&hk_sysctl;
     return resolved;
 }
 
-// 0x4C18 / 0x2ED6C / 0x33794 / 0x3358C — return success/no-threat.
 static uint64_t repl_prot_flags(void)      { return 0; }
 static uint64_t repl_ct_init(void)         { return 0; }
 static uint64_t repl_proxy_detect(void)    { return 0; }
 static uint64_t repl_screen_capture(void)  { return 0; }
-
-// 0x33D6C — intentionally NOT hooked (device fingerprint needed for binding).
 
 // ============================================================
 // INSTALLATION
@@ -154,11 +156,6 @@ static void install_brk(uintptr_t vaddr, void *repl, const char *name) {
 }
 
 static void install_internal_hooks() {
-    // 0x10C24 via static-inline-hook (needs a trampoline to call the original).
-    // If inline hooking the resolver destabilises the game, comment this block
-    // and rely on GOT hooks alone — the resolver will still return real kill/
-    // ptrace pointers, but those already point at our GOT hooks, so the effect
-    // is the same without touching __TEXT.
     TitanoxHook *hooker = [[TitanoxHook alloc] initWithMachOName:@"anogs"];
     if (hooker) {
         void *tramp = [hooker hookFunctionAtVaddr:(g_anogs_base + 0x10C24)
@@ -167,24 +164,18 @@ static void install_internal_hooks() {
             orig_resolver = (resolver_fn_t)tramp;
             NSLog(@"[XK] resolver inline-hooked, tramp=%p", tramp);
         } else {
-            NSLog(@"[XK] resolver inline hook failed — relying on GOT only");
+            NSLog(@"[XK] resolver inline hook failed — GOT-only");
         }
     }
 
-    // BRK hooks (max 6). Four here, leaving two spare.
     install_brk(0x4C18,  (void*)&repl_prot_flags,     "prot_flags");
     install_brk(0x2ED6C, (void*)&repl_ct_init,        "ct_init");
     install_brk(0x33794, (void*)&repl_proxy_detect,   "proxy_detect");
     install_brk(0x3358C, (void*)&repl_screen_capture, "screen_capture");
 
-    // 0x33D6C — NOT hooked on purpose. Disabling the fingerprint breaks
-    // account binding and fires an integrity alert on the server side.
+    // 0x33D6C — intentionally NOT hooked (device binding).
     NSLog(@"[XK] BRK slots used: %d / 6", g_brk_used);
 }
-
-// ============================================================
-// ENTRY
-// ============================================================
 
 __attribute__((constructor))
 static void xk_entry() {
@@ -195,10 +186,8 @@ static void xk_entry() {
             return;
         }
         NSLog(@"[XK] anogs base = 0x%llx", g_anogs_base);
-
         install_got_hooks();
         install_internal_hooks();
-
         NSLog(@"[XK] done");
     }
 }
