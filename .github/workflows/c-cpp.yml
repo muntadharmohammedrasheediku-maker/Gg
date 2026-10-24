@@ -1,62 +1,124 @@
-- name: Build unified dylib (C and C++ separate)
-  run: |
-    set -Eeuo pipefail
-    SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-    TX="deps/Titanox/libtitanox"
-    OBJ="build/obj"
-    rm -rf "$OBJ" && mkdir -p "$OBJ"
+name: build-shadowbypass
 
-    COMMON=(
-      -arch arm64e -arch arm64
-      -isysroot "$SDK"
-      -miphoneos-version-min=13.0
-      -O2
-      -Wno-incompatible-pointer-types
-      -Wno-nullability-completeness
-      -Wno-deprecated-declarations
-      -Wno-unguarded-availability
-      -I "$TX"
-      -I "$TX/libtitanox"
-      -I "$TX/fishhook"
-      -I "$TX/mempatch"
-      -I "$TX/brk_hook"
-      -I "$TX/brk_hook/Hook"
-      -I "$TX/utils"
-      -I "$TX/MemX"
-      -I "$TX/static-inline-hook"
-    )
+on: [push, workflow_dispatch]
 
-    OBJS=()
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-    for f in $(find "$TX" -type f -name "*.c" ! -path "*/.git/*"); do
-      out="$OBJ/$(echo "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
-      echo "CC  $f"
-      clang -x c -std=gnu11 "${COMMON[@]}" -c "$f" -o "$out"
-      OBJS+=("$out")
-    done
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
-    for f in $(find "$TX" -type f \( -name "*.mm" -o -name "*.cpp" \) \
-               ! -path "*/.git/*" ! -name "main.*" ! -name "*test*"); do
-      out="$OBJ/$(echo "$f" | tr '/' '_' | sed -E 's/\.(mm|cpp)$/.o/')"
-      echo "CXX $f"
-      clang++ -std=gnu++17 -fobjc-arc "${COMMON[@]}" -c "$f" -o "$out"
-      OBJS+=("$out")
-    done
+      - name: Clone Titanox
+        run: |
+          if [ ! -d deps/Titanox ]; then
+            git clone --recursive --depth 1 \
+              https://github.com/Ragekill3377/Titanox.git deps/Titanox
+          fi
 
-    echo "CXX ShadowBypassXK.mm"
-    clang++ -std=gnu++17 -fobjc-arc "${COMMON[@]}" \
-      -c ShadowBypassXK.mm -o "$OBJ/ShadowBypassXK.o"
-    OBJS+=("$OBJ/ShadowBypassXK.o")
+      - name: Force ObjC++ source extension
+        run: |
+          if [ -f ShadowBypassXK.m ] && [ ! -f ShadowBypassXK.mm ]; then
+            cp -f ShadowBypassXK.m ShadowBypassXK.m.bak
+            mv ShadowBypassXK.m ShadowBypassXK.mm
+          fi
 
-    echo "LINK ${#OBJS[@]} objects"
-    clang++ \
-      -arch arm64e -arch arm64 \
-      -isysroot "$SDK" \
-      -miphoneos-version-min=13.0 \
-      -dynamiclib \
-      -Wl,-undefined,dynamic_lookup \
-      -Wl,-install_name,@rpath/ShadowBypassXK.dylib \
-      "${OBJS[@]}" \
-      -framework Foundation -framework UIKit -framework Security \
-      -framework CoreFoundation -framework CoreGraphics \
-      -o ShadowBypassXK.dylib
+      - name: Patch Titanox hook.c for SDK 17.5 ptrauth
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          p = "deps/Titanox/libtitanox/brk_hook/Hook/hook.c"
+          s = open(p).read()
+          old = "arm_thread_state64_set_pc_fptr(*new, hooks[i].new);"
+          new = "arm_thread_state64_set_pc_fptr(*new, (void *)(uintptr_t)hooks[i].new);"
+          if old in s:
+              s = s.replace(old, new)
+              open(p, "w").write(s)
+              print("[patch] applied")
+          else:
+              print("[patch] already patched or line changed")
+          PY
+
+      - name: Build unified dylib
+        run: |
+          set -Eeuo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          TX="deps/Titanox/libtitanox"
+          OBJ="build/obj"
+          rm -rf "$OBJ" && mkdir -p "$OBJ"
+
+          COMMON=(
+            -arch arm64e -arch arm64
+            -isysroot "$SDK"
+            -miphoneos-version-min=13.0
+            -O2
+            -Wno-incompatible-pointer-types
+            -Wno-nullability-completeness
+            -Wno-deprecated-declarations
+            -Wno-unguarded-availability
+            -I "$TX"
+            -I "$TX/libtitanox"
+            -I "$TX/fishhook"
+            -I "$TX/mempatch"
+            -I "$TX/brk_hook"
+            -I "$TX/brk_hook/Hook"
+            -I "$TX/utils"
+            -I "$TX/MemX"
+            -I "$TX/static-inline-hook"
+          )
+
+          OBJS=()
+
+          for f in $(find "$TX" -type f -name "*.c" ! -path "*/.git/*"); do
+            out="$OBJ/$(echo "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
+            echo "CC  $f"
+            clang -x c -std=gnu11 "${COMMON[@]}" -c "$f" -o "$out"
+            OBJS+=("$out")
+          done
+
+          for f in $(find "$TX" -type f \( -name "*.mm" -o -name "*.cpp" \) \
+                     ! -path "*/.git/*" ! -name "main.*" ! -name "*test*"); do
+            out="$OBJ/$(echo "$f" | tr '/' '_' | sed -E 's/\.(mm|cpp)$/.o/')"
+            echo "CXX $f"
+            clang++ -std=gnu++17 -fobjc-arc "${COMMON[@]}" -c "$f" -o "$out"
+            OBJS+=("$out")
+          done
+
+          echo "CXX ShadowBypassXK.mm"
+          clang++ -std=gnu++17 -fobjc-arc "${COMMON[@]}" \
+            -c ShadowBypassXK.mm -o "$OBJ/ShadowBypassXK.o"
+          OBJS+=("$OBJ/ShadowBypassXK.o")
+
+          echo "LINK ${#OBJS[@]} objects"
+          clang++ \
+            -arch arm64e -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=13.0 \
+            -dynamiclib \
+            -Wl,-undefined,dynamic_lookup \
+            -Wl,-install_name,@rpath/ShadowBypassXK.dylib \
+            "${OBJS[@]}" \
+            -framework Foundation -framework UIKit -framework Security \
+            -framework CoreFoundation -framework CoreGraphics \
+            -o ShadowBypassXK.dylib
+
+      - name: Verify output
+        run: |
+          set -Eeuo pipefail
+          file ShadowBypassXK.dylib
+          lipo -info ShadowBypassXK.dylib
+          otool -D ShadowBypassXK.dylib
+          echo "=== Titanox classes ==="
+          nm -a ShadowBypassXK.dylib | grep -iE "TitanoxHook|SIH|MemX" | head -10 || true
+          echo "=== Our hooks ==="
+          nm -a ShadowBypassXK.dylib | grep -E "_hk_|_repl_" | head -20 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ShadowBypassXK
+          path: ShadowBypassXK.dylib
