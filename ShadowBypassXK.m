@@ -1,16 +1,19 @@
-// language: Objective-C++, file: HookKit.mm, target: iOS arm64/arm64e jailed
-// Build: xcrun -sdk iphoneos clang++ -arch arm64e -arch arm64 -dynamiclib \
-//        -fobjc-arc -framework Foundation -o HookKit.dylib HookKit.mm
+// language: Objective-C++, file: ShadowBypassXK.mm, target: iOS arm64/arm64e jailed
+// Build: xcrun -sdk iphoneos clang++ -std=gnu++17 -arch arm64e -arch arm64 \
+//        -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+//        -miphoneos-version-min=13.0 -fobjc-arc -O2 -dynamiclib \
+//        -Wl,-undefined,dynamic_lookup -Wl,-install_name,@rpath/ShadowBypassXK.dylib \
+//        -I deps ShadowBypassXK.mm deps/fishhook/fishhook.c \
+//        -framework Foundation -framework UIKit -framework Security \
+//        -framework AdSupport -framework AppTrackingTransparency \
+//        -o ShadowBypassXK.dylib
 //
-// What this adds over v6:
-//   * Exported AnoSDK* functions intercepted at the CALLER's GOT:
-//       AnoSDKGetReportData, AnoSDKGetReportData2 — return empty (nothing to ban).
-//       AnoSDKOnRecvSignature, AnoSDKOnRecvData     — drop server traffic.
-//       AnoSDKDelReportData                          — no-op.
-//   * Internal anti-hook / anti-inject / integrity functions located by
-//     string xref, gated by hardware breakpoints:
-//       ms_set_inlie_hook, inline_hook_opcode_dismatch, black_module_macho.
-//   * No __text modification anywhere → checksum stays clean.
+// v8 fixes vs v7:
+//   * resign_got: switch on ptrauth_key (builtin needs compile-time constant)
+//   * ts_pc_load / ts_pc_store: __pc field renamed to pc on newer SDKs
+//   * = {} instead of {} everywhere (C++98-compatible, works in all modes)
+//   * <sys/ptrace.h> included for PT_DENY_ATTACH
+//   * sign_fp helper for hardware-breakpoint PC redirect on arm64e
 
 #import <Foundation/Foundation.h>
 #include <mach/mach.h>
@@ -19,6 +22,7 @@
 #include <mach/thread_act.h>
 #include <mach/vm_region.h>
 #include <mach/vm_map.h>
+#include <mach/arm/thread_status.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
@@ -26,6 +30,7 @@
 #include <ptrauth.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/ptrace.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 #include <cstring>
@@ -58,12 +63,38 @@ static void repl_black_module();
 static void repl_tcj_protect();
 static void repl_sc_protect();
 
-// ================================ PAC ================================
-static inline uintptr_t pac_blend(uintptr_t slot, uint16_t d){ return slot ^ d; }
+// =========================== thread-state PC access ===========================
+// __pc became `pc` on newer SDKs. Access by fixed offset:
+//   __x[29] (232) + __fp (8) + __lr (8) + __sp (8) = 256 → __pc
+static inline uint64_t ts_pc_load(const arm_thread_state64_t *s) {
+    uint64_t v; memcpy(&v, (const uint8_t*)s + 256, sizeof(v)); return v;
+}
+static inline void ts_pc_store(arm_thread_state64_t *s, uint64_t v) {
+    memcpy((uint8_t*)s + 256, &v, sizeof(v));
+}
+
+// Sign a function pointer with the canonical key used for BLR/BLRAA.
+static inline void *sign_fp(void *p) {
+#if __arm64e__
+    return ptrauth_sign_unauthenticated(p, ptrauth_key_function_pointer, 0);
+#else
+    return p;
+#endif
+}
+
+// ================================ PAC GOT ================================
+static inline uintptr_t pac_blend(uintptr_t slot, uint16_t d) { return slot ^ d; }
+
 static inline void *resign_got(void *raw, void *slot, uint8_t key, uint8_t ad, uint16_t d) {
 #if __arm64e__
-    return ptrauth_sign_unauthenticated(raw, (ptrauth_key)key,
-        ad ? pac_blend((uintptr_t)slot, d) : (uintptr_t)d);
+    uintptr_t disc = ad ? pac_blend((uintptr_t)slot, d) : (uintptr_t)d;
+    switch (key) {
+        case 0:  return ptrauth_sign_unauthenticated(raw, ptrauth_key_asia, disc);
+        case 1:  return ptrauth_sign_unauthenticated(raw, ptrauth_key_asib, disc);
+        case 2:  return ptrauth_sign_unauthenticated(raw, ptrauth_key_asda, disc);
+        case 3:  return ptrauth_sign_unauthenticated(raw, ptrauth_key_asdb, disc);
+        default: return raw;
+    }
 #else
     (void)raw;(void)slot;(void)key;(void)ad;(void)d; return raw;
 #endif
@@ -71,28 +102,30 @@ static inline void *resign_got(void *raw, void *slot, uint8_t key, uint8_t ad, u
 
 // ==================== chained-fixup metadata =========================
 struct auth_meta { uint8_t key, addrDiv; uint16_t diversity; bool ok; };
+
 static auth_meta find_auth_meta(const struct mach_header_64 *mh, const void *slot) {
-    auth_meta o{0,0,0,false};
+    auth_meta o = {0,0,0,false};
     const struct linkedit_data_command *cf = nullptr;
     const struct segment_command_64 *le = nullptr;
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
     for (uint32_t i = 0; i < mh->ncmds; ++i) {
         if (lc->cmd == LC_DYLD_CHAINED_FIXUPS) cf = (const struct linkedit_data_command*)lc;
         if (lc->cmd == LC_SEGMENT_64) {
-            const auto *sg = (const struct segment_command_64*)lc;
+            const struct segment_command_64 *sg = (const struct segment_command_64*)lc;
             if (!strcmp(sg->segname, "__LINKEDIT")) le = sg;
         }
         lc = (const struct load_command*)((const uint8_t*)lc + lc->cmdsize);
     }
     if (!cf || !le || cf->dataoff < le->fileoff) return o;
     const uint8_t *data = (const uint8_t*)mh + le->vmaddr + (cf->dataoff - le->fileoff);
-    const auto *hdr = (const dyld_chained_fixups_header*)data;
+    const dyld_chained_fixups_header *hdr = (const dyld_chained_fixups_header*)data;
     if (hdr->fixups_version || !hdr->starts_offset) return o;
-    const auto *starts = (const dyld_chained_starts_in_image*)(data + hdr->starts_offset);
+    const dyld_chained_starts_in_image *starts =
+        (const dyld_chained_starts_in_image*)(data + hdr->starts_offset);
     for (uint32_t si = 0; si < starts->seg_count; ++si) {
         if (!starts->seg_info_offset[si]) continue;
-        const auto *seg = (const dyld_chained_starts_in_segment*)
-            ((const uint8_t*)starts + starts->seg_info_offset[si]);
+        const dyld_chained_starts_in_segment *seg =
+            (const dyld_chained_starts_in_segment*)((const uint8_t*)starts + starts->seg_info_offset[si]);
         if (seg->pointer_format != 1 && seg->pointer_format != 9 &&
             seg->pointer_format != 10 && seg->pointer_format != 12) continue;
         for (uint16_t pi = 0; pi < seg->page_count; ++pi) {
@@ -100,15 +133,20 @@ static auth_meta find_auth_meta(const struct mach_header_64 *mh, const void *slo
             uint8_t *cur = (uint8_t*)mh + seg->segment_offset
                          + (uint64_t)pi * seg->page_size + seg->page_start[pi];
             uint8_t *lim = (uint8_t*)mh + seg->segment_offset
-                         + (uint64_t)(pi+1) * seg->page_size;
+                         + (uint64_t)(pi + 1) * seg->page_size;
             for (int g = 0; g < 200000; ++g) {
                 if (cur < (uint8_t*)mh || cur >= lim) break;
                 if ((const void*)cur == slot) {
-                    const auto *b = (const dyld_chained_ptr_arm64e_auth_bind*)cur;
-                    if (b->auth) { o.key=b->key; o.addrDiv=b->addrDiv; o.diversity=b->diversity; o.ok=true; }
+                    const dyld_chained_ptr_arm64e_auth_bind *b =
+                        (const dyld_chained_ptr_arm64e_auth_bind*)cur;
+                    if (b->auth) {
+                        o.key = b->key; o.addrDiv = b->addrDiv;
+                        o.diversity = b->diversity; o.ok = true;
+                    }
                     return o;
                 }
-                const auto *bb = (const dyld_chained_ptr_arm64e_auth_bind*)cur;
+                const dyld_chained_ptr_arm64e_auth_bind *bb =
+                    (const dyld_chained_ptr_arm64e_auth_bind*)cur;
                 uint32_t st = bb->auth ? ((const dyld_chained_ptr_arm64e_auth_bind*)cur)->next
                              : bb->bind ? ((const dyld_chained_ptr_arm64e_bind*)cur)->next
                                         : ((const dyld_chained_ptr_arm64e_rebase*)cur)->next;
@@ -122,6 +160,7 @@ static auth_meta find_auth_meta(const struct mach_header_64 *mh, const void *slo
 
 // ========================= Mach-O parsers =========================
 struct symtab_info { const struct nlist_64 *nl; const char *str; uint32_t n; };
+
 static bool get_symtab(const struct mach_header_64 *mh, symtab_info *o) {
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
     const struct symtab_command *sc = nullptr;
@@ -138,7 +177,7 @@ static bool get_symtab(const struct mach_header_64 *mh, symtab_info *o) {
 
 static bool page_prot(vm_address_t a, vm_prot_t *out) {
     vm_address_t r = a; vm_size_t sz = 0;
-    vm_region_submap_info_data_64_t info{};
+    vm_region_submap_info_data_64_t info = {};
     mach_msg_type_number_t c = VM_REGION_SUBMAP_INFO_COUNT_64; natural_t d = 0;
     if (vm_region_recurse_64(mach_task_self(), &r, &sz, &d,
             (vm_region_recurse_info_t)&info, &c) != KERN_SUCCESS) return false;
@@ -147,21 +186,19 @@ static bool page_prot(vm_address_t a, vm_prot_t *out) {
 }
 
 // ================ string-in-image + xref resolver ================
-// Find a null-terminated string in __TEXT,__cstring; return RUNTIME address.
 static uintptr_t find_cstring(const struct mach_header_64 *mh, const char *needle) {
     const size_t nlen = strlen(needle);
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
     for (uint32_t i = 0; i < mh->ncmds; ++i) {
         if (lc->cmd == LC_SEGMENT_64) {
-            const auto *sg = (const struct segment_command_64*)lc;
+            const struct segment_command_64 *sg = (const struct segment_command_64*)lc;
             if (strcmp(sg->segname, "__TEXT") == 0) {
                 const struct section_64 *s = (const struct section_64*)((const uint8_t*)lc + sizeof(*sg));
                 for (uint32_t j = 0; j < sg->nsects; ++j, ++s) {
                     if (strcmp(s->sectname, "__cstring") != 0) continue;
                     const char *base = (const char*)((const uint8_t*)mh + s->offset);
                     for (size_t k = 0; k + nlen < s->size; ++k) {
-                        if (memcmp(base + k, needle, nlen) == 0 &&
-                            base[k + nlen] == '\0') {
+                        if (memcmp(base + k, needle, nlen) == 0 && base[k + nlen] == '\0') {
                             return (uintptr_t)((const uint8_t*)mh + s->addr + k);
                         }
                     }
@@ -173,7 +210,6 @@ static uintptr_t find_cstring(const struct mach_header_64 *mh, const char *needl
     return 0;
 }
 
-// Decode ADRP imm; returns page or 0.
 static uintptr_t adrp_page(uint32_t inst, uintptr_t pc) {
     if ((inst & 0x9F000000u) != 0x90000000u) return 0;
     uint32_t immlo = (inst >> 29) & 0x3;
@@ -182,41 +218,38 @@ static uintptr_t adrp_page(uint32_t inst, uintptr_t pc) {
     return (pc & ~0xFFFULL) + (uintptr_t)(imm << 12);
 }
 static bool add_low12(uint32_t inst, uintptr_t page, uintptr_t *out, uint32_t *rd) {
-    if ((inst & 0xFF800000u) != 0x91000000u) return false; // ADD xD, xN, #imm
-    if (((inst >> 22) & 0x3) != 0) return false;           // no shift
+    if ((inst & 0xFF800000u) != 0x91000000u) return false;
+    if (((inst >> 22) & 0x3) != 0) return false;
     uint32_t imm12 = (inst >> 10) & 0xFFF;
     *rd = inst & 0x1F;
     *out = page + imm12;
     return true;
 }
 
-// Scan __TEXT,__text for ADRP+ADD that resolves to target. Return code addr.
 static uintptr_t find_ref_to_addr(const struct mach_header_64 *mh, uintptr_t target) {
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
     for (uint32_t i = 0; i < mh->ncmds; ++i) {
         if (lc->cmd == LC_SEGMENT_64) {
-            const auto *sg = (const struct segment_command_64*)lc;
+            const struct segment_command_64 *sg = (const struct segment_command_64*)lc;
             if (strcmp(sg->segname, "__TEXT") == 0) {
                 const struct section_64 *s = (const struct section_64*)((const uint8_t*)lc + sizeof(*sg));
                 for (uint32_t j = 0; j < sg->nsects; ++j, ++s) {
                     if (strcmp(s->sectname, "__text") != 0) continue;
                     const uint8_t *base = (const uint8_t*)mh + s->offset;
-                    const size_t   bytes = s->size;
+                    const size_t bytes = s->size;
                     for (size_t k = 0; k + 8 <= bytes; k += 4) {
                         uint32_t i0 = *(const uint32_t*)(base + k);
-                        uintptr_t page = adrp_page(i0, (uintptr_t)(base + k));
-                        if (!page) continue;
+                        uintptr_t pg = adrp_page(i0, (uintptr_t)(base + k));
+                        if (!pg) continue;
                         uint32_t rd0 = i0 & 0x1F;
                         for (size_t m = 4; m <= 12 && k + m + 4 <= bytes; m += 4) {
                             uint32_t iN = *(const uint32_t*)(base + k + m);
-                            uintptr_t final; uint32_t rdN;
-                            if (add_low12(iN, page, &final, &rdN) && rdN == rd0) {
-                                if (final == target) return (uintptr_t)(base + k);
+                            uintptr_t final_addr; uint32_t rdN;
+                            if (add_low12(iN, pg, &final_addr, &rdN) && rdN == rd0) {
+                                if (final_addr == target) return (uintptr_t)(base + k);
                                 break;
                             }
-                            // stop scanning after first non-ADD with Rd same
-                            if ((iN & 0x1F) == rd0 && (iN & 0xFF800000u) != 0x91000000u)
-                                break;
+                            if ((iN & 0x1F) == rd0 && (iN & 0xFF800000u) != 0x91000000u) break;
                         }
                     }
                 }
@@ -227,15 +260,13 @@ static uintptr_t find_ref_to_addr(const struct mach_header_64 *mh, uintptr_t tar
     return 0;
 }
 
-// Walk back from code_ref to find STP x29,x30,[sp,#-N]! (function prologue).
 static uintptr_t find_func_start(uintptr_t code_ref, size_t max_back) {
     for (size_t off = 0; off <= max_back; off += 4) {
         if (code_ref < off + 4) break;
         uintptr_t cand = code_ref - off;
         uint32_t inst = *(const uint32_t*)cand;
         if ((inst & 0xFFC07FFFu) == 0xA9807BFDu) return cand; // STP x29,x30,[sp,#-N]!
-        // PACIASP alone (arm64e leaf) also marks entry
-        if (inst == 0xD503233Fu) return cand;
+        if (inst == 0xD503233Fu) return cand;                  // PACIASP
     }
     return 0;
 }
@@ -243,7 +274,7 @@ static uintptr_t find_func_start(uintptr_t code_ref, size_t max_back) {
 // ========================= GOT rebind =========================
 static bool rebind_image(const struct mach_header_64 *mh, const char *name,
                          void *repl_raw, void **orig_out) {
-    symtab_info st{};
+    symtab_info st = {};
     if (!get_symtab(mh, &st)) return false;
     const struct dysymtab_command *dys = nullptr;
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
@@ -256,13 +287,17 @@ static bool rebind_image(const struct mach_header_64 *mh, const char *name,
     lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
     for (uint32_t i = 0; i < mh->ncmds; ++i) {
         if (lc->cmd == LC_SEGMENT_64) {
-            const auto *sg = (const struct segment_command_64*)lc;
-            const bool isData = !strcmp(sg->segname, "__DATA") || !strcmp(sg->segname, "__DATA_CONST") || !strcmp(sg->segname, "__AUTH_CONST");
+            const struct segment_command_64 *sg = (const struct segment_command_64*)lc;
+            const bool isData = !strcmp(sg->segname, "__DATA") ||
+                                !strcmp(sg->segname, "__DATA_CONST") ||
+                                !strcmp(sg->segname, "__AUTH_CONST");
             if (isData) {
                 const struct section_64 *s = (const struct section_64*)((const uint8_t*)lc + sizeof(*sg));
                 for (uint32_t j = 0; j < sg->nsects; ++j, ++s) {
-                    const bool isA = !strcmp(s->sectname, "__auth_got") || !strcmp(s->sectname, "__auth_ptr");
-                    const bool isP = !strcmp(s->sectname, "__got") || !strcmp(s->sectname, "__la_symbol_ptr");
+                    const bool isA = !strcmp(s->sectname, "__auth_got") ||
+                                     !strcmp(s->sectname, "__auth_ptr");
+                    const bool isP = !strcmp(s->sectname, "__got") ||
+                                     !strcmp(s->sectname, "__la_symbol_ptr");
                     if (!isA && !isP) continue;
                     void **slots = (void**)((uint8_t*)mh + s->offset);
                     const uint32_t ns = s->size / sizeof(void*);
@@ -276,11 +311,12 @@ static bool rebind_image(const struct mach_header_64 *mh, const char *name,
                         vm_prot_t op = VM_PROT_READ; const bool have = page_prot(pg, &op);
                         if (vm_protect(mach_task_self(), pg, vm_page_size, false,
                                 VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return false;
-                        if (orig_out && !*orig_out) *orig_out = (void*)ptrauth_strip(slots[k], ptrauth_key_asia);
+                        if (orig_out && !*orig_out)
+                            *orig_out = (void*)ptrauth_strip(slots[k], ptrauth_key_asia);
                         void *ns_v;
                         if (isA) {
                             auth_meta m = find_auth_meta(mh, &slots[k]);
-                            if (!m.ok) { m.key = 1; m.addrDiv = 1; m.diversity = 0; }
+                            if (!m.ok) { m.key = 0; m.addrDiv = 1; m.diversity = 0; }
                             ns_v = resign_got(repl_raw, &slots[k], m.key, m.addrDiv, m.diversity);
                         } else ns_v = repl_raw;
                         slots[k] = ns_v;
@@ -297,10 +333,11 @@ static bool rebind_image(const struct mach_header_64 *mh, const char *name,
     }
     return false;
 }
+
 static bool rebind_all(const char *name, void *repl, void **orig) {
     bool any = false;
     for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
-        const auto *mh = (const struct mach_header_64*)_dyld_get_image_header(i);
+        const struct mach_header_64 *mh = (const struct mach_header_64*)_dyld_get_image_header(i);
         if (mh && mh->magic == MH_MAGIC_64 && rebind_image(mh, name, repl, orig)) any = true;
     }
     return any;
@@ -336,7 +373,8 @@ static int hwb_slot_for(uintptr_t a) {
     return -1;
 }
 static bool hwb_arm_on_thread(thread_t th, int slot, uintptr_t addr) {
-    arm_debug_state64_t dbg{}; mach_msg_type_number_t c = ARM_DEBUG_STATE64_COUNT;
+    arm_debug_state64_t dbg = {};
+    mach_msg_type_number_t c = ARM_DEBUG_STATE64_COUNT;
     if (thread_get_state(th, ARM_DEBUG_STATE64, (thread_state_t)&dbg, &c) != KERN_SUCCESS) return false;
     if (c != ARM_DEBUG_STATE64_COUNT) return false;
     dbg.__bvr[slot] = addr;
@@ -361,57 +399,69 @@ static void hwb_arm_all_threads() {
 }
 
 static bool handle_breakpoint(thread_t th) {
-    arm_thread_state64_t raw{}; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+    arm_thread_state64_t raw = {};
+    mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&raw, &c) != KERN_SUCCESS) return false;
     if (c != ARM_THREAD_STATE64_COUNT) return false;
-    uintptr_t pc = (uintptr_t)ptrauth_strip((void*)raw.__pc, ptrauth_key_function_pointer);
+
+    uintptr_t pc = (uintptr_t)ptrauth_strip((void*)ts_pc_load(&raw), ptrauth_key_function_pointer);
     int slot = hwb_slot_for(pc);
     if (slot < 0) return false;
+
 #if __arm64e__
-    arm_thread_state64_t self{}; mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+    arm_thread_state64_t self = {};
+    mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
     if (thread_convert_thread_state(th, THREAD_CONVERT_THREAD_STATE_TO_SELF, ARM_THREAD_STATE64,
             (thread_state_t)&raw, c, (thread_state_t)&self, &sc) != KERN_SUCCESS ||
         sc != ARM_THREAD_STATE64_COUNT) return false;
-    self.__pc = (uint64_t)g_hwb_repl[slot];
-    arm_thread_state64_t fin{}; mach_msg_type_number_t fc = ARM_THREAD_STATE64_COUNT;
+
+    ts_pc_store(&self, (uint64_t)sign_fp(g_hwb_repl[slot]));
+
+    arm_thread_state64_t fin = {};
+    mach_msg_type_number_t fc = ARM_THREAD_STATE64_COUNT;
     if (thread_convert_thread_state(th, THREAD_CONVERT_THREAD_STATE_FROM_SELF, ARM_THREAD_STATE64,
             (thread_state_t)&self, sc, (thread_state_t)&fin, &fc) != KERN_SUCCESS ||
         fc != ARM_THREAD_STATE64_COUNT) return false;
     return thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&fin, fc) == KERN_SUCCESS;
 #else
-    raw.__pc = (uint64_t)g_hwb_repl[slot];
+    ts_pc_store(&raw, (uint64_t)g_hwb_repl[slot]);
     return thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&raw, c) == KERN_SUCCESS;
 #endif
 }
 
 static void free_ports(exc_msg_t *m) {
     if (!(m->Head.msgh_bits & MACH_MSGH_BITS_COMPLEX)) return;
-    if (m->msgh_body.msgh_descriptor_count >= 1 && m->thread.name != MACH_PORT_NULL)
-        { mach_port_deallocate(mach_task_self(), m->thread.name); m->thread.name = MACH_PORT_NULL; }
-    if (m->msgh_body.msgh_descriptor_count >= 2 && m->task.name != MACH_PORT_NULL)
-        { mach_port_deallocate(mach_task_self(), m->task.name); m->task.name = MACH_PORT_NULL; }
+    if (m->msgh_body.msgh_descriptor_count >= 1 && m->thread.name != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), m->thread.name);
+        m->thread.name = MACH_PORT_NULL;
+    }
+    if (m->msgh_body.msgh_descriptor_count >= 2 && m->task.name != MACH_PORT_NULL) {
+        mach_port_deallocate(mach_task_self(), m->task.name);
+        m->task.name = MACH_PORT_NULL;
+    }
 }
 static void send_reply(exc_msg_t *r, kern_return_t ret) {
-    exc_reply_t p{};
+    exc_reply_t p = {};
     p.Head.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_MAKE_SEND, 0);
     p.Head.msgh_size = sizeof(p);
     p.Head.msgh_remote_port = r->Head.msgh_remote_port;
     p.Head.msgh_local_port  = MACH_PORT_NULL;
     p.Head.msgh_id = r->Head.msgh_id + 100;
     p.NDR = r->NDR; p.RetCode = ret;
-    (void)mach_msg(&p.Head, MACH_SEND_MSG, sizeof(p), 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+    (void)mach_msg(&p.Head, MACH_SEND_MSG, sizeof(p), 0, MACH_PORT_NULL,
+                   MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
 }
 static void *exc_loop(void *) {
     uint8_t buf[2048] __attribute__((aligned(8)));
     for (;;) {
         memset(buf, 0, sizeof(buf));
-        auto *r = (exc_msg_t*)buf;
-        mach_msg_return_t mr = mach_msg(&r->Head, MACH_RCV_MSG, 0, sizeof(buf), g_exc_port,
-                                       MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+        exc_msg_t *r = (exc_msg_t*)buf;
+        mach_msg_return_t mr = mach_msg(&r->Head, MACH_RCV_MSG, 0, sizeof(buf),
+                                        g_exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
         if (mr == MACH_RCV_TOO_LARGE) {
             uint8_t t[64] __attribute__((aligned(8)));
-            (void)mach_msg((mach_msg_header_t*)t, MACH_RCV_MSG, 0, sizeof(t), g_exc_port,
-                           MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+            (void)mach_msg((mach_msg_header_t*)t, MACH_RCV_MSG, 0, sizeof(t),
+                           g_exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
             continue;
         }
         if (mr != MACH_MSG_SUCCESS) continue;
@@ -420,8 +470,10 @@ static void *exc_loop(void *) {
         }
         kern_return_t ret = KERN_FAILURE;
         const bool cx = (r->Head.msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
-        const bool ht = cx && r->msgh_body.msgh_descriptor_count >= 1 && r->thread.name != MACH_PORT_NULL;
-        if (r->exception == EXC_BREAKPOINT && ht && handle_breakpoint(r->thread.name)) ret = KERN_SUCCESS;
+        const bool ht = cx && r->msgh_body.msgh_descriptor_count >= 1 &&
+                        r->thread.name != MACH_PORT_NULL;
+        if (r->exception == EXC_BREAKPOINT && ht && handle_breakpoint(r->thread.name))
+            ret = KERN_SUCCESS;
         send_reply(r, ret);
         free_ports(r);
     }
@@ -429,7 +481,8 @@ static void *exc_loop(void *) {
 }
 static bool exc_setup() {
     if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port) != KERN_SUCCESS) return false;
-    if (mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) return false;
+    if (mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port,
+            MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) return false;
     if (task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, g_exc_port,
             EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64) != KERN_SUCCESS) return false;
     pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
@@ -444,38 +497,51 @@ static int (*g_orig_kill)(pid_t,int) = nullptr;
 static int (*g_orig_sysctl)(int*,u_int,void*,size_t*,void*,size_t) = nullptr;
 static int (*g_orig_ptrace)(int,pid_t,caddr_t,int) = nullptr;
 static int (*g_orig_pthread_create)(pthread_t*,const pthread_attr_t*,void*(*)(void*),void*) = nullptr;
-static kern_return_t (*g_orig_task_set_exc)(task_t,exception_mask_t,mach_port_t,exception_behavior_t,thread_state_flavor_t) = nullptr;
+static kern_return_t (*g_orig_task_set_exc)(task_t,exception_mask_t,mach_port_t,
+                                            exception_behavior_t,thread_state_flavor_t) = nullptr;
 
-static int hk_kill(pid_t p, int s){ if (p == getpid() && (s == SIGKILL || s == SIGSTOP || s == SIGABRT)) return 0; return g_orig_kill ? g_orig_kill(p,s) : -1; }
-static int hk_sysctl(int *n, u_int nl, void *o, size_t *ol, void *nw, size_t nw2){
+static int hk_kill(pid_t p, int s) {
+    if (p == getpid() && (s == SIGKILL || s == SIGSTOP || s == SIGABRT)) return 0;
+    return g_orig_kill ? g_orig_kill(p,s) : -1;
+}
+static int hk_sysctl(int *n, u_int nl, void *o, size_t *ol, void *nw, size_t nw2) {
     int rc = g_orig_sysctl ? g_orig_sysctl(n,nl,o,ol,nw,nw2) : -1;
     if (!rc && n && nl >= 4 && o && n[0]==CTL_KERN && n[1]==KERN_PROC &&
         n[2]==KERN_PROC_PID && n[3]==getpid()) {
-        auto *kp = (struct kinfo_proc*)o; if (kp) kp->kp_proc.p_flag &= ~P_TRACED;
+        struct kinfo_proc *kp = (struct kinfo_proc*)o;
+        if (kp) kp->kp_proc.p_flag &= ~P_TRACED;
     }
     return rc;
 }
-static int hk_ptrace(int r, pid_t p, caddr_t a, int d){ if (r == PT_DENY_ATTACH) return 0; return g_orig_ptrace ? g_orig_ptrace(r,p,a,d) : -1; }
-static int hk_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void*), void *arg){
+static int hk_ptrace(int r, pid_t p, caddr_t a, int d) {
+    if (r == PT_DENY_ATTACH) return 0;
+    return g_orig_ptrace ? g_orig_ptrace(r,p,a,d) : -1;
+}
+static int hk_pthread_create(pthread_t *t, const pthread_attr_t *a,
+                             void *(*fn)(void*), void *arg) {
     int rc = g_orig_pthread_create ? g_orig_pthread_create(t,a,fn,arg) : -1;
     if (!rc && t) {
         int n; pthread_mutex_lock(&g_hwb_mu); n = g_hwb_n; pthread_mutex_unlock(&g_hwb_mu);
-        if (n) { thread_t m = pthread_mach_thread_np(*t);
-                 for (int s = 0; s < n; ++s) (void)hwb_arm_on_thread(m, s, g_hwb_addr[s]); }
+        if (n) {
+            thread_t m = pthread_mach_thread_np(*t);
+            for (int s = 0; s < n; ++s) (void)hwb_arm_on_thread(m, s, g_hwb_addr[s]);
+        }
     }
     return rc;
 }
-static kern_return_t hk_task_set_exc(task_t t, exception_mask_t m, mach_port_t p, exception_behavior_t b, thread_state_flavor_t f){
+static kern_return_t hk_task_set_exc(task_t t, exception_mask_t m, mach_port_t p,
+                                     exception_behavior_t b, thread_state_flavor_t f) {
     kern_return_t rc = g_orig_task_set_exc ? g_orig_task_set_exc(t,m,p,b,f) : KERN_FAILURE;
-    if (t == mach_task_self() && (m & EXC_MASK_BREAKPOINT) && g_exc_port && p != g_exc_port) {
+    if (t == mach_task_self() && (m & EXC_MASK_BREAKPOINT) &&
+        g_exc_port && p != g_exc_port) {
         (void)task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, g_exc_port,
-                                        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+                                        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+                                        ARM_THREAD_STATE64);
     }
     return rc;
 }
 
 // ============== EXPORTED AnoSDK* HOOKS (via GOT) ==============
-// Report path: force zero-length report so nothing reaches the server.
 static int (*g_orig_GetReportData)(void*, unsigned int*) = nullptr;
 static int hk_GetReportData(void *out, unsigned int *outLen) {
     if (out) memset(out, 0, outLen ? *outLen : 0);
@@ -488,12 +554,10 @@ static int hk_GetReportData2(void *out, unsigned int *outLen) {
     if (outLen) *outLen = 0;
     return 0;
 }
-// Server challenge path: drop so no response signature is verified.
 static int (*g_orig_OnRecvSignature)(const char*, unsigned int) = nullptr;
 static int hk_OnRecvSignature(const char *s, unsigned int l) { (void)s; (void)l; return 0; }
 static int (*g_orig_OnRecvData)(const char*, unsigned int) = nullptr;
 static int hk_OnRecvData(const char *d, unsigned int l) { (void)d; (void)l; return 0; }
-// Report cleanup — no-op so nothing persists.
 static int (*g_orig_DelReportData)(void) = nullptr;
 static int hk_DelReportData(void) { return 0; }
 
@@ -540,13 +604,12 @@ static str_target kStrTargets[] = {
     { "ms_set_inlie_hook",           (void*)&repl_inline_detect, "set_inline_hook_error" },
     { "inline_hook_opcode_dismatch", (void*)&repl_inline_detect, "inline_hook_opcode_dismatch" },
     { "black_module_macho",          (void*)&repl_black_module,  "black_module_macho" },
-    // Un-comment only after verifying in your build that these are report sites:
     // { "tcj_protect",              (void*)&repl_tcj_protect,   "tcj_protect" },
     // { "sc_protect",               (void*)&repl_sc_protect,    "sc_protect" },
 };
 
 static void install_string_hooks() {
-    const auto *mh = find_image("anogs"); if (!mh) return;
+    const struct mach_header_64 *mh = find_image("anogs"); if (!mh) return;
     for (size_t i = 0; i < sizeof(kStrTargets)/sizeof(kStrTargets[0]); ++i) {
         uintptr_t str_addr = find_cstring(mh, kStrTargets[i].needle);
         if (!str_addr) continue;
@@ -554,7 +617,6 @@ static void install_string_hooks() {
         if (!cref) continue;
         uintptr_t fstart = find_func_start(cref, 0x1000);
         if (!fstart) fstart = cref;
-        // Try inline hook first (Dobby-linked builds); fall back to hwbp.
         if (!inline_hook_addr((void*)fstart, kStrTargets[i].repl, nullptr)) {
             (void)hw_hook_addr(fstart, kStrTargets[i].repl);
         }
@@ -568,11 +630,11 @@ static void hookkit_entry(void) {
         if (!find_image("anogs")) return;
         if (!exc_setup()) return;
 
-        rebind_all("kill",                    (void*)&hk_kill,             (void**)&g_orig_kill);
-        rebind_all("sysctl",                  (void*)&hk_sysctl,           (void**)&g_orig_sysctl);
-        rebind_all("ptrace",                  (void*)&hk_ptrace,           (void**)&g_orig_ptrace);
-        rebind_all("pthread_create",          (void*)&hk_pthread_create,   (void**)&g_orig_pthread_create);
-        rebind_all("task_set_exception_ports",(void*)&hk_task_set_exc,     (void**)&g_orig_task_set_exc);
+        rebind_all("kill",                    (void*)&hk_kill,          (void**)&g_orig_kill);
+        rebind_all("sysctl",                  (void*)&hk_sysctl,        (void**)&g_orig_sysctl);
+        rebind_all("ptrace",                  (void*)&hk_ptrace,        (void**)&g_orig_ptrace);
+        rebind_all("pthread_create",          (void*)&hk_pthread_create,(void**)&g_orig_pthread_create);
+        rebind_all("task_set_exception_ports",(void*)&hk_task_set_exc,  (void**)&g_orig_task_set_exc);
 
         install_exported_hooks();
         install_string_hooks();
@@ -580,10 +642,7 @@ static void hookkit_entry(void) {
 }
 
 // =================== replacement bodies ===================
-// Called instead of the anti-hook reporter. Returning without side effects
-// means the report event is never emitted to the MRPCS queue.
 static void repl_inline_detect() {}
 static void repl_black_module()  {}
-// Commented-out targets (un-comment with care — these may be setup, not report):
 static void repl_tcj_protect()   {}
 static void repl_sc_protect()    {}
