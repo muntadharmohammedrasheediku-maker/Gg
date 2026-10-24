@@ -25,7 +25,7 @@
 //   * GOT rebind is idempotent; installing twice is a no-op.
 
 #import <Foundation/Foundation.h>
-#import <Titanox/Titanox.h>
+#import "libtitanox.h"
 #include <mach-o/dyld.h>
 #include <ptrauth.h>
 #include <cstring>
