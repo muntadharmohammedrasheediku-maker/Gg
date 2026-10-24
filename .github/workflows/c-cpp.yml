@@ -14,16 +14,12 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
 
-      - name: Clone Titanox (headers + sources)
+      - name: Clone Titanox
         run: |
           if [ ! -d deps/Titanox ]; then
             git clone --recursive --depth 1 \
               https://github.com/Ragekill3377/Titanox.git deps/Titanox
           fi
-          echo "=== Titanox layout ==="
-          find deps/Titanox -maxdepth 3 -type d | head -30
-          echo "=== libtitanox.h ==="
-          ls -la deps/Titanox/libtitanox/libtitanox/libtitanox.h || true
 
       - name: Force ObjC++ source extension
         run: |
@@ -32,58 +28,70 @@ jobs:
             mv ShadowBypassXK.m ShadowBypassXK.mm
           fi
 
-      - name: Build unified ShadowBypassXK.dylib
+      - name: Build unified dylib (C and C++ compiled separately)
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          TX="deps/Titanox/libtitanox"
+          OBJ="build/obj"
+          rm -rf "$OBJ" && mkdir -p "$OBJ"
 
-          TX_ROOT="deps/Titanox/libtitanox"
-          if [ ! -f "$TX_ROOT/libtitanox/libtitanox.h" ]; then
-            echo "::error::libtitanox.h not found at $TX_ROOT/libtitanox/"
-            find deps/Titanox -name "libtitanox.h" || true
-            exit 1
-          fi
+          COMMON=(
+            -arch arm64e -arch arm64
+            -isysroot "$SDK"
+            -miphoneos-version-min=13.0
+            -O2
+            -Wno-incompatible-pointer-types
+            -Wno-nullability-completeness
+            -Wno-deprecated-declarations
+            -Wno-unguarded-availability
+            -I "$TX"
+            -I "$TX/libtitanox"
+            -I "$TX/fishhook"
+            -I "$TX/mempatch"
+            -I "$TX/brk_hook"
+            -I "$TX/brk_hook/Hook"
+            -I "$TX/utils"
+            -I "$TX/MemX"
+            -I "$TX/static-inline-hook"
+          )
 
-          # Compile every .mm/.cpp/.c inside the Titanox library tree into our dylib.
-          # Exclude test/main sources and git metadata.
-          TX_SRCS=$(find "$TX_ROOT" -type f \
-            \( -name "*.mm" -o -name "*.cpp" -o -name "*.c" \) \
-            ! -path "*/.git/*" \
-            ! -name "main.*" \
-            ! -name "*test*" \
-            | sort -u | tr '\n' ' ')
+          OBJS=()
 
-          if [ -z "$TX_SRCS" ]; then
-            echo "::error::No Titanox sources under $TX_ROOT"
-            exit 1
-          fi
+          # --- 1. C sources: compile with clang (NOT clang++) ---
+          # hook.c uses `new` as an identifier — invalid in C++.
+          for f in $(find "$TX" -type f -name "*.c" ! -path "*/.git/*"); do
+            out="$OBJ/$(echo "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
+            echo "CC  $f"
+            clang -x c -std=gnu11 "${COMMON[@]}" -c "$f" -o "$out"
+            OBJS+=("$out")
+          done
 
-          echo "Titanox sources:"
-          for f in $TX_SRCS; do echo "  $f"; done
+          # --- 2. C++/ObjC++ sources: compile with clang++ ---
+          for f in $(find "$TX" -type f \( -name "*.mm" -o -name "*.cpp" \) \
+                     ! -path "*/.git/*" ! -name "main.*" ! -name "*test*"); do
+            out="$OBJ/$(echo "$f" | tr '/' '_' | sed -E 's/\.(mm|cpp)$/.o/')"
+            echo "CXX $f"
+            clang++ -std=gnu++17 -fobjc-arc "${COMMON[@]}" -c "$f" -o "$out"
+            OBJS+=("$out")
+          done
 
+          # --- 3. Our entry file ---
+          echo "CXX ShadowBypassXK.mm"
+          clang++ -std=gnu++17 -fobjc-arc "${COMMON[@]}" \
+            -c ShadowBypassXK.mm -o "$OBJ/ShadowBypassXK.o"
+          OBJS+=("$OBJ/ShadowBypassXK.o")
+
+          # --- 4. Link with clang++ (pulls libc++ for Titanox) ---
+          echo "LINK ${#OBJS[@]} objects"
           clang++ \
-            -std=gnu++17 \
             -arch arm64e -arch arm64 \
             -isysroot "$SDK" \
             -miphoneos-version-min=13.0 \
-            -fobjc-arc -O2 -dynamiclib \
-            -Wno-incompatible-pointer-types \
-            -Wno-nullability-completeness \
-            -Wno-deprecated-declarations \
-            -Wno-unguarded-availability \
-            -Wno-c++11-narrowing \
+            -dynamiclib \
             -Wl,-undefined,dynamic_lookup \
             -Wl,-install_name,@rpath/ShadowBypassXK.dylib \
-            -I "$TX_ROOT" \
-            -I "$TX_ROOT/libtitanox" \
-            -I "$TX_ROOT/libtitanox/fishhook" \
-            -I "$TX_ROOT/libtitanox/mempatch" \
-            -I "$TX_ROOT/libtitanox/brk_hook" \
-            -I "$TX_ROOT/libtitanox/brk_hook/Hook" \
-            -I "$TX_ROOT/libtitanox/utils" \
-            -I "$TX_ROOT/libtitanox/MemX" \
-            -I "$TX_ROOT/libtitanox/static-inline-hook" \
-            ShadowBypassXK.mm $TX_SRCS \
+            "${OBJS[@]}" \
             -framework Foundation -framework UIKit -framework Security \
             -framework CoreFoundation -framework CoreGraphics \
             -framework CoreSymbolication \
@@ -95,11 +103,10 @@ jobs:
           file ShadowBypassXK.dylib
           lipo -info ShadowBypassXK.dylib
           otool -D ShadowBypassXK.dylib
-          otool -L ShadowBypassXK.dylib | head -20
-          echo "=== Hook classes present ==="
-          nm -a ShadowBypassXK.dylib | grep -E "TitanoxHook|_OBJC_CLASS.*Titanox" || true
-          echo "=== Custom hooks ==="
-          nm -a ShadowBypassXK.dylib | grep -E "hk_|repl_" | head -20 || true
+          echo "=== Titanox classes ==="
+          nm -a ShadowBypassXK.dylib | grep -iE "TitanoxHook|SIH|MemX" | head -10 || true
+          echo "=== Our hooks ==="
+          nm -a ShadowBypassXK.dylib | grep -E "_hk_|_repl_" | head -20 || true
 
       - uses: actions/upload-artifact@v4
         with:
