@@ -28,7 +28,23 @@ jobs:
             mv ShadowBypassXK.m ShadowBypassXK.mm
           fi
 
-      - name: Build unified dylib (C and C++ compiled separately)
+      - name: Patch Titanox hook.c for SDK 17.5 ptrauth
+        run: |
+          set -Eeuo pipefail
+          python3 - <<'PY'
+          p = "deps/Titanox/libtitanox/brk_hook/Hook/hook.c"
+          s = open(p).read()
+          old = "arm_thread_state64_set_pc_fptr(*new, hooks[i].new);"
+          new = "arm_thread_state64_set_pc_fptr(*new, (void *)(uintptr_t)hooks[i].new);"
+          if old in s:
+              s = s.replace(old, new)
+              open(p, "w").write(s)
+              print("[patch] applied")
+          else:
+              print("[patch] already patched or line changed")
+          PY
+
+      - name: Build unified dylib (C and C++ separate)
         run: |
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -58,8 +74,6 @@ jobs:
 
           OBJS=()
 
-          # --- 1. C sources: compile with clang (NOT clang++) ---
-          # hook.c uses `new` as an identifier — invalid in C++.
           for f in $(find "$TX" -type f -name "*.c" ! -path "*/.git/*"); do
             out="$OBJ/$(echo "$f" | tr '/' '_' | sed 's/\.c$/.o/')"
             echo "CC  $f"
@@ -67,7 +81,6 @@ jobs:
             OBJS+=("$out")
           done
 
-          # --- 2. C++/ObjC++ sources: compile with clang++ ---
           for f in $(find "$TX" -type f \( -name "*.mm" -o -name "*.cpp" \) \
                      ! -path "*/.git/*" ! -name "main.*" ! -name "*test*"); do
             out="$OBJ/$(echo "$f" | tr '/' '_' | sed -E 's/\.(mm|cpp)$/.o/')"
@@ -76,13 +89,11 @@ jobs:
             OBJS+=("$out")
           done
 
-          # --- 3. Our entry file ---
           echo "CXX ShadowBypassXK.mm"
           clang++ -std=gnu++17 -fobjc-arc "${COMMON[@]}" \
             -c ShadowBypassXK.mm -o "$OBJ/ShadowBypassXK.o"
           OBJS+=("$OBJ/ShadowBypassXK.o")
 
-          # --- 4. Link with clang++ (pulls libc++ for Titanox) ---
           echo "LINK ${#OBJS[@]} objects"
           clang++ \
             -arch arm64e -arch arm64 \
