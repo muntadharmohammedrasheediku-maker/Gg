@@ -1,11 +1,15 @@
 // language: Objective-C++, file: ShadowBypassXK.mm, target: iOS arm64/arm64e jailed
-// Build: see workflow — C and C++ compiled separately, linked with clang++.
+// Build: see workflow — C sources via clang -x c, C++/ObjC++ via clang++,
+//        linked together with clang++ (pulls libc++ for Titanox).
+//
+// Changes vs v9.1:
+//   * Removed #define __APPLE_API_UNSTABLE 1 (SDK already defines it).
+//   * Removed CoreSymbolication from link (private framework, unused by us).
+//   * All hooks use Titanox API as declared in libtitanox.h.
 
 #import <Foundation/Foundation.h>
 #import "libtitanox.h"
 
-// iOS hides kinfo_proc and P_TRACED unless __APPLE_API_UNSTABLE is set.
-#define __APPLE_API_UNSTABLE 1
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <mach-o/dyld.h>
@@ -15,7 +19,7 @@
 #include <cstdio>
 #include <dlfcn.h>
 
-// Fallback if the SDK still hides them.
+// Fallbacks if the SDK still hides any of these.
 #ifndef CTL_KERN
 #define CTL_KERN 1
 #endif
@@ -30,7 +34,7 @@
 #endif
 
 // ============================================================
-// GOT HOOKS — exported symbols (unlimited, safe)
+// GOT HOOKS — exported symbols only (unlimited, safe)
 // ============================================================
 
 static int (*orig_kill)(pid_t, int) = NULL;
@@ -58,7 +62,7 @@ static int hk_ptrace(int req, pid_t pid, caddr_t addr, int data) {
     return orig_ptrace ? orig_ptrace(req, pid, addr, data) : -1;
 }
 
-// --- AnoSDK report path ---
+// --- AnoSDK report path: zero-length report → nothing to ban ---
 static int (*orig_GetReportData)(void*, unsigned int*) = NULL;
 static int hk_GetReportData(void *o, unsigned int *l) {
     if (o) memset(o, 0, l ? *l : 0);
@@ -82,6 +86,8 @@ static int hk_DelReportData(void) { return 0; }
 // INTERNAL HOOKS
 // ============================================================
 
+// 0x10C24 — dynamic resolver. Inline hook with trampoline so we can call the
+// original and filter only the anti-debug primitives.
 typedef void *(*resolver_fn_t)(uint64_t, uint64_t, uint64_t, uint64_t);
 static resolver_fn_t orig_resolver = NULL;
 
@@ -93,10 +99,14 @@ static void *hk_resolver(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     return resolved;
 }
 
+// 0x4C18 / 0x2ED6C / 0x33794 / 0x3358C — return success / no-threat.
 static uint64_t repl_prot_flags(void)      { return 0; }
 static uint64_t repl_ct_init(void)         { return 0; }
 static uint64_t repl_proxy_detect(void)    { return 0; }
 static uint64_t repl_screen_capture(void)  { return 0; }
+
+// 0x33D6C — intentionally NOT hooked: device fingerprint must stay real for
+// account binding. Disabling it fires an integrity alert server-side.
 
 // ============================================================
 // INSTALLATION
@@ -173,7 +183,6 @@ static void install_internal_hooks() {
     install_brk(0x33794, (void*)&repl_proxy_detect,   "proxy_detect");
     install_brk(0x3358C, (void*)&repl_screen_capture, "screen_capture");
 
-    // 0x33D6C — intentionally NOT hooked (device binding).
     NSLog(@"[XK] BRK slots used: %d / 6", g_brk_used);
 }
 
