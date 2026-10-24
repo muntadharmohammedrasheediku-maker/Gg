@@ -8,12 +8,15 @@
 //        -framework AdSupport -framework AppTrackingTransparency \
 //        -o ShadowBypassXK.dylib
 //
-// v8 fixes vs v7:
-//   * resign_got: switch on ptrauth_key (builtin needs compile-time constant)
-//   * ts_pc_load / ts_pc_store: __pc field renamed to pc on newer SDKs
-//   * = {} instead of {} everywhere (C++98-compatible, works in all modes)
-//   * <sys/ptrace.h> included for PT_DENY_ATTACH
-//   * sign_fp helper for hardware-breakpoint PC redirect on arm64e
+// v9 changes:
+//   * No thread_suspend/resume — thread_set_state(ARM_DEBUG_STATE64) is applied
+//     by the kernel on next context switch. Eliminates the resume-failure hang.
+//   * Every rebind_all / hw_hook_addr / hwb_arm_on_thread result is aggregated
+//     into g_hook_ok[] and logged to stderr for Console.app.
+//   * _dyld_register_func_for_add_image retries install when anogs loads late.
+//   * Watchdog thread every 10 s re-takes the exception port if anogs stole it.
+//   * Exc-loop counts 2405 and unknown msgh_ids; unknown IDs get KERN_FAILURE
+//     plus a stderr note, so silent drops are impossible.
 
 #import <Foundation/Foundation.h>
 #include <mach/mach.h>
@@ -30,11 +33,15 @@
 #include <ptrauth.h>
 #include <pthread.h>
 #include <signal.h>
-#include <sys/ptrace.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <atomic>
 #include <cstring>
 #include <cstdint>
+
+#ifndef PT_DENY_ATTACH
+#define PT_DENY_ATTACH 31
+#endif
 
 __attribute__((weak)) extern "C" int DobbyHook(void*, void*, void**);
 
@@ -50,6 +57,38 @@ typedef struct { uint64_t __bvr[16],__bcr[16],__wvr[16],__wcr[16],__mdscr_el1; }
 #define THREAD_CONVERT_THREAD_STATE_FROM_SELF 2
 #endif
 
+// ================= state tracking =================
+static std::atomic<uint32_t> g_exc_msg_2405{0};
+static std::atomic<uint32_t> g_exc_msg_other{0};
+static std::atomic<bool>     g_exc_loop_alive{false};
+static std::atomic<uint64_t> g_exc_last_msg_ms{0};
+
+static uint64_t now_ms() {
+    struct timeval tv; gettimeofday(&tv, nullptr);
+    return (uint64_t)tv.tv_sec * 1000ULL + tv.tv_usec / 1000ULL;
+}
+
+enum {
+    HK_KILL, HK_SYSCTL, HK_PTRACE, HK_PTHREAD, HK_TASK_SET_EXC,
+    HK_GETREP, HK_GETREP2, HK_RECVSIG, HK_RECVDATA, HK_DELREP,
+    HK_STR_INLINE, HK_STR_BLACKMOD,
+    HK_NUM
+};
+static const char *kHookNames[HK_NUM] = {
+    "kill", "sysctl", "ptrace", "pthread_create", "task_set_exception_ports",
+    "AnoSDKGetReportData", "AnoSDKGetReportData2",
+    "AnoSDKOnRecvSignature", "AnoSDKOnRecvData", "AnoSDKDelReportData",
+    "anogs:ms_set_inlie_hook", "anogs:black_module_macho"
+};
+static bool g_hook_ok[HK_NUM] = {};
+
+static void log_hook_state() {
+    for (int i = 0; i < HK_NUM; ++i) {
+        fprintf(stderr, "[HookKit] %s %s\n",
+                g_hook_ok[i] ? "ok    " : "FAILED", kHookNames[i]);
+    }
+}
+
 struct exc_msg_t {
     mach_msg_header_t Head; mach_msg_body_t msgh_body;
     mach_msg_port_descriptor_t thread, task; NDR_record_t NDR;
@@ -57,23 +96,13 @@ struct exc_msg_t {
 };
 struct exc_reply_t { mach_msg_header_t Head; NDR_record_t NDR; kern_return_t RetCode; };
 
-// =================== replacement function forwards ===================
-static void repl_inline_detect();
-static void repl_black_module();
-static void repl_tcj_protect();
-static void repl_sc_protect();
-
-// =========================== thread-state PC access ===========================
-// __pc became `pc` on newer SDKs. Access by fixed offset:
-//   __x[29] (232) + __fp (8) + __lr (8) + __sp (8) = 256 → __pc
+// =================== thread-state PC access ===================
 static inline uint64_t ts_pc_load(const arm_thread_state64_t *s) {
     uint64_t v; memcpy(&v, (const uint8_t*)s + 256, sizeof(v)); return v;
 }
 static inline void ts_pc_store(arm_thread_state64_t *s, uint64_t v) {
     memcpy((uint8_t*)s + 256, &v, sizeof(v));
 }
-
-// Sign a function pointer with the canonical key used for BLR/BLRAA.
 static inline void *sign_fp(void *p) {
 #if __arm64e__
     return ptrauth_sign_unauthenticated(p, ptrauth_key_function_pointer, 0);
@@ -82,9 +111,8 @@ static inline void *sign_fp(void *p) {
 #endif
 }
 
-// ================================ PAC GOT ================================
+// ================= PAC GOT =================
 static inline uintptr_t pac_blend(uintptr_t slot, uint16_t d) { return slot ^ d; }
-
 static inline void *resign_got(void *raw, void *slot, uint8_t key, uint8_t ad, uint16_t d) {
 #if __arm64e__
     uintptr_t disc = ad ? pac_blend((uintptr_t)slot, d) : (uintptr_t)d;
@@ -100,9 +128,8 @@ static inline void *resign_got(void *raw, void *slot, uint8_t key, uint8_t ad, u
 #endif
 }
 
-// ==================== chained-fixup metadata =========================
+// ================= chained-fixup metadata =================
 struct auth_meta { uint8_t key, addrDiv; uint16_t diversity; bool ok; };
-
 static auth_meta find_auth_meta(const struct mach_header_64 *mh, const void *slot) {
     auth_meta o = {0,0,0,false};
     const struct linkedit_data_command *cf = nullptr;
@@ -137,16 +164,11 @@ static auth_meta find_auth_meta(const struct mach_header_64 *mh, const void *slo
             for (int g = 0; g < 200000; ++g) {
                 if (cur < (uint8_t*)mh || cur >= lim) break;
                 if ((const void*)cur == slot) {
-                    const dyld_chained_ptr_arm64e_auth_bind *b =
-                        (const dyld_chained_ptr_arm64e_auth_bind*)cur;
-                    if (b->auth) {
-                        o.key = b->key; o.addrDiv = b->addrDiv;
-                        o.diversity = b->diversity; o.ok = true;
-                    }
+                    const dyld_chained_ptr_arm64e_auth_bind *b = (const dyld_chained_ptr_arm64e_auth_bind*)cur;
+                    if (b->auth) { o.key = b->key; o.addrDiv = b->addrDiv; o.diversity = b->diversity; o.ok = true; }
                     return o;
                 }
-                const dyld_chained_ptr_arm64e_auth_bind *bb =
-                    (const dyld_chained_ptr_arm64e_auth_bind*)cur;
+                const dyld_chained_ptr_arm64e_auth_bind *bb = (const dyld_chained_ptr_arm64e_auth_bind*)cur;
                 uint32_t st = bb->auth ? ((const dyld_chained_ptr_arm64e_auth_bind*)cur)->next
                              : bb->bind ? ((const dyld_chained_ptr_arm64e_bind*)cur)->next
                                         : ((const dyld_chained_ptr_arm64e_rebase*)cur)->next;
@@ -158,9 +180,8 @@ static auth_meta find_auth_meta(const struct mach_header_64 *mh, const void *slo
     return o;
 }
 
-// ========================= Mach-O parsers =========================
+// ================= Mach-O parsers =================
 struct symtab_info { const struct nlist_64 *nl; const char *str; uint32_t n; };
-
 static bool get_symtab(const struct mach_header_64 *mh, symtab_info *o) {
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
     const struct symtab_command *sc = nullptr;
@@ -185,7 +206,7 @@ static bool page_prot(vm_address_t a, vm_prot_t *out) {
     *out = info.protection; return true;
 }
 
-// ================ string-in-image + xref resolver ================
+// ================= string-xref resolver =================
 static uintptr_t find_cstring(const struct mach_header_64 *mh, const char *needle) {
     const size_t nlen = strlen(needle);
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
@@ -198,9 +219,8 @@ static uintptr_t find_cstring(const struct mach_header_64 *mh, const char *needl
                     if (strcmp(s->sectname, "__cstring") != 0) continue;
                     const char *base = (const char*)((const uint8_t*)mh + s->offset);
                     for (size_t k = 0; k + nlen < s->size; ++k) {
-                        if (memcmp(base + k, needle, nlen) == 0 && base[k + nlen] == '\0') {
+                        if (memcmp(base + k, needle, nlen) == 0 && base[k + nlen] == '\0')
                             return (uintptr_t)((const uint8_t*)mh + s->addr + k);
-                        }
                     }
                 }
             }
@@ -209,23 +229,19 @@ static uintptr_t find_cstring(const struct mach_header_64 *mh, const char *needl
     }
     return 0;
 }
-
 static uintptr_t adrp_page(uint32_t inst, uintptr_t pc) {
     if ((inst & 0x9F000000u) != 0x90000000u) return 0;
-    uint32_t immlo = (inst >> 29) & 0x3;
-    uint32_t immhi = (inst >> 5) & 0x7FFFF;
+    uint32_t immlo = (inst >> 29) & 0x3, immhi = (inst >> 5) & 0x7FFFF;
     int64_t imm = ((int64_t)(((uint64_t)immhi << 2) | immlo) << 43) >> 43;
     return (pc & ~0xFFFULL) + (uintptr_t)(imm << 12);
 }
 static bool add_low12(uint32_t inst, uintptr_t page, uintptr_t *out, uint32_t *rd) {
     if ((inst & 0xFF800000u) != 0x91000000u) return false;
     if (((inst >> 22) & 0x3) != 0) return false;
-    uint32_t imm12 = (inst >> 10) & 0xFFF;
     *rd = inst & 0x1F;
-    *out = page + imm12;
+    *out = page + ((inst >> 10) & 0xFFF);
     return true;
 }
-
 static uintptr_t find_ref_to_addr(const struct mach_header_64 *mh, uintptr_t target) {
     const struct load_command *lc = (const struct load_command*)((const uint8_t*)mh + sizeof(*mh));
     for (uint32_t i = 0; i < mh->ncmds; ++i) {
@@ -244,9 +260,9 @@ static uintptr_t find_ref_to_addr(const struct mach_header_64 *mh, uintptr_t tar
                         uint32_t rd0 = i0 & 0x1F;
                         for (size_t m = 4; m <= 12 && k + m + 4 <= bytes; m += 4) {
                             uint32_t iN = *(const uint32_t*)(base + k + m);
-                            uintptr_t final_addr; uint32_t rdN;
-                            if (add_low12(iN, pg, &final_addr, &rdN) && rdN == rd0) {
-                                if (final_addr == target) return (uintptr_t)(base + k);
+                            uintptr_t fa; uint32_t rdN;
+                            if (add_low12(iN, pg, &fa, &rdN) && rdN == rd0) {
+                                if (fa == target) return (uintptr_t)(base + k);
                                 break;
                             }
                             if ((iN & 0x1F) == rd0 && (iN & 0xFF800000u) != 0x91000000u) break;
@@ -259,19 +275,18 @@ static uintptr_t find_ref_to_addr(const struct mach_header_64 *mh, uintptr_t tar
     }
     return 0;
 }
-
 static uintptr_t find_func_start(uintptr_t code_ref, size_t max_back) {
     for (size_t off = 0; off <= max_back; off += 4) {
         if (code_ref < off + 4) break;
         uintptr_t cand = code_ref - off;
         uint32_t inst = *(const uint32_t*)cand;
-        if ((inst & 0xFFC07FFFu) == 0xA9807BFDu) return cand; // STP x29,x30,[sp,#-N]!
-        if (inst == 0xD503233Fu) return cand;                  // PACIASP
+        if ((inst & 0xFFC07FFFu) == 0xA9807BFDu) return cand;
+        if (inst == 0xD503233Fu) return cand;
     }
     return 0;
 }
 
-// ========================= GOT rebind =========================
+// ================= GOT rebind =================
 static bool rebind_image(const struct mach_header_64 *mh, const char *name,
                          void *repl_raw, void **orig_out) {
     symtab_info st = {};
@@ -294,10 +309,8 @@ static bool rebind_image(const struct mach_header_64 *mh, const char *name,
             if (isData) {
                 const struct section_64 *s = (const struct section_64*)((const uint8_t*)lc + sizeof(*sg));
                 for (uint32_t j = 0; j < sg->nsects; ++j, ++s) {
-                    const bool isA = !strcmp(s->sectname, "__auth_got") ||
-                                     !strcmp(s->sectname, "__auth_ptr");
-                    const bool isP = !strcmp(s->sectname, "__got") ||
-                                     !strcmp(s->sectname, "__la_symbol_ptr");
+                    const bool isA = !strcmp(s->sectname, "__auth_got") || !strcmp(s->sectname, "__auth_ptr");
+                    const bool isP = !strcmp(s->sectname, "__got") || !strcmp(s->sectname, "__la_symbol_ptr");
                     if (!isA && !isP) continue;
                     void **slots = (void**)((uint8_t*)mh + s->offset);
                     const uint32_t ns = s->size / sizeof(void*);
@@ -333,7 +346,6 @@ static bool rebind_image(const struct mach_header_64 *mh, const char *name,
     }
     return false;
 }
-
 static bool rebind_all(const char *name, void *repl, void **orig) {
     bool any = false;
     for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
@@ -343,7 +355,7 @@ static bool rebind_all(const char *name, void *repl, void **orig) {
     return any;
 }
 
-// =========================== anogs ===========================
+// ================= anogs =================
 static const struct mach_header_64 *find_image(const char *n) {
     for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
         const char *nm = _dyld_get_image_name(i);
@@ -351,25 +363,18 @@ static const struct mach_header_64 *find_image(const char *n) {
     }
     return nullptr;
 }
-static intptr_t anogs_slide() {
-    for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
-        const char *nm = _dyld_get_image_name(i);
-        if (nm && strstr(nm, "anogs")) return _dyld_get_image_vmaddr_slide(i);
-    }
-    return 0;
-}
 
-// ===================== Mach exception handler =====================
+// ================= Mach exception =================
 static mach_port_t g_exc_port = MACH_PORT_NULL;
 static const int kMaxHWBP = 6;
 static uintptr_t g_hwb_addr[kMaxHWBP] = {};
 static void    *g_hwb_repl[kMaxHWBP] = {};
-static volatile int g_hwb_n = 0;
+static std::atomic<int> g_hwb_n{0};
 static pthread_mutex_t g_hwb_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_threads_mu = PTHREAD_MUTEX_INITIALIZER;
 
 static int hwb_slot_for(uintptr_t a) {
-    for (int i = 0; i < kMaxHWBP; ++i) if (g_hwb_addr[i] == a && a) return i;
+    int n = g_hwb_n.load();
+    for (int i = 0; i < n; ++i) if (g_hwb_addr[i] == a && a) return i;
     return -1;
 }
 static bool hwb_arm_on_thread(thread_t th, int slot, uintptr_t addr) {
@@ -381,21 +386,23 @@ static bool hwb_arm_on_thread(thread_t th, int slot, uintptr_t addr) {
     dbg.__bcr[slot] = 0x1E5ULL;
     return thread_set_state(th, ARM_DEBUG_STATE64, (thread_state_t)&dbg, c) == KERN_SUCCESS;
 }
-static void hwb_arm_all_threads() {
-    int n; pthread_mutex_lock(&g_hwb_mu); n = g_hwb_n; pthread_mutex_unlock(&g_hwb_mu);
-    if (!n) return;
-    pthread_mutex_lock(&g_threads_mu);
+
+// No suspend. thread_set_state on debug state is applied by the kernel on the
+// next context switch; if a target PC is missed once, the next call hits.
+// This is the only way to guarantee we never leave a thread suspended forever.
+static void hwb_arm_all_threads(int *armed, int *failed) {
+    *armed = 0; *failed = 0;
+    int n = g_hwb_n.load();
+    if (n == 0) return;
     thread_act_array_t ts = nullptr; mach_msg_type_number_t c = 0;
-    if (task_threads(mach_task_self(), &ts, &c) == KERN_SUCCESS) {
-        for (mach_msg_type_number_t i = 0; i < c; ++i) {
-            (void)thread_suspend(ts[i]);
-            for (int s = 0; s < n; ++s) (void)hwb_arm_on_thread(ts[i], s, g_hwb_addr[s]);
-            (void)thread_resume(ts[i]);
-            mach_port_deallocate(mach_task_self(), ts[i]);
-        }
-        vm_deallocate(mach_task_self(), (vm_address_t)ts, c * sizeof(thread_t));
+    if (task_threads(mach_task_self(), &ts, &c) != KERN_SUCCESS) return;
+    for (mach_msg_type_number_t i = 0; i < c; ++i) {
+        bool ok = true;
+        for (int s = 0; s < n; ++s) if (!hwb_arm_on_thread(ts[i], s, g_hwb_addr[s])) ok = false;
+        if (ok) (*armed)++; else (*failed)++;
+        mach_port_deallocate(mach_task_self(), ts[i]);
     }
-    pthread_mutex_unlock(&g_threads_mu);
+    vm_deallocate(mach_task_self(), (vm_address_t)ts, c * sizeof(thread_t));
 }
 
 static bool handle_breakpoint(thread_t th) {
@@ -403,20 +410,26 @@ static bool handle_breakpoint(thread_t th) {
     mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&raw, &c) != KERN_SUCCESS) return false;
     if (c != ARM_THREAD_STATE64_COUNT) return false;
-
     uintptr_t pc = (uintptr_t)ptrauth_strip((void*)ts_pc_load(&raw), ptrauth_key_function_pointer);
     int slot = hwb_slot_for(pc);
-    if (slot < 0) return false;
-
+    if (slot < 0) {
+        // Not our hardware breakpoint. Could be a BRK instruction (self-test,
+        // or another tool). Skip the BRK and reply SUCCESS — safer than KERN_FAILURE
+        // which would kill the thread when we're the only port.
+        uint32_t inst = 0;
+        if (memcpy(&inst, (void*)pc, 4) && (inst & 0xFFE0001F) == 0xD4200000) {
+            ts_pc_store(&raw, pc + 4);
+            (void)thread_set_state(th, ARM_THREAD_STATE64, (thread_state_t)&raw, c);
+        }
+        return true;
+    }
 #if __arm64e__
     arm_thread_state64_t self = {};
     mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
     if (thread_convert_thread_state(th, THREAD_CONVERT_THREAD_STATE_TO_SELF, ARM_THREAD_STATE64,
             (thread_state_t)&raw, c, (thread_state_t)&self, &sc) != KERN_SUCCESS ||
         sc != ARM_THREAD_STATE64_COUNT) return false;
-
     ts_pc_store(&self, (uint64_t)sign_fp(g_hwb_repl[slot]));
-
     arm_thread_state64_t fin = {};
     mach_msg_type_number_t fc = ARM_THREAD_STATE64_COUNT;
     if (thread_convert_thread_state(th, THREAD_CONVERT_THREAD_STATE_FROM_SELF, ARM_THREAD_STATE64,
@@ -432,12 +445,10 @@ static bool handle_breakpoint(thread_t th) {
 static void free_ports(exc_msg_t *m) {
     if (!(m->Head.msgh_bits & MACH_MSGH_BITS_COMPLEX)) return;
     if (m->msgh_body.msgh_descriptor_count >= 1 && m->thread.name != MACH_PORT_NULL) {
-        mach_port_deallocate(mach_task_self(), m->thread.name);
-        m->thread.name = MACH_PORT_NULL;
+        mach_port_deallocate(mach_task_self(), m->thread.name); m->thread.name = MACH_PORT_NULL;
     }
     if (m->msgh_body.msgh_descriptor_count >= 2 && m->task.name != MACH_PORT_NULL) {
-        mach_port_deallocate(mach_task_self(), m->task.name);
-        m->task.name = MACH_PORT_NULL;
+        mach_port_deallocate(mach_task_self(), m->task.name); m->task.name = MACH_PORT_NULL;
     }
 }
 static void send_reply(exc_msg_t *r, kern_return_t ret) {
@@ -452,6 +463,7 @@ static void send_reply(exc_msg_t *r, kern_return_t ret) {
                    MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
 }
 static void *exc_loop(void *) {
+    g_exc_loop_alive.store(true);
     uint8_t buf[2048] __attribute__((aligned(8)));
     for (;;) {
         memset(buf, 0, sizeof(buf));
@@ -464,10 +476,21 @@ static void *exc_loop(void *) {
                            g_exc_port, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
             continue;
         }
-        if (mr != MACH_MSG_SUCCESS) continue;
-        if (r->Head.msgh_id != 2405 && r->Head.msgh_id != 2406 && r->Head.msgh_id != 2407) {
-            free_ports(r); continue;
+        if (mr != MACH_MSG_SUCCESS) {
+            // Port died or message invalid — mark ourselves unhealthy
+            g_exc_loop_alive.store(false);
+            continue;
         }
+        g_exc_last_msg_ms.store(now_ms());
+
+        if (r->Head.msgh_id != 2405 && r->Head.msgh_id != 2406 && r->Head.msgh_id != 2407) {
+            g_exc_msg_other.fetch_add(1);
+            fprintf(stderr, "[HookKit] unexpected msgh_id=%u\n", r->Head.msgh_id);
+            free_ports(r);
+            continue;
+        }
+        if (r->Head.msgh_id == 2405) g_exc_msg_2405.fetch_add(1);
+
         kern_return_t ret = KERN_FAILURE;
         const bool cx = (r->Head.msgh_bits & MACH_MSGH_BITS_COMPLEX) != 0;
         const bool ht = cx && r->msgh_body.msgh_descriptor_count >= 1 &&
@@ -479,49 +502,85 @@ static void *exc_loop(void *) {
     }
     return nullptr;
 }
+
+static bool exc_port_is_ours() {
+    exception_mask_t masks[EXC_TYPES_COUNT];
+    mach_port_t ports[EXC_TYPES_COUNT];
+    exception_behavior_t behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+    mach_msg_type_number_t count = EXC_TYPES_COUNT;
+    if (task_get_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT,
+            masks, &count, ports, behaviors, flavors) != KERN_SUCCESS) return false;
+    for (mach_msg_type_number_t i = 0; i < count; ++i)
+        if ((masks[i] & EXC_MASK_BREAKPOINT) && ports[i] == g_exc_port) return true;
+    return false;
+}
+
 static bool exc_setup() {
     if (mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &g_exc_port) != KERN_SUCCESS) return false;
-    if (mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port,
-            MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) return false;
+    if (mach_port_insert_right(mach_task_self(), g_exc_port, g_exc_port, MACH_MSG_TYPE_MAKE_SEND) != KERN_SUCCESS) return false;
     if (task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, g_exc_port,
             EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64) != KERN_SUCCESS) return false;
+    if (!exc_port_is_ours()) return false;
+
     pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
     pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
     int rc = pthread_create(&t, &a, exc_loop, nullptr);
     pthread_attr_destroy(&a);
-    return rc == 0;
+    if (rc != 0) return false;
+
+    // Wait up to 2 s for exc_loop to enter its receive loop.
+    for (int i = 0; i < 200; ++i) {
+        if (g_exc_loop_alive.load()) break;
+        usleep(10000);
+    }
+    return g_exc_loop_alive.load();
 }
 
-// ========================= GOT hooks =========================
+static void *exc_watchdog(void *) {
+    while (true) {
+        sleep(10);
+        if (!exc_port_is_ours()) {
+            fprintf(stderr, "[HookKit] EXC port stolen — retaking\n");
+            (void)task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, g_exc_port,
+                EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+        }
+        if (!g_exc_loop_alive.load()) {
+            fprintf(stderr, "[HookKit] exc_loop died — restarting\n");
+            pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
+            pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+            if (pthread_create(&t, &a, exc_loop, nullptr) == 0) {
+                pthread_attr_destroy(&a);
+            } else {
+                pthread_attr_destroy(&a);
+            }
+        }
+    }
+    return nullptr;
+}
+
+// ================= GOT hooks =================
 static int (*g_orig_kill)(pid_t,int) = nullptr;
 static int (*g_orig_sysctl)(int*,u_int,void*,size_t*,void*,size_t) = nullptr;
 static int (*g_orig_ptrace)(int,pid_t,caddr_t,int) = nullptr;
 static int (*g_orig_pthread_create)(pthread_t*,const pthread_attr_t*,void*(*)(void*),void*) = nullptr;
-static kern_return_t (*g_orig_task_set_exc)(task_t,exception_mask_t,mach_port_t,
-                                            exception_behavior_t,thread_state_flavor_t) = nullptr;
+static kern_return_t (*g_orig_task_set_exc)(task_t,exception_mask_t,mach_port_t,exception_behavior_t,thread_state_flavor_t) = nullptr;
 
-static int hk_kill(pid_t p, int s) {
-    if (p == getpid() && (s == SIGKILL || s == SIGSTOP || s == SIGABRT)) return 0;
-    return g_orig_kill ? g_orig_kill(p,s) : -1;
-}
-static int hk_sysctl(int *n, u_int nl, void *o, size_t *ol, void *nw, size_t nw2) {
-    int rc = g_orig_sysctl ? g_orig_sysctl(n,nl,o,ol,nw,nw2) : -1;
-    if (!rc && n && nl >= 4 && o && n[0]==CTL_KERN && n[1]==KERN_PROC &&
+static int hk_kill(pid_t p, int s){ if (p == getpid() && (s==SIGKILL||s==SIGSTOP||s==SIGABRT)) return 0; return g_orig_kill?g_orig_kill(p,s):-1; }
+static int hk_sysctl(int *n, u_int nl, void *o, size_t *ol, void *nw, size_t nw2){
+    int rc = g_orig_sysctl?g_orig_sysctl(n,nl,o,ol,nw,nw2):-1;
+    if (!rc && n && nl>=4 && o && n[0]==CTL_KERN && n[1]==KERN_PROC &&
         n[2]==KERN_PROC_PID && n[3]==getpid()) {
         struct kinfo_proc *kp = (struct kinfo_proc*)o;
         if (kp) kp->kp_proc.p_flag &= ~P_TRACED;
     }
     return rc;
 }
-static int hk_ptrace(int r, pid_t p, caddr_t a, int d) {
-    if (r == PT_DENY_ATTACH) return 0;
-    return g_orig_ptrace ? g_orig_ptrace(r,p,a,d) : -1;
-}
-static int hk_pthread_create(pthread_t *t, const pthread_attr_t *a,
-                             void *(*fn)(void*), void *arg) {
-    int rc = g_orig_pthread_create ? g_orig_pthread_create(t,a,fn,arg) : -1;
+static int hk_ptrace(int r, pid_t p, caddr_t a, int d){ if (r==PT_DENY_ATTACH) return 0; return g_orig_ptrace?g_orig_ptrace(r,p,a,d):-1; }
+static int hk_pthread_create(pthread_t *t, const pthread_attr_t *a, void *(*fn)(void*), void *arg){
+    int rc = g_orig_pthread_create?g_orig_pthread_create(t,a,fn,arg):-1;
     if (!rc && t) {
-        int n; pthread_mutex_lock(&g_hwb_mu); n = g_hwb_n; pthread_mutex_unlock(&g_hwb_mu);
+        int n = g_hwb_n.load();
         if (n) {
             thread_t m = pthread_mach_thread_np(*t);
             for (int s = 0; s < n; ++s) (void)hwb_arm_on_thread(m, s, g_hwb_addr[s]);
@@ -530,58 +589,39 @@ static int hk_pthread_create(pthread_t *t, const pthread_attr_t *a,
     return rc;
 }
 static kern_return_t hk_task_set_exc(task_t t, exception_mask_t m, mach_port_t p,
-                                     exception_behavior_t b, thread_state_flavor_t f) {
-    kern_return_t rc = g_orig_task_set_exc ? g_orig_task_set_exc(t,m,p,b,f) : KERN_FAILURE;
-    if (t == mach_task_self() && (m & EXC_MASK_BREAKPOINT) &&
-        g_exc_port && p != g_exc_port) {
+                                     exception_behavior_t b, thread_state_flavor_t f){
+    kern_return_t rc = g_orig_task_set_exc?g_orig_task_set_exc(t,m,p,b,f):KERN_FAILURE;
+    if (t == mach_task_self() && (m & EXC_MASK_BREAKPOINT) && g_exc_port && p != g_exc_port) {
         (void)task_set_exception_ports(mach_task_self(), EXC_MASK_BREAKPOINT, g_exc_port,
-                                        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
-                                        ARM_THREAD_STATE64);
+                                        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
     }
     return rc;
 }
 
-// ============== EXPORTED AnoSDK* HOOKS (via GOT) ==============
-static int (*g_orig_GetReportData)(void*, unsigned int*) = nullptr;
-static int hk_GetReportData(void *out, unsigned int *outLen) {
-    if (out) memset(out, 0, outLen ? *outLen : 0);
-    if (outLen) *outLen = 0;
-    return 0;
-}
-static int (*g_orig_GetReportData2)(void*, unsigned int*) = nullptr;
-static int hk_GetReportData2(void *out, unsigned int *outLen) {
-    if (out) memset(out, 0, outLen ? *outLen : 0);
-    if (outLen) *outLen = 0;
-    return 0;
-}
-static int (*g_orig_OnRecvSignature)(const char*, unsigned int) = nullptr;
-static int hk_OnRecvSignature(const char *s, unsigned int l) { (void)s; (void)l; return 0; }
-static int (*g_orig_OnRecvData)(const char*, unsigned int) = nullptr;
-static int hk_OnRecvData(const char *d, unsigned int l) { (void)d; (void)l; return 0; }
-static int (*g_orig_DelReportData)(void) = nullptr;
-static int hk_DelReportData(void) { return 0; }
+// ================= AnoSDK hooks =================
+static int (*g_orig_GetRep)(void*, unsigned int*) = nullptr;
+static int hk_GetRep(void *o, unsigned int *l){ if (o) memset(o,0,l?*l:0); if (l) *l=0; return 0; }
+static int (*g_orig_GetRep2)(void*, unsigned int*) = nullptr;
+static int hk_GetRep2(void *o, unsigned int *l){ if (o) memset(o,0,l?*l:0); if (l) *l=0; return 0; }
+static int (*g_orig_RecvSig)(const char*, unsigned int) = nullptr;
+static int hk_RecvSig(const char *s, unsigned int l){ (void)s;(void)l; return 0; }
+static int (*g_orig_RecvData)(const char*, unsigned int) = nullptr;
+static int hk_RecvData(const char *d, unsigned int l){ (void)d;(void)l; return 0; }
+static int (*g_orig_DelRep)(void) = nullptr;
+static int hk_DelRep(void){ return 0; }
 
-static void install_exported_hooks() {
-    rebind_all("AnoSDKGetReportData",   (void*)&hk_GetReportData,   (void**)&g_orig_GetReportData);
-    rebind_all("AnoSDKGetReportData2",  (void*)&hk_GetReportData2,  (void**)&g_orig_GetReportData2);
-    rebind_all("AnoSDKOnRecvSignature", (void*)&hk_OnRecvSignature, (void**)&g_orig_OnRecvSignature);
-    rebind_all("AnoSDKOnRecvData",      (void*)&hk_OnRecvData,      (void**)&g_orig_OnRecvData);
-    rebind_all("AnoSDKDelReportData",   (void*)&hk_DelReportData,   (void**)&g_orig_DelReportData);
-}
-
-// ================= hook installers =================
+// ================= installers =================
 static bool hw_hook_addr(uintptr_t a, void *repl) {
     pthread_mutex_lock(&g_hwb_mu);
-    if (g_hwb_n >= kMaxHWBP) { pthread_mutex_unlock(&g_hwb_mu); return false; }
-    int slot = g_hwb_n++;
-    g_hwb_addr[slot] = a; g_hwb_repl[slot] = repl;
+    int n = g_hwb_n.load();
+    if (n >= kMaxHWBP) { pthread_mutex_unlock(&g_hwb_mu); return false; }
+    g_hwb_addr[n] = a; g_hwb_repl[n] = repl; g_hwb_n.store(n+1);
     pthread_mutex_unlock(&g_hwb_mu);
-    hwb_arm_all_threads();
-    return true;
-}
-static bool hw_hook(uintptr_t vaddr, void *repl) {
-    intptr_t s = anogs_slide(); if (!s) return false;
-    return hw_hook_addr((uintptr_t)s + vaddr, repl);
+    int armed = 0, failed = 0;
+    hwb_arm_all_threads(&armed, &failed);
+    fprintf(stderr, "[HookKit] hw_hook %p armed=%d failed=%d\n",
+            (void*)a, armed, failed);
+    return armed > 0;
 }
 static bool inline_hook_addr(void *target, void *repl, void **orig_out) {
     if (!DobbyHook) return false;
@@ -598,51 +638,80 @@ static bool inline_hook_addr(void *target, void *repl, void **orig_out) {
     return true;
 }
 
-// ============ INTERNAL PROTECTION HOOKS (string xref) ============
-struct str_target { const char *needle; void *repl; const char *name; };
+struct str_target { const char *needle; void *repl; int hook_id; };
 static str_target kStrTargets[] = {
-    { "ms_set_inlie_hook",           (void*)&repl_inline_detect, "set_inline_hook_error" },
-    { "inline_hook_opcode_dismatch", (void*)&repl_inline_detect, "inline_hook_opcode_dismatch" },
-    { "black_module_macho",          (void*)&repl_black_module,  "black_module_macho" },
-    // { "tcj_protect",              (void*)&repl_tcj_protect,   "tcj_protect" },
-    // { "sc_protect",               (void*)&repl_sc_protect,    "sc_protect" },
+    { "ms_set_inlie_hook",           (void*)&repl_inline_detect, HK_STR_INLINE },
+    { "inline_hook_opcode_dismatch", (void*)&repl_inline_detect, HK_STR_INLINE },
+    { "black_module_macho",          (void*)&repl_black_module,  HK_STR_BLACKMOD },
 };
 
 static void install_string_hooks() {
     const struct mach_header_64 *mh = find_image("anogs"); if (!mh) return;
     for (size_t i = 0; i < sizeof(kStrTargets)/sizeof(kStrTargets[0]); ++i) {
-        uintptr_t str_addr = find_cstring(mh, kStrTargets[i].needle);
-        if (!str_addr) continue;
-        uintptr_t cref = find_ref_to_addr(mh, str_addr);
-        if (!cref) continue;
-        uintptr_t fstart = find_func_start(cref, 0x1000);
-        if (!fstart) fstart = cref;
-        if (!inline_hook_addr((void*)fstart, kStrTargets[i].repl, nullptr)) {
-            (void)hw_hook_addr(fstart, kStrTargets[i].repl);
+        uintptr_t sa = find_cstring(mh, kStrTargets[i].needle);
+        if (!sa) continue;
+        uintptr_t cr = find_ref_to_addr(mh, sa);
+        if (!cr) continue;
+        uintptr_t fs = find_func_start(cr, 0x1000);
+        if (!fs) fs = cr;
+        bool ok = inline_hook_addr((void*)fs, kStrTargets[i].repl, nullptr)
+               || hw_hook_addr(fs, kStrTargets[i].repl);
+        if (ok) g_hook_ok[kStrTargets[i].hook_id] = true;
+    }
+}
+
+static void install_libc_and_anogs() {
+    g_hook_ok[HK_KILL]         = rebind_all("kill",             (void*)&hk_kill,             (void**)&g_orig_kill);
+    g_hook_ok[HK_SYSCTL]       = rebind_all("sysctl",           (void*)&hk_sysctl,           (void**)&g_orig_sysctl);
+    g_hook_ok[HK_PTRACE]       = rebind_all("ptrace",           (void*)&hk_ptrace,           (void**)&g_orig_ptrace);
+    g_hook_ok[HK_PTHREAD]      = rebind_all("pthread_create",   (void*)&hk_pthread_create,   (void**)&g_orig_pthread_create);
+    g_hook_ok[HK_TASK_SET_EXC] = rebind_all("task_set_exception_ports",(void*)&hk_task_set_exc,(void**)&g_orig_task_set_exc);
+
+    g_hook_ok[HK_GETREP]  = rebind_all("AnoSDKGetReportData",   (void*)&hk_GetRep,    (void**)&g_orig_GetRep);
+    g_hook_ok[HK_GETREP2] = rebind_all("AnoSDKGetReportData2",  (void*)&hk_GetRep2,   (void**)&g_orig_GetRep2);
+    g_hook_ok[HK_RECVSIG] = rebind_all("AnoSDKOnRecvSignature", (void*)&hk_RecvSig,   (void**)&g_orig_RecvSig);
+    g_hook_ok[HK_RECVDATA]= rebind_all("AnoSDKOnRecvData",      (void*)&hk_RecvData,  (void**)&g_orig_RecvData);
+    g_hook_ok[HK_DELREP]  = rebind_all("AnoSDKDelReportData",   (void*)&hk_DelRep,    (void**)&g_orig_DelRep);
+
+    install_string_hooks();
+}
+
+static pthread_once_t g_install_once = PTHREAD_ONCE_INIT;
+static void install_once_worker() {
+    if (!find_image("anogs")) return;   // callback will retry on load
+    if (!exc_setup()) { fprintf(stderr, "[HookKit] exc_setup failed\n"); return; }
+
+    install_libc_and_anogs();
+
+    pthread_t wd; pthread_attr_t a; pthread_attr_init(&a);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    (void)pthread_create(&wd, &a, exc_watchdog, nullptr);
+    pthread_attr_destroy(&a);
+
+    log_hook_state();
+}
+
+// ================= dyld hook =================
+static void on_image_added(const struct mach_header *mh, intptr_t slide) {
+    (void)slide;
+    // We cannot look up the name by mh here, but find_image is cheap and idempotent.
+    if (find_image("anogs")) {
+        pthread_once(&g_install_once, install_once_worker);
+    }
+}
+
+__attribute__((constructor))
+static void hookkit_entry(void) {
+    @autoreleasepool {
+        // Try install immediately (anogs may already be loaded).
+        pthread_once(&g_install_once, install_once_worker);
+        // If anogs wasn't loaded yet, the callback will retry. If it was,
+        // pthread_once makes the retry a no-op.
+        if (!find_image("anogs")) {
+            _dyld_register_func_for_add_image(on_image_added);
         }
     }
 }
 
-// ========================= constructor =========================
-__attribute__((constructor))
-static void hookkit_entry(void) {
-    @autoreleasepool {
-        if (!find_image("anogs")) return;
-        if (!exc_setup()) return;
-
-        rebind_all("kill",                    (void*)&hk_kill,          (void**)&g_orig_kill);
-        rebind_all("sysctl",                  (void*)&hk_sysctl,        (void**)&g_orig_sysctl);
-        rebind_all("ptrace",                  (void*)&hk_ptrace,        (void**)&g_orig_ptrace);
-        rebind_all("pthread_create",          (void*)&hk_pthread_create,(void**)&g_orig_pthread_create);
-        rebind_all("task_set_exception_ports",(void*)&hk_task_set_exc,  (void**)&g_orig_task_set_exc);
-
-        install_exported_hooks();
-        install_string_hooks();
-    }
-}
-
-// =================== replacement bodies ===================
 static void repl_inline_detect() {}
 static void repl_black_module()  {}
-static void repl_tcj_protect()   {}
-static void repl_sc_protect()    {}
