@@ -8,15 +8,21 @@
 //        -framework AdSupport -framework AppTrackingTransparency \
 //        -o ShadowBypassXK.dylib
 //
-// v9 changes:
-//   * No thread_suspend/resume — thread_set_state(ARM_DEBUG_STATE64) is applied
-//     by the kernel on next context switch. Eliminates the resume-failure hang.
+// v9.1 changes vs v9:
+//   * Forward declarations for replacement functions before kStrTargets[].
+//     Fixes "use of undeclared identifier 'repl_inline_detect'" + incomplete
+//     'str_target[]' errors.
+//
+// State verification summary:
+//   * No thread_suspend/resume — thread_set_state(ARM_DEBUG_STATE64) applied
+//     by kernel at next context switch. Cannot leave a thread suspended.
 //   * Every rebind_all / hw_hook_addr / hwb_arm_on_thread result is aggregated
 //     into g_hook_ok[] and logged to stderr for Console.app.
 //   * _dyld_register_func_for_add_image retries install when anogs loads late.
-//   * Watchdog thread every 10 s re-takes the exception port if anogs stole it.
+//   * Watchdog thread every 10 s re-takes the exception port if stolen, and
+//     restarts exc_loop if it dies.
 //   * Exc-loop counts 2405 and unknown msgh_ids; unknown IDs get KERN_FAILURE
-//     plus a stderr note, so silent drops are impossible.
+//     plus a stderr note. Silent drops impossible.
 
 #import <Foundation/Foundation.h>
 #include <mach/mach.h>
@@ -56,6 +62,12 @@ typedef struct { uint64_t __bvr[16],__bcr[16],__wvr[16],__wcr[16],__mdscr_el1; }
 #define THREAD_CONVERT_THREAD_STATE_TO_SELF   1
 #define THREAD_CONVERT_THREAD_STATE_FROM_SELF 2
 #endif
+
+// =================== forward declarations (fixes v9 build) ===================
+static void repl_inline_detect();
+static void repl_black_module();
+static void repl_tcj_protect();
+static void repl_sc_protect();
 
 // ================= state tracking =================
 static std::atomic<uint32_t> g_exc_msg_2405{0};
@@ -387,9 +399,6 @@ static bool hwb_arm_on_thread(thread_t th, int slot, uintptr_t addr) {
     return thread_set_state(th, ARM_DEBUG_STATE64, (thread_state_t)&dbg, c) == KERN_SUCCESS;
 }
 
-// No suspend. thread_set_state on debug state is applied by the kernel on the
-// next context switch; if a target PC is missed once, the next call hits.
-// This is the only way to guarantee we never leave a thread suspended forever.
 static void hwb_arm_all_threads(int *armed, int *failed) {
     *armed = 0; *failed = 0;
     int n = g_hwb_n.load();
@@ -413,9 +422,6 @@ static bool handle_breakpoint(thread_t th) {
     uintptr_t pc = (uintptr_t)ptrauth_strip((void*)ts_pc_load(&raw), ptrauth_key_function_pointer);
     int slot = hwb_slot_for(pc);
     if (slot < 0) {
-        // Not our hardware breakpoint. Could be a BRK instruction (self-test,
-        // or another tool). Skip the BRK and reply SUCCESS — safer than KERN_FAILURE
-        // which would kill the thread when we're the only port.
         uint32_t inst = 0;
         if (memcpy(&inst, (void*)pc, 4) && (inst & 0xFFE0001F) == 0xD4200000) {
             ts_pc_store(&raw, pc + 4);
@@ -477,7 +483,6 @@ static void *exc_loop(void *) {
             continue;
         }
         if (mr != MACH_MSG_SUCCESS) {
-            // Port died or message invalid — mark ourselves unhealthy
             g_exc_loop_alive.store(false);
             continue;
         }
@@ -529,7 +534,6 @@ static bool exc_setup() {
     pthread_attr_destroy(&a);
     if (rc != 0) return false;
 
-    // Wait up to 2 s for exc_loop to enter its receive loop.
     for (int i = 0; i < 200; ++i) {
         if (g_exc_loop_alive.load()) break;
         usleep(10000);
@@ -549,11 +553,8 @@ static void *exc_watchdog(void *) {
             fprintf(stderr, "[HookKit] exc_loop died — restarting\n");
             pthread_t t; pthread_attr_t a; pthread_attr_init(&a);
             pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
-            if (pthread_create(&t, &a, exc_loop, nullptr) == 0) {
-                pthread_attr_destroy(&a);
-            } else {
-                pthread_attr_destroy(&a);
-            }
+            (void)pthread_create(&t, &a, exc_loop, nullptr);
+            pthread_attr_destroy(&a);
         }
     }
     return nullptr;
@@ -678,7 +679,7 @@ static void install_libc_and_anogs() {
 
 static pthread_once_t g_install_once = PTHREAD_ONCE_INIT;
 static void install_once_worker() {
-    if (!find_image("anogs")) return;   // callback will retry on load
+    if (!find_image("anogs")) return;
     if (!exc_setup()) { fprintf(stderr, "[HookKit] exc_setup failed\n"); return; }
 
     install_libc_and_anogs();
@@ -693,8 +694,7 @@ static void install_once_worker() {
 
 // ================= dyld hook =================
 static void on_image_added(const struct mach_header *mh, intptr_t slide) {
-    (void)slide;
-    // We cannot look up the name by mh here, but find_image is cheap and idempotent.
+    (void)mh; (void)slide;
     if (find_image("anogs")) {
         pthread_once(&g_install_once, install_once_worker);
     }
@@ -703,10 +703,7 @@ static void on_image_added(const struct mach_header *mh, intptr_t slide) {
 __attribute__((constructor))
 static void hookkit_entry(void) {
     @autoreleasepool {
-        // Try install immediately (anogs may already be loaded).
         pthread_once(&g_install_once, install_once_worker);
-        // If anogs wasn't loaded yet, the callback will retry. If it was,
-        // pthread_once makes the retry a no-op.
         if (!find_image("anogs")) {
             _dyld_register_func_for_add_image(on_image_added);
         }
@@ -715,3 +712,5 @@ static void hookkit_entry(void) {
 
 static void repl_inline_detect() {}
 static void repl_black_module()  {}
+static void repl_tcj_protect()   {}
+static void repl_sc_protect()    {}
