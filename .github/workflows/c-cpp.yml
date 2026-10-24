@@ -18,19 +18,12 @@ jobs:
         run: |
           if [ ! -f deps/fishhook/fishhook.h ]; then
             mkdir -p deps/fishhook
-            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h \
-              -o deps/fishhook/fishhook.h
-            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c \
-              -o deps/fishhook/fishhook.c
+            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.h -o deps/fishhook/fishhook.h
+            curl -fsSL https://raw.githubusercontent.com/facebook/fishhook/main/fishhook.c -o deps/fishhook/fishhook.c
           fi
 
-      - name: Force ObjC++ for the entry source
+      - name: Force ObjC++ source extension
         run: |
-          # ShadowBypassXK.m uses <cstring>, <cstdint>, nullptr, ptrauth —
-          # clang reads the extension to pick the language, .m → ObjC,
-          # and fails at the first C++ header. Rename to .mm so clang
-          # drives the C++ frontend; keep a backup in case you want to
-          # restore the original name.
           if [ -f ShadowBypassXK.m ] && [ ! -f ShadowBypassXK.mm ]; then
             cp -f ShadowBypassXK.m ShadowBypassXK.m.bak
             mv ShadowBypassXK.m ShadowBypassXK.mm
@@ -41,6 +34,7 @@ jobs:
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           clang++ \
+            -std=gnu++17 \
             -arch arm64e \
             -isysroot "$SDK" \
             -miphoneos-version-min=13.0 \
@@ -59,6 +53,7 @@ jobs:
           set -Eeuo pipefail
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
           clang++ \
+            -std=gnu++17 \
             -arch arm64 -arch arm64e \
             -isysroot "$SDK" \
             -miphoneos-version-min=13.0 \
@@ -83,7 +78,6 @@ jobs:
           file ShadowBypassXK.dylib
           lipo -info ShadowBypassXK.dylib
           otool -D ShadowBypassXK.dylib
-          otool -L ShadowBypassXK.dylib | head -20
           nm -u ShadowBypassXK.dylib | grep -E "rebind_symbols|AnoSDK" || true
 
       - uses: actions/upload-artifact@v4
