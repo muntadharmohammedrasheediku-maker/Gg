@@ -1,11 +1,6 @@
 // language: Objective-C++, file: ShadowBypassXK.mm, target: iOS arm64/arm64e jailed
-// Build: see workflow — C sources via clang -x c, C++/ObjC++ via clang++,
-//        linked together with clang++ (pulls libc++ for Titanox).
-//
-// Changes vs v9.1:
-//   * Removed #define __APPLE_API_UNSTABLE 1 (SDK already defines it).
-//   * Removed CoreSymbolication from link (private framework, unused by us).
-//   * All hooks use Titanox API as declared in libtitanox.h.
+// SAFE mode: GOT rebind only. No __TEXT modification, no hardware breakpoints.
+// This cannot crash the game. BRK hooks are behind a compile-time switch.
 
 #import <Foundation/Foundation.h>
 #import "libtitanox.h"
@@ -19,7 +14,6 @@
 #include <cstdio>
 #include <dlfcn.h>
 
-// Fallbacks if the SDK still hides any of these.
 #ifndef CTL_KERN
 #define CTL_KERN 1
 #endif
@@ -33,10 +27,15 @@
 #define P_TRACED 0x00000800
 #endif
 
-// ============================================================
-// GOT HOOKS — exported symbols only (unlimited, safe)
-// ============================================================
+// =====================================================================
+// SAFETY SWITCH
+// 0 = GOT only (safe, use this first)
+// 1 = GOT + BRK hooks (only after verifying every vaddr in your build)
+// =====================================================================
+#define ENABLE_BRK_HOOKS 0
+#define ENABLE_RESOLVER_INLINE 0
 
+// ================== GOT hooks ==================
 static int (*orig_kill)(pid_t, int) = NULL;
 static int hk_kill(pid_t pid, int sig) {
     if (pid == getpid() && (sig == SIGKILL || sig == SIGSTOP || sig == SIGABRT))
@@ -58,11 +57,10 @@ static int hk_sysctl(int *n, u_int nl, void *o, size_t *ol, void *nw, size_t nw2
 
 static int (*orig_ptrace)(int, pid_t, caddr_t, int) = NULL;
 static int hk_ptrace(int req, pid_t pid, caddr_t addr, int data) {
-    if (req == 31) return 0; // PT_DENY_ATTACH
+    if (req == 31) return 0;
     return orig_ptrace ? orig_ptrace(req, pid, addr, data) : -1;
 }
 
-// --- AnoSDK report path: zero-length report → nothing to ban ---
 static int (*orig_GetReportData)(void*, unsigned int*) = NULL;
 static int hk_GetReportData(void *o, unsigned int *l) {
     if (o) memset(o, 0, l ? *l : 0);
@@ -82,15 +80,14 @@ static int hk_OnRecvData(const char *d, unsigned int l) { (void)d; (void)l; retu
 static int (*orig_DelReportData)(void) = NULL;
 static int hk_DelReportData(void) { return 0; }
 
-// ============================================================
-// INTERNAL HOOKS
-// ============================================================
+// ================== BRK replacements (unused unless enabled) ==================
+static uint64_t repl_prot_flags(void)      { return 0; }
+static uint64_t repl_ct_init(void)         { return 0; }
+static uint64_t repl_proxy_detect(void)    { return 0; }
+static uint64_t repl_screen_capture(void)  { return 0; }
 
-// 0x10C24 — dynamic resolver. Inline hook with trampoline so we can call the
-// original and filter only the anti-debug primitives.
 typedef void *(*resolver_fn_t)(uint64_t, uint64_t, uint64_t, uint64_t);
 static resolver_fn_t orig_resolver = NULL;
-
 static void *hk_resolver(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     void *resolved = orig_resolver ? orig_resolver(a0, a1, a2, a3) : NULL;
     if (resolved == (void*)dlsym(RTLD_DEFAULT, "kill"))   return (void*)&hk_kill;
@@ -99,35 +96,28 @@ static void *hk_resolver(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
     return resolved;
 }
 
-// 0x4C18 / 0x2ED6C / 0x33794 / 0x3358C — return success / no-threat.
-static uint64_t repl_prot_flags(void)      { return 0; }
-static uint64_t repl_ct_init(void)         { return 0; }
-static uint64_t repl_proxy_detect(void)    { return 0; }
-static uint64_t repl_screen_capture(void)  { return 0; }
-
-// 0x33D6C — intentionally NOT hooked: device fingerprint must stay real for
-// account binding. Disabling it fires an integrity alert server-side.
-
-// ============================================================
-// INSTALLATION
-// ============================================================
-
+// ================== installers ==================
 static uint64_t g_anogs_base = 0;
-static int g_brk_used = 0;
 
 static void install_got_hooks() {
+    NSLog(@"[XK] enter install_got_hooks");
     [TitanoxHook hookStaticFunction:"_kill"
                     withReplacement:(void*)&hk_kill
                           inLibrary:"libSystem.B.dylib"
                      outOldFunction:(void**)&orig_kill];
+    NSLog(@"[XK] kill done, orig=%p", (void*)orig_kill);
+
     [TitanoxHook hookStaticFunction:"_sysctl"
                     withReplacement:(void*)&hk_sysctl
                           inLibrary:"libSystem.B.dylib"
                      outOldFunction:(void**)&orig_sysctl];
+    NSLog(@"[XK] sysctl done, orig=%p", (void*)orig_sysctl);
+
     [TitanoxHook hookStaticFunction:"_ptrace"
                     withReplacement:(void*)&hk_ptrace
                           inLibrary:"libSystem.B.dylib"
                      outOldFunction:(void**)&orig_ptrace];
+    NSLog(@"[XK] ptrace done, orig=%p", (void*)orig_ptrace);
 
     [TitanoxHook hookStaticFunction:"_AnoSDKGetReportData"
                     withReplacement:(void*)&hk_GetReportData
@@ -150,53 +140,74 @@ static void install_got_hooks() {
                           inLibrary:"anogs"
                      outOldFunction:(void**)&orig_DelReportData];
 
-    NSLog(@"[XK] GOT: kill=%p sysctl=%p ptrace=%p AnoSDK=%p",
-          (void*)orig_kill, (void*)orig_sysctl, (void*)orig_ptrace,
-          (void*)orig_GetReportData);
+    NSLog(@"[XK] AnoSDK hooks: GetRep=%p GetRep2=%p RecvSig=%p RecvData=%p DelRep=%p",
+          (void*)orig_GetReportData, (void*)orig_GetReportData2,
+          (void*)orig_OnRecvSignature, (void*)orig_OnRecvData,
+          (void*)orig_DelReportData);
+}
+
+#if ENABLE_BRK_HOOKS
+// Verify target reads as a function prologue before arming a breakpoint.
+static bool looks_like_prologue(uintptr_t addr) {
+    uint32_t inst = 0;
+    if (memcpy(&inst, (void*)addr, 4) != &inst) return false;
+    // STP x29,x30,[sp,#-N]!  (standard prologue)
+    if ((inst & 0xFFC07FFFu) == 0xA9807BFDu) return true;
+    // PACIASP (arm64e leaf)
+    if (inst == 0xD503233Fu) return true;
+    // SUB sp, sp, #N
+    if ((inst & 0xFFC003FFu) == 0xD10003FFu) return true;
+    // MOV x29, sp
+    if (inst == 0x910003FDu) return true;
+    return false;
 }
 
 static void install_brk(uintptr_t vaddr, void *repl, const char *name) {
     uintptr_t addr = g_anogs_base + vaddr;
+    if (!looks_like_prologue(addr)) {
+        NSLog(@"[XK] SKIP %s @ 0x%lx (not a prologue)", name, addr);
+        return;
+    }
     if ([TitanoxHook addBreakpointAtAddress:(void*)addr withHook:repl]) {
-        NSLog(@"[XK] BRK OK  %s @ 0x%lx", name, addr);
-        g_brk_used++;
+        NSLog(@"[XK] BRK OK %s @ 0x%lx", name, addr);
     } else {
-        NSLog(@"[XK] BRK FAILED  %s @ 0x%lx", name, addr);
+        NSLog(@"[XK] BRK FAILED %s @ 0x%lx", name, addr);
     }
 }
-
-static void install_internal_hooks() {
-    TitanoxHook *hooker = [[TitanoxHook alloc] initWithMachOName:@"anogs"];
-    if (hooker) {
-        void *tramp = [hooker hookFunctionAtVaddr:(g_anogs_base + 0x10C24)
-                                 withReplacement:(void*)&hk_resolver];
-        if (tramp) {
-            orig_resolver = (resolver_fn_t)tramp;
-            NSLog(@"[XK] resolver inline-hooked, tramp=%p", tramp);
-        } else {
-            NSLog(@"[XK] resolver inline hook failed — GOT-only");
-        }
-    }
-
-    install_brk(0x4C18,  (void*)&repl_prot_flags,     "prot_flags");
-    install_brk(0x2ED6C, (void*)&repl_ct_init,        "ct_init");
-    install_brk(0x33794, (void*)&repl_proxy_detect,   "proxy_detect");
-    install_brk(0x3358C, (void*)&repl_screen_capture, "screen_capture");
-
-    NSLog(@"[XK] BRK slots used: %d / 6", g_brk_used);
-}
+#endif
 
 __attribute__((constructor))
 static void xk_entry() {
     @autoreleasepool {
+        NSLog(@"[XK] === entry ===");
+
         g_anogs_base = [TitanoxHook getBaseAddressOfLibrary:"anogs"];
         if (!g_anogs_base) {
-            NSLog(@"[XK] anogs not loaded yet");
+            NSLog(@"[XK] anogs not loaded — abort");
             return;
         }
         NSLog(@"[XK] anogs base = 0x%llx", g_anogs_base);
+
         install_got_hooks();
-        install_internal_hooks();
-        NSLog(@"[XK] done");
+        NSLog(@"[XK] GOT complete");
+
+#if ENABLE_RESOLVER_INLINE
+        TitanoxHook *hooker = [[TitanoxHook alloc] initWithMachOName:@"anogs"];
+        if (hooker) {
+            void *tramp = [hooker hookFunctionAtVaddr:(g_anogs_base + 0x10C24)
+                                     withReplacement:(void*)&hk_resolver];
+            orig_resolver = (resolver_fn_t)tramp;
+            NSLog(@"[XK] resolver tramp=%p", tramp);
+        }
+#endif
+
+#if ENABLE_BRK_HOOKS
+        install_brk(0x4C18,  (void*)&repl_prot_flags,     "prot_flags");
+        install_brk(0x2ED6C, (void*)&repl_ct_init,        "ct_init");
+        install_brk(0x33794, (void*)&repl_proxy_detect,   "proxy_detect");
+        install_brk(0x3358C, (void*)&repl_screen_capture, "screen_capture");
+#endif
+
+        NSLog(@"[XK] === done ===");
     }
 }
